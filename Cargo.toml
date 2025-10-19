@@ -1,0 +1,20 @@
+[package]
+name = "simple_downloader"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.47.1", features = [
+    "rt-multi-thread", # 启用多线程运行时，支持 tokio::spawn
+    "macros",          # 启用宏，主要是为了 tokio::select!
+    "fs",              # 启用异步文件系统操作，如 tokio::fs
+    "io-util",         # 启用 I/O 工具 trait，如 AsyncWriteExt
+] }
+reqwest = { version = "0.12.23", features = ["stream"] }
+futures-util = "0.3.31"
+bytes = "1.10.1"
+thiserror = "2.0.16"
+faststr = "0.2.32"
+
+[dev-dependencies]
+indicatif = "0.18.0"
