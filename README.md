@@ -51,14 +51,14 @@
 #### 示例
 
 ```rust
-use mddl::{Downloader, DownloadInfo, reqwest::ClientBuilder};
+use simple_downloader::{Downloader, DownloadInfo, reqwest::ClientBuilder};
 use tokio::sync::broadcast;
 
 #[tokio::main]
 async fn main() {
     let downloader = Downloader::new(
-        "https://proof.ovh.net/files/100Mio.dat", // 下载链接
-        "100Mio.dat",                             // 保存路径
+        "https://dldir1.qq.com/qqfile/qq/PCQQ9.7.17/QQ9.7.17.29225.exe", // 下载链接
+        "QQ9.7.17.29225.exe",                             // 保存路径
         16,                                       // 最大并发线程数
         1.0,                                      // 进度更新间隔(秒)
         || ClientBuilder::new(),                  // 提供网络客户端构建器
@@ -93,58 +93,54 @@ async fn main() {
 #### 代码逻辑
 ```mermaid
 graph TD
-subgraph 用户交互
-User(["👤 用户"]) -- "1. 调用 Downloader.run(进度处理器)" --> D[🚀 下载器 Downloader]
-PH[📊 进度处理器]
-end
+    subgraph 用户交互
+        User(["👤 用户"]) -- " 1. 调用 Downloader.run(进度处理器) " --> D["🚀 下载器 Downloader"]
+        PH["📊 进度处理器"]
+    end
 
-subgraph 核心逻辑
-D -- "2. 启动" --> PH
-D -- "3. 启动" --> FW[📝 文件写入任务]
-D -- "4. 创建并运行" --> M[🧠 下载监控器]
-D -- "5. 启动初始" --> C1["⚙️ 下载块任务 (Worker 1)"]
+    subgraph 核心逻辑
+        D -- " 2. 启动 " --> PH
+        D -- " 3. 启动 " --> FW["📝 文件写入任务"]
+        D -- " 4. 创建并运行 " --> M["🧠 下载监控器"]
+        D -- " 5. 启动初始 " --> C1["⚙️ 下载块任务 (Worker 1)"]
 
-subgraph "监控器的助手"
-M -- "拥有并委托给" --> CM[📈 并发管理器]
-M -- "拥有并委托给" --> RH[🔄 重试处理器]
-M -- "拥有并修改" --> DS[🗃️ 下载状态]
-end
+        subgraph "监控器的助手"
+            M -- " 拥有并委托给 " --> CM["📈 并发管理器"]
+            M -- " 拥有并委托给 " --> RH["🔄 重试处理器"]
+            M -- " 拥有并修改 " --> DS["🗃️ 下载状态"]
+        end
 
-CM -- "分析" --> DS
-RH -- "管理失败的块" --> DS
-M -- "在分割/重试时启动新任务" --> C2["⚙️ 下载块任务 (Worker N)"]
-end
+        CM -- " 分析 " --> DS
+        RH -- " 管理失败的块 " --> DS
+        M -- " 在分割/重试时启动新任务 " --> C2["⚙️ 下载块任务 (Worker N)"]
+    end
 
-subgraph 通信通道
-style InfoChannel fill:#cde4ff,stroke:#333,stroke-width:2px
-style CmdChannel fill:#ffcdcd,stroke:#333,stroke-width:2px
-style DataChannel fill:#d5f5e3,stroke:#333,stroke-width:2px
+    subgraph 通信通道
+        style InfoChannel fill: #cde4ff, stroke: #333, stroke-width: 2px
+        style CmdChannel fill: #ffcdcd, stroke: #333, stroke-width: 2px
+        style DataChannel fill: #d5f5e3, stroke: #333, stroke-width: 2px
+        InfoChannel("📢 广播: 下载信息 DownloadInfo")
+        CmdChannel("📡 广播: 控制命令 DownloadCmd")
+        DataChannel("📥 MPSC: 文件写入数据")
+    end
 
-InfoChannel(📢 广播: 下载信息 DownloadInfo)
-CmdChannel(📡 广播: 控制命令 DownloadCmd)
-DataChannel(📥 MPSC: 文件写入数据)
-end
-
-subgraph 外部
-Server[(🌐 远程服务器)]
-Disk[(💾 磁盘文件)]
-end
+    subgraph 外部
+        Server["🌐 远程服务器"]
+        Disk["💾 磁盘文件"]
+    end
 
 %% --- 数据与事件流 ---
-C1 & C2 -- "发送块进度、失败等信息" --> InfoChannel
-M -- "发送聚合后的监控更新" --> InfoChannel
-InfoChannel -- "接收事件" --> M
-InfoChannel -- "接收事件" --> PH
-
+    C1 & C2 -- " 发送块进度、失败等信息 " --> InfoChannel
+    M -- " 发送聚合后的监控更新 " --> InfoChannel
+    InfoChannel -- " 接收事件 " --> M
+    InfoChannel -- " 接收事件 " --> PH
 %% --- 命令流 ---
-CM -- "发送 BisectDownload 命令" --> CmdChannel
-CmdChannel -- "接收命令 (如分割、终止)" --> C1 & C2
-
+    CM -- " 发送 BisectDownload 命令 " --> CmdChannel
+    CmdChannel -- " 接收命令 (如分割、终止) " --> C1 & C2
 %% --- 文件写入流 ---
-C1 & C2 -- "发送已下载的数据" --> DataChannel
-DataChannel -- "接收数据块" --> FW
-FW -- "写入到" --> Disk
-
+    C1 & C2 -- " 发送已下载的数据 " --> DataChannel
+    DataChannel -- " 接收数据块 " --> FW
+    FW -- " 写入到 " --> Disk
 %% --- 网络流 ---
-C1 & C2 -- "发送 HTTP Range 请求" --> Server
+    C1 & C2 -- " 发送 HTTP Range 请求 " --> Server
 ```
