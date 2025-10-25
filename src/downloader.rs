@@ -1,64 +1,32 @@
-//! 包含核心的 `Downloader` 结构体，是整个库的入口和总协调器。
+//! downloader.rs - 下载器监督者与系统入口。
 
-use crate::chunk::chunk_run;
-use crate::monitor::DownloadMonitor;
-use crate::types::{DownloadCmd, DownloadInfo, Result};
-use crate::util::{file_writer_task, get_file_info};
+use crate::monitor::MonitorActor;
+use crate::types::{DownloadInfo, Result, SystemCommand, SystemEvent};
+use crate::util::{get_file_info, writer_actor_task};
 use faststr::FastStr;
-use futures_util::stream::FuturesUnordered;
-use log::{debug, info, trace};
-use reqwest::{Client, ClientBuilder};
-use std::sync::atomic::AtomicU64;
+use log::{debug, info};
+use reqwest::ClientBuilder;
 use tokio::spawn;
 use tokio::sync::{broadcast, mpsc};
 
-const MIN_CHUNK_SIZE: u64 = 1024 * 1024; // 1 MB
 const CHANNEL_CAPACITY: usize = 1024;
 
-/// 下载器的配置信息。
-#[derive(Clone)]
-struct DownloaderConfig {
-    /// 下载目标的 URL。
-    url: FastStr,
-    /// 文件保存路径。
-    output_path: FastStr,
-    /// 最大并发工作线程数。
-    workers: u64,
-}
-
-/// 主要的下载管理器。
-///
-/// 泛型 `F` 允许用户传入一个闭包，用于创建 `reqwest::ClientBuilder`，
-/// 从而可以自定义客户端配置（如代理、超时等）。
+/// 下载器，作为 Actor 系统的监督者和入口。
 pub struct Downloader<F>
 where
     F: Fn() -> ClientBuilder,
 {
-    /// 下载配置。
-    config: DownloaderConfig,
-    /// 用于创建 reqwest 客户端的构建器闭包。
-    client_builder: F,
-    /// 用于广播控制命令（如 `BisectDownload`, `TerminateAll`）的发送端。
-    cmd_tx: broadcast::Sender<DownloadCmd>,
-    /// 用于广播下载信息（如进度、状态）的发送端。
-    info_tx: broadcast::Sender<DownloadInfo>,
-    /// 进度更新的间隔时间（秒）。
+    url: FastStr,
+    output_path: FastStr,
+    workers: u64,
     update_interval: f64,
+    client_builder: F,
 }
 
 impl<F> Downloader<F>
 where
-    // `F` 必须是 `Send + Sync + 'static` 的，因为它可能被移动到其他线程。
     F: Fn() -> ClientBuilder + Send + Sync + 'static,
 {
-    /// 创建一个新的 `Downloader` 实例。
-    ///
-    /// # 参数
-    /// - `url`: 下载文件的 URL。
-    /// - `output_path`: 文件保存的路径。
-    /// - `workers`: 最大并发下载线程数。
-    /// - `update_interval`: 进度信息更新的频率（秒）。
-    /// - `client_builder`: 一个返回 `reqwest::ClientBuilder` 的闭包。
     pub fn new(
         url: impl Into<FastStr>,
         output_path: impl Into<FastStr>,
@@ -66,127 +34,66 @@ where
         update_interval: f64,
         client_builder: F,
     ) -> Self {
-        let (cmd_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
-        let (info_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
-        let url = url.into();
-        let output_path = output_path.into();
-        info!(
-            "下载器已为 URL '{}' 创建，输出到 '{}'，并发数: {}。",
-            url.as_str(),
-            output_path.as_str(),
-            workers
-        );
         Self {
-            config: DownloaderConfig {
-                url,
-                output_path,
-                workers,
-            },
-            client_builder,
-            cmd_tx,
-            info_tx,
+            url: url.into(),
+            output_path: output_path.into(),
+            workers,
             update_interval,
+            client_builder,
         }
     }
 
-    /// 启动下载过程。
-    ///
-    /// # 参数
-    /// - `progress_handler`: 一个异步闭包，接收总文件大小和 `DownloadInfo` 的接收端，
-    ///   用于处理和显示下载进度。
+    /// 启动下载过程，初始化并运行整个 Actor 系统。
     pub async fn run<ProgF, Fut>(self, progress_handler: ProgF) -> Result<()>
     where
         ProgF: FnOnce(u64, broadcast::Receiver<DownloadInfo>) -> Fut,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         info!(
-            "开始下载 '{}' 到 '{}'。",
-            self.config.url, self.config.output_path
+            "启动下载 Actor 系统: '{}' -> '{}'",
+            self.url, self.output_path
         );
-        // 构建 reqwest 客户端
-        let client = (self.client_builder)().build()?;
-        debug!("Reqwest 客户端已构建。");
-        // 获取文件信息（大小、是否支持范围请求）
-        let (file_size, support_ranges) = get_file_info(&client, &self.config.url).await?;
-        info!("文件大小: {file_size}, Range 请求支持: {support_ranges}。");
-        // 为进度处理器订阅信息通道
-        let info_rx_for_progress = self.info_tx.subscribe();
-        // 启动文件写入任务，并获取其命令发送端
-        let writer_tx = file_writer_task(self.config.output_path.clone(), file_size).await?;
 
-        // 异步执行用户提供的进度处理逻辑
-        debug!("正在派生用户提供的进度处理任务。");
+        // 1. 创建通信信道
+        let (info_tx, info_rx_for_progress) = broadcast::channel(CHANNEL_CAPACITY);
+        let (cmd_tx, _) = broadcast::channel::<SystemCommand>(CHANNEL_CAPACITY);
+        let (event_tx, event_rx) = mpsc::channel::<SystemEvent>(CHANNEL_CAPACITY);
+
+        // 2. 获取文件信息
+        let client = (self.client_builder)().build()?;
+        let (file_size, _) = get_file_info(&client, &self.url).await?;
+        info!("文件大小: {} 字节。", file_size);
+
+        // 3. 启动文件写入 Actor
+        let writer_tx = writer_actor_task(self.output_path.clone(), file_size).await?;
+
+        // 4. 启动用户进度处理任务
         spawn(progress_handler(file_size, info_rx_for_progress));
 
-        // 协调和管理所有下载任务
-        self.orchestrate_downloads(file_size, support_ranges, writer_tx, client)
-            .await?;
+        // 5. 创建并启动核心 MonitorActor
+        let monitor_actor = MonitorActor::new(
+            file_size,
+            self.update_interval,
+            self.workers,
+            self.client_builder,
+            self.url,
+            event_rx,
+            cmd_tx.clone(),
+            info_tx,
+            writer_tx,
+            event_tx,
+        )?;
 
-        // 下载结束后，发送终止命令以清理所有任务
-        info!("下载协调完成，发送 TerminateAll 命令以清理任务。");
-        let _ = self.cmd_tx.send(DownloadCmd::TerminateAll);
-        Ok(())
-    }
+        let monitor_handle = spawn(monitor_actor.run());
+        debug!("[Downloader] MonitorActor 已启动。");
 
-    /// 内部函数，用于创建和管理所有下载任务。
-    async fn orchestrate_downloads(
-        &self,
-        file_size: u64,
-        support_ranges: bool,
-        writer_tx: mpsc::Sender<DownloadCmd>,
-        client: Client,
-    ) -> Result<()> {
-        // 使用 FuturesUnordered 来管理所有并发的下载任务
-        let tasks = FuturesUnordered::new();
-        // 用于生成唯一的块 ID
-        let next_chunk_id = AtomicU64::new(0);
+        // 6. 等待 MonitorActor 完成
+        monitor_handle.await?;
 
-        // 决定实际的并发数
-        let workers = if !support_ranges || self.config.workers == 1 || file_size < MIN_CHUNK_SIZE {
-            // 如果服务器不支持范围请求，或用户只设置了1个worker，或文件太小，则强制使用单线程
-            1
-        } else {
-            self.config.workers
-        };
-        info!("协调下载，实际并发数: {workers}。");
+        // 7. 下载结束，发送终止命令以清理所有任务
+        info!("[Downloader] 下载协调完成，发送 TerminateAll 命令。");
+        let _ = cmd_tx.send(SystemCommand::TerminateAll);
 
-        // 创建并启动第一个下载任务，它将下载整个文件
-        let initial_id = next_chunk_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let rb = client.get(self.config.url.as_str());
-        let task = chunk_run(
-            initial_id,
-            writer_tx.clone(),
-            self.cmd_tx.subscribe(),
-            self.info_tx.clone(),
-            rb,
-            0,
-            file_size.saturating_sub(1),
-        );
-        tasks.push(spawn(task));
-        info!(
-            "[Main] 启动初始下载任务 (ID: {}), 范围: 0-{}",
-            initial_id,
-            file_size.saturating_sub(1)
-        );
-
-        // 创建下载监控器
-        let monitor = DownloadMonitor::new(file_size, self.update_interval, workers);
-        debug!("下载监控器已创建。");
-
-        // 运行监控器，它将接管下载过程的管理
-        info!("将控制权移交给下载监控器。");
-        monitor
-            .run(
-                self.info_tx.subscribe(),
-                self.info_tx.clone(),
-                tasks,
-                &next_chunk_id,
-                &client,
-                writer_tx,
-                &self.cmd_tx,
-                &self.config.url,
-            )
-            .await;
         Ok(())
     }
 }

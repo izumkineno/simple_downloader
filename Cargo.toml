@@ -4,12 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1.47.1", features = [
-    "rt-multi-thread", # 启用多线程运行时，支持 tokio::spawn
-    "macros",          # 启用宏，主要是为了 tokio::select!
-    "fs",              # 启用异步文件系统操作，如 tokio::fs
-    "io-util",         # 启用 I/O 工具 trait，如 AsyncWriteExt
-] }
+tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
 reqwest = { version = "0.12.23", features = ["stream"] }
 futures-util = "0.3.31"
 bytes = "1.10.1"
@@ -19,5 +14,5 @@ rand = "0.9.2"
 log = "0.4.28"
 
 [dev-dependencies]
-indicatif = "0.18.0"
-env_logger = "0.10.0"
+indicatif = { version = "0.18.0", features = ["tokio"] }
+env_logger = "0.11.8"

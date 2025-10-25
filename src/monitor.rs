@@ -1,291 +1,632 @@
-//! 下载监控器，作为状态、重试和并发管理的协调中心。
+//! 包含核心的 MonitorActor 及其所有权下的状态和逻辑。
+//!
+//! 这个模块是下载引擎的心脏，它作为一个事件中心，
+//! 管理着所有下载块（ChunkActor）、下载状态、并发策略和重试逻辑。
 
-use crate::chunk::chunk_run;
-use crate::concurrency::ConcurrencyManager;
-use crate::retry::RetryHandler;
-use crate::state::{ChunkState, DownloadState};
-use crate::types::{DownloadCmd, DownloadInfo};
+use crate::types::{ChunkId, DownloadInfo, Result, SystemCommand, SystemEvent};
+use bytes::Bytes;
 use faststr::FastStr;
 use futures_util::stream::{FuturesUnordered, StreamExt};
-use log::{debug, error, info, trace, warn};
-use reqwest::Client;
+use log::{error, info, warn};
+use reqwest::{Client, ClientBuilder, RequestBuilder};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use tokio::spawn;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 
-/// 用于速度计算的平滑因子，防止速度因瞬时网络波动而剧烈变化。
 const SMOOTHING_FACTOR: f64 = 0.15;
 
-/// 下载监控器，充当状态、重试和并发管理的协调器。
-pub struct DownloadMonitor {
-    /// 整个下载任务的中心状态存储。
+//==============================================================================================
+// 1. Monitor Actor - 系统事件中心
+//==============================================================================================
+
+pub(crate) struct MonitorActor {
     state: DownloadState,
-    /// 失败块的重试逻辑处理器。
     retry_handler: RetryHandler,
-    /// 动态并发控制管理器。
     concurrency_manager: ConcurrencyManager,
-    /// 状态更新的间隔时间（秒）。
     update_interval: f64,
+    next_chunk_id: AtomicU64,
+    client: Client,
+    url: FastStr,
+    // 通信 Channel
+    event_rx: mpsc::Receiver<SystemEvent>,
+    event_tx: mpsc::Sender<SystemEvent>,
+    cmd_tx: broadcast::Sender<SystemCommand>,
+    info_tx: broadcast::Sender<DownloadInfo>,
+    writer_tx: mpsc::Sender<SystemCommand>,
 }
 
-impl DownloadMonitor {
-    /// 创建一个新的 `DownloadMonitor` 实例。
-    pub fn new(total_file_size: u64, update_interval: f64, max_workers: u64) -> Self {
-        info!(
-            "下载监控器已为 {} 字节的文件初始化，更新间隔: {}s，最大并发: {}。",
-            total_file_size, update_interval, max_workers
-        );
-        Self {
+impl MonitorActor {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        total_file_size: u64,
+        update_interval: f64,
+        max_workers: u64,
+        client_builder: impl Fn() -> ClientBuilder + Send + Sync + 'static,
+        url: FastStr,
+        event_rx: mpsc::Receiver<SystemEvent>,
+        cmd_tx: broadcast::Sender<SystemCommand>,
+        info_tx: broadcast::Sender<DownloadInfo>,
+        writer_tx: mpsc::Sender<SystemCommand>,
+        event_tx: mpsc::Sender<SystemEvent>,
+    ) -> Result<Self> {
+        Ok(Self {
             state: DownloadState::new(total_file_size),
             retry_handler: RetryHandler::new(),
             concurrency_manager: ConcurrencyManager::new(max_workers),
             update_interval,
-        }
+            next_chunk_id: AtomicU64::new(0),
+            client: client_builder().build()?,
+            url,
+            event_rx,
+            cmd_tx,
+            info_tx,
+            writer_tx,
+            event_tx,
+        })
     }
 
-    /// 运行监控器的主事件循环。
-    ///
-    /// 这个循环会监听来自各个下载块的信息，并定期触发状态更新、并发决策和重试处理。
-    #[allow(clippy::too_many_arguments)]
-    pub async fn run(
-        mut self,
-        mut info_rx: broadcast::Receiver<DownloadInfo>,
-        info_tx: broadcast::Sender<DownloadInfo>,
-        mut tasks: FuturesUnordered<JoinHandle<()>>,
-        next_chunk_id: &AtomicU64,
-        client: &Client,
-        writer_tx: mpsc::Sender<DownloadCmd>,
-        cmd_tx: &broadcast::Sender<DownloadCmd>,
-        url: &FastStr,
-    ) {
-        info!("下载监控器正在运行。");
+    /// 启动 MonitorActor 的主事件循环。
+    pub(crate) async fn run(mut self) {
+        info!("[MonitorActor] 正在运行。");
+        let mut tasks = FuturesUnordered::<JoinHandle<()>>::new();
         let mut ticker = interval(Duration::from_secs_f64(self.update_interval));
         let mut last_tick_time = Instant::now();
 
+        self.spawn_chunk_actor(0, self.state.total_file_size.saturating_sub(1), &mut tasks);
+
         'main_loop: loop {
-            trace!("监控器进入主事件循环。");
             tokio::select! {
-                // `biased` 确保优先处理已完成的任务和信息，而不是等待定时器。
                 biased;
-
-                // 一个下载任务已完成（或 panic）
                 Some(result) = tasks.next() => {
-                    if let Err(e) = result { error!("[Monitor] 一个下载任务 panicked: {e}"); }
-                    // 如果所有任务都已结束，则退出循环
+                    if let Err(e) = result { error!("[MonitorActor] 一个下载任务 panicked: {e}"); }
                     if tasks.is_empty() && self.are_all_tasks_done() {
-                        info!("[Monitor] 所有派生的任务已完成，退出主循环。");
                         break 'main_loop;
                     }
                 },
-
-                // 收到来自下载块的信息
-                Ok(info) = info_rx.recv() => {
-                    trace!("[Monitor] 收到信息: {:?}", info);
-                    self.handle_download_info(info, &mut tasks, next_chunk_id, client, &writer_tx, cmd_tx, &info_tx, url);
+                Some(event) = self.event_rx.recv() => {
+                    self.handle_system_event(event, &mut tasks);
                 },
-
-                // 定时器触发
                 _ = ticker.tick() => {
-                    let now = Instant::now();
-                    let elapsed_secs = (now - last_tick_time).as_secs_f64();
-                    last_tick_time = now;
-                    debug!("[Monitor] 定时器触发。距离上次触发时间: {:.3}s", elapsed_secs);
-
-                    // 执行定期的处理逻辑
-                    if self.handle_tick(elapsed_secs, &mut tasks, &info_tx, cmd_tx, client, &writer_tx, url) {
-                        // 如果 tick 处理器返回 true，表示下载已完成
-                        info!("[Monitor] 下载完成。发出信号以退出主循环。");
+                    let elapsed_secs = (Instant::now() - last_tick_time).as_secs_f64();
+                    last_tick_time = Instant::now();
+                    if self.handle_tick(elapsed_secs, &mut tasks) {
                         break 'main_loop;
                     }
                 },
-
-                // 通道关闭或发生其他错误，退出循环
-                else => {
-                    warn!("[Monitor] 主事件循环退出，可能是因为通道已关闭。");
-                    break;
-                }
+                else => break,
             }
         }
-        info!("[Monitor] 所有下载任务已完成。监控器正在关闭。");
+        info!("[MonitorActor] 所有下载任务已完成，正在关闭。");
     }
 
-    /// 处理从下载块接收到的各种 `DownloadInfo` 消息。
-    fn handle_download_info(
+    fn handle_system_event(
         &mut self,
-        info: DownloadInfo,
+        event: SystemEvent,
         tasks: &mut FuturesUnordered<JoinHandle<()>>,
-        next_chunk_id: &AtomicU64,
-        client: &Client,
-        writer_tx: &mpsc::Sender<DownloadCmd>,
-        cmd_tx: &broadcast::Sender<DownloadCmd>,
-        info_tx: &broadcast::Sender<DownloadInfo>,
-        url: &FastStr,
     ) {
-        match info {
-            DownloadInfo::ChunkProgress {
-                id,
-                start_byte,
-                end_byte,
-                downloaded,
-            } => {
-                trace!("[Monitor] 处理块 {} 的进度，已下载: {}。", id, downloaded);
-                // 更新块的进度信息
-                let chunk = self
-                    .state
-                    .chunks
-                    .entry(id)
-                    .or_insert_with(|| ChunkState::new(id, start_byte, end_byte));
-                chunk.update_downloaded(downloaded);
-                chunk.update_end_byte(end_byte);
-                // 如果块的状态不是“下载中”，则更新为“下载中”
-                if chunk.status != 0 {
-                    chunk.update_status(0, None);
-                    let _ = info_tx.send(DownloadInfo::ChunkStatusChanged {
-                        id,
-                        status: 0,
-                        message: None,
-                    });
+        match event {
+            SystemEvent::ChunkProgress { id, downloaded } => {
+                if let Some(chunk) = self.state.chunks.get_mut(&id) {
+                    chunk.update_downloaded(downloaded);
                 }
             }
-            DownloadInfo::DownloadComplete(id) => {
-                info!("[Monitor] 块 {} 已完成。", id);
-                // 标记一个块为已完成
+            SystemEvent::ChunkCompleted { id } => {
                 self.state.complete_chunk(&id);
                 self.retry_handler.on_download_complete(&id);
-                let _ = info_tx.send(DownloadInfo::ChunkStatusChanged {
-                    id,
-                    status: 4,
-                    message: None,
-                });
             }
-            DownloadInfo::ChunkFailed {
+            SystemEvent::ChunkFailed {
                 id,
                 start,
                 end,
                 error,
             } => {
-                warn!("[Monitor] 块 {} 失败。委托给 RetryHandler。", id);
-                // 将失败的块交给重试处理器
-                self.retry_handler
-                    .on_chunk_failed(id, start, end, error, &mut self.state, info_tx);
+                self.retry_handler.on_chunk_failed(
+                    id,
+                    start,
+                    end,
+                    error,
+                    &mut self.state,
+                    &self.info_tx,
+                );
             }
-            DownloadInfo::ChunkBisected {
+            SystemEvent::ChunkBisected {
                 original_id,
                 new_start,
                 new_end,
             } => {
-                let new_id = next_chunk_id.fetch_add(1, Ordering::SeqCst);
-                info!(
-                    "[Monitor] 块 {} 已分割。为新块 (ID: {}) 派生新任务，范围: {}-{}",
-                    original_id, new_id, new_start, new_end
-                );
-                // 当一个块被分割时，为新的部分创建一个新的下载任务
-                let rb = client.get(url.as_str());
-                let task = chunk_run(
-                    new_id,
-                    writer_tx.clone(),
-                    cmd_tx.subscribe(),
-                    info_tx.clone(),
-                    rb,
-                    new_start,
-                    new_end,
-                );
-                tasks.push(tokio::spawn(task));
+                if let Some(chunk) = self.state.chunks.get_mut(&original_id) {
+                    chunk.update_end_byte(new_start.saturating_sub(1));
+                }
+                self.spawn_chunk_actor(new_start, new_end, tasks);
             }
-            _ => {}
         }
     }
 
-    /// 处理定时器触发的事件。
-    /// 返回 `true` 表示下载已完成。
     fn handle_tick(
         &mut self,
         elapsed_secs: f64,
         tasks: &mut FuturesUnordered<JoinHandle<()>>,
-        info_tx: &broadcast::Sender<DownloadInfo>,
-        cmd_tx: &broadcast::Sender<DownloadCmd>,
-        client: &Client,
-        writer_tx: &mpsc::Sender<DownloadCmd>,
-        url: &FastStr,
     ) -> bool {
-        debug!("[Monitor] 处理定时器事件。更新速度，检查并发和重试。");
         if elapsed_secs <= 0.0 {
             return false;
         }
 
-        // 委托状态更新：计算每个块的速度
         for chunk in self.state.chunks.values_mut() {
             chunk.update_speed(elapsed_secs, SMOOTHING_FACTOR);
         }
-        // 发送聚合后的监控更新
-        self.send_monitor_update(info_tx);
-
-        // 委托并发控制：让并发管理器决定是否需要分割块
-        trace!("[Monitor] 委托给 ConcurrencyManager。");
-        self.concurrency_manager.decide_and_act(&self.state, cmd_tx);
-
-        // 委托重试处理：处理重试队列
-        trace!("[Monitor] 委托给 RetryHandler 处理队列。");
+        self.send_monitor_update();
+        self.concurrency_manager
+            .decide_and_act(&self.state, &self.cmd_tx);
         self.retry_handler.process_queues();
         while let Some(chunk_to_retry) = self.retry_handler.pop_ready_chunk() {
-            info!(
-                "[Monitor] 一个块准备好重试，为 id {} 创建新任务。",
-                chunk_to_retry.id
-            );
-            // 如果有块准备好重试，则为其创建新任务
-            let _ = info_tx.send(DownloadInfo::ChunkStatusChanged {
-                id: chunk_to_retry.id,
-                status: 1, // 状态：重试中
-                message: Some(format!("正在进行第 {} 次重试", chunk_to_retry.attempts)),
-            });
-            let rb = client.get(url.as_str());
-            let task = chunk_run(
-                chunk_to_retry.id,
-                writer_tx.clone(),
-                cmd_tx.subscribe(),
-                info_tx.clone(),
-                rb,
-                chunk_to_retry.start,
-                chunk_to_retry.end,
-            );
-            tasks.push(tokio::spawn(task));
+            self.spawn_chunk_actor(chunk_to_retry.start, chunk_to_retry.end, tasks);
         }
 
-        // 检查下载是否已全部完成
         self.are_all_tasks_done() && self.state.is_download_finished()
     }
 
-    /// 发送聚合的监控更新信息。
-    fn send_monitor_update(&self, info_tx: &broadcast::Sender<DownloadInfo>) {
-        let total_downloaded = self.state.total_downloaded();
-        let total_speed = self.state.total_speed();
-        let progress = if self.state.total_file_size > 0 {
-            (total_downloaded as f64 / self.state.total_file_size as f64) * 100.0
-        } else {
-            0.0
-        };
-        debug!(
-            "[Monitor] 发送更新: {:.2}% 完成, 速度: {:.2} B/s",
-            progress, total_speed
+    fn spawn_chunk_actor(
+        &mut self,
+        start: u64,
+        end: u64,
+        tasks: &mut FuturesUnordered<JoinHandle<()>>,
+    ) {
+        let id = self.next_chunk_id.fetch_add(1, Ordering::SeqCst);
+        info!(
+            "[MonitorActor] 派生新 ChunkActor (ID: {}), 范围: {}-{}",
+            id, start, end
         );
-        let chunk_details = self
-            .state
+        self.state
             .chunks
-            .values()
-            .map(|c| (c.id, c.size(), c.downloaded_bytes, c.speed, c.status))
-            .collect();
-        let _ = info_tx.send(DownloadInfo::MonitorUpdate {
+            .insert(id, ChunkState::new(id, start, end));
+        let task = chunk_actor_task(
+            id,
+            self.event_tx.clone(),
+            self.writer_tx.clone(),
+            self.cmd_tx.subscribe(),
+            self.client.get(self.url.as_str()),
+            start,
+            end,
+        );
+        tasks.push(spawn(task));
+    }
+
+    fn send_monitor_update(&self) {
+        let _ = self.info_tx.send(DownloadInfo::MonitorUpdate {
             total_size: self.state.total_file_size,
-            total_downloaded,
-            total_speed,
-            chunk_details,
+            total_downloaded: self.state.total_downloaded(),
+            total_speed: self.state.total_speed(),
+            chunk_details: self
+                .state
+                .chunks
+                .values()
+                .map(|c| (c.id, c.size(), c.downloaded_bytes, c.speed, c.status))
+                .collect(),
         });
     }
 
-    /// 检查是否所有任务（包括活跃的下载和重试队列中的）都已处理完毕。
     fn are_all_tasks_done(&self) -> bool {
         self.state.chunks.is_empty() && self.retry_handler.are_all_tasks_done()
+    }
+}
+
+//==============================================================================================
+// 2. Chunk Actor - 下载工作单元
+//==============================================================================================
+
+const MIN_CHUNK_SIZE: u64 = 1024 * 10;
+
+async fn chunk_actor_task(
+    id: ChunkId,
+    event_tx: mpsc::Sender<SystemEvent>,
+    writer_tx: mpsc::Sender<SystemCommand>,
+    mut cmd_rx: broadcast::Receiver<SystemCommand>,
+    rb: RequestBuilder,
+    start_byte: u64,
+    end_byte: u64,
+) {
+    let mut end = end_byte;
+    let mut offset = start_byte;
+    let mut failed = false;
+
+    let range_header = format!("bytes={start_byte}-{end_byte}");
+    let response = match rb
+        .header("Range", range_header)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            let _ = event_tx
+                .send(SystemEvent::ChunkFailed {
+                    id,
+                    start: start_byte,
+                    end,
+                    error: e.to_string(),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let mut stream = response.bytes_stream();
+
+    loop {
+        tokio::select! {
+            biased;
+            Ok(cmd) = cmd_rx.recv() => {
+                if let SystemCommand::BisectDownload { id: id_ } = cmd {
+                    if id == id_ {
+                        let remaining = end.saturating_sub(offset);
+                        if remaining >= MIN_CHUNK_SIZE * 2 {
+                            let midpoint = offset + remaining / 2;
+                            if event_tx.send(SystemEvent::ChunkBisected { original_id: id, new_start: midpoint + 1, new_end: end }).await.is_ok() {
+                                end = midpoint;
+                            }
+                        }
+                    }
+                } else if let SystemCommand::TerminateAll = cmd {
+                    break;
+                }
+            },
+            chunk_result = stream.next() => {
+                match chunk_result {
+                    Some(Ok(mut chunk)) => {
+                        if offset > end { break; }
+                        let allowed = end.saturating_sub(offset).saturating_add(1);
+                        if allowed == 0 { break; }
+                        let len = chunk.len();
+                        let write_len = std::cmp::min(allowed, len as u64);
+                        let to_write: Bytes = if write_len as usize == len { chunk } else { chunk.split_to(write_len as usize) };
+
+                        if writer_tx.send(SystemCommand::WriteFile { offset, data: to_write }).await.is_err() {
+                            let _ = event_tx.send(SystemEvent::ChunkFailed { id, start: offset, end, error: "File write channel closed".to_string() }).await;
+                            failed = true;
+                            break;
+                        }
+                        offset = offset.saturating_add(write_len);
+                        let _ = event_tx.send(SystemEvent::ChunkProgress { id, downloaded: offset.saturating_sub(start_byte) }).await;
+                        if write_len < len as u64 { break; }
+                    }
+                    Some(Err(e)) => {
+                        let _ = event_tx.send(SystemEvent::ChunkFailed { id, start: offset, end, error: e.to_string() }).await;
+                        failed = true;
+                        break;
+                    },
+                    None => break,
+                }
+            },
+            else => break,
+        }
+    }
+
+    if !failed {
+        let _ = event_tx.send(SystemEvent::ChunkCompleted { id }).await;
+    }
+}
+
+//==============================================================================================
+// 3. State Management - 状态机定义
+//==============================================================================================
+
+#[derive(Debug, Clone)]
+struct ChunkState {
+    id: ChunkId,
+    start_byte: u64,
+    end_byte: u64,
+    downloaded_bytes: u64,
+    last_sampled_bytes: u64,
+    speed: f64,
+    status: u8,
+}
+
+impl ChunkState {
+    fn new(id: ChunkId, start_byte: u64, end_byte: u64) -> Self {
+        Self {
+            id,
+            start_byte,
+            end_byte,
+            downloaded_bytes: 0,
+            last_sampled_bytes: 0,
+            speed: 0.0,
+            status: 0,
+        }
+    }
+    fn update_downloaded(&mut self, downloaded_bytes: u64) {
+        self.downloaded_bytes = downloaded_bytes;
+    }
+    fn update_end_byte(&mut self, end_byte: u64) {
+        self.end_byte = end_byte;
+    }
+    fn size(&self) -> u64 {
+        self.end_byte.saturating_sub(self.start_byte) + 1
+    }
+    fn update_speed(&mut self, elapsed_secs: f64, smoothing_factor: f64) {
+        let newly_downloaded = self
+            .downloaded_bytes
+            .saturating_sub(self.last_sampled_bytes);
+        let instantaneous_speed = newly_downloaded as f64 / elapsed_secs;
+        self.speed = if self.speed == 0.0 {
+            instantaneous_speed
+        } else {
+            (instantaneous_speed * smoothing_factor) + (self.speed * (1.0 - smoothing_factor))
+        };
+        self.last_sampled_bytes = self.downloaded_bytes;
+    }
+}
+
+struct DownloadState {
+    total_file_size: u64,
+    chunks: HashMap<ChunkId, ChunkState>,
+    completed_bytes: u64,
+}
+
+impl DownloadState {
+    fn new(total_file_size: u64) -> Self {
+        Self {
+            total_file_size,
+            chunks: HashMap::new(),
+            completed_bytes: 0,
+        }
+    }
+    fn complete_chunk(&mut self, id: &ChunkId) {
+        if let Some(chunk) = self.chunks.remove(id) {
+            self.completed_bytes += chunk.downloaded_bytes;
+        }
+    }
+    fn total_downloaded(&self) -> u64 {
+        self.completed_bytes
+            + self
+                .chunks
+                .values()
+                .map(|c| c.downloaded_bytes)
+                .sum::<u64>()
+    }
+    fn total_speed(&self) -> f64 {
+        self.chunks.values().map(|c| c.speed).sum::<f64>()
+    }
+    fn is_download_finished(&self) -> bool {
+        self.total_downloaded() >= self.total_file_size
+    }
+}
+
+//==============================================================================================
+// 4. Concurrency Management - 动态并发控制器
+//==============================================================================================
+
+struct ConcurrencyManager {
+    max_workers: u64,
+    phase: DownloadPhase,
+    max_speed: f64,
+    last_split_time: Instant,
+    stable_speed_samples: VecDeque<f64>,
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum DownloadPhase {
+    Probing,
+    Stable,
+}
+
+impl ConcurrencyManager {
+    fn new(max_workers: u64) -> Self {
+        Self {
+            max_workers,
+            phase: if max_workers == 1 {
+                DownloadPhase::Stable
+            } else {
+                DownloadPhase::Probing
+            },
+            max_speed: 0.0,
+            last_split_time: Instant::now(),
+            stable_speed_samples: VecDeque::with_capacity(10),
+        }
+    }
+    fn decide_and_act(&mut self, state: &DownloadState, cmd_tx: &broadcast::Sender<SystemCommand>) {
+        if self.last_split_time.elapsed() < Duration::from_millis(300) {
+            return;
+        }
+        let current_speed = state.total_speed();
+        self.stable_speed_samples.push_back(current_speed);
+        if self.stable_speed_samples.len() > 5 {
+            self.stable_speed_samples.pop_front();
+        }
+        if self.stable_speed_samples.is_empty() {
+            return;
+        }
+        let avg_speed =
+            self.stable_speed_samples.iter().sum::<f64>() / self.stable_speed_samples.len() as f64;
+        let remaining_bytes = state
+            .total_file_size
+            .saturating_sub(state.total_downloaded());
+        let estimated_time = if avg_speed > 0.0 {
+            remaining_bytes as f64 / avg_speed
+        } else {
+            f64::MAX
+        };
+        match self.phase {
+            DownloadPhase::Probing => self.handle_probing_phase(state, avg_speed, cmd_tx),
+            DownloadPhase::Stable => {
+                self.handle_stable_phase(state, avg_speed, estimated_time, cmd_tx)
+            }
+        }
+        self.reactive_split(state, cmd_tx);
+    }
+    fn handle_probing_phase(
+        &mut self,
+        state: &DownloadState,
+        avg_speed: f64,
+        cmd_tx: &broadcast::Sender<SystemCommand>,
+    ) {
+        let active_chunks = state.chunks.len() as u64;
+        if active_chunks >= self.max_workers {
+            self.transition_to_stable();
+            return;
+        }
+        if avg_speed > self.max_speed * 1.2 || self.max_speed == 0.0 {
+            self.max_speed = avg_speed;
+            if let Some(largest_chunk) = state.chunks.values().max_by_key(|c| c.size()) {
+                self.request_split(largest_chunk.id, cmd_tx);
+            }
+        } else if active_chunks > 1 && self.stable_speed_samples.len() >= 3 {
+            self.transition_to_stable();
+        }
+    }
+    fn handle_stable_phase(
+        &mut self,
+        state: &DownloadState,
+        avg_speed: f64,
+        estimated_time: f64,
+        cmd_tx: &broadcast::Sender<SystemCommand>,
+    ) {
+        if self.stable_speed_samples.len() > 3
+            && (avg_speed > self.max_speed * 1.2 || avg_speed < self.max_speed * 0.8)
+            && estimated_time > 5.0
+            && (state.chunks.len() as u64) < self.max_workers
+        {
+            if let Some(slowest_chunk) = state
+                .chunks
+                .values()
+                .filter(|c| c.size().saturating_sub(c.downloaded_bytes) > MIN_CHUNK_SIZE * 2)
+                .min_by(|a, b| {
+                    a.speed
+                        .partial_cmp(&b.speed)
+                        .unwrap_or(core::cmp::Ordering::Equal)
+                })
+            {
+                self.request_split(slowest_chunk.id, cmd_tx);
+            }
+            if avg_speed < self.max_speed * 0.8 {
+                self.stable_speed_samples.clear();
+            }
+        }
+    }
+    fn reactive_split(&mut self, state: &DownloadState, cmd_tx: &broadcast::Sender<SystemCommand>) {
+        if self.phase == DownloadPhase::Stable
+            && self.last_split_time.elapsed() > Duration::from_millis(300)
+        {
+            let active_chunks = state.chunks.len() as u64;
+            if active_chunks > 0 && active_chunks < self.max_workers {
+                if let Some(largest_chunk) = state.chunks.values().max_by_key(|c| c.size()) {
+                    self.request_split(largest_chunk.id, cmd_tx);
+                }
+            }
+        }
+    }
+    fn request_split(&mut self, id: ChunkId, cmd_tx: &broadcast::Sender<SystemCommand>) {
+        let _ = cmd_tx.send(SystemCommand::BisectDownload { id });
+        self.last_split_time = Instant::now();
+    }
+    fn transition_to_stable(&mut self) {
+        self.phase = DownloadPhase::Stable;
+        self.stable_speed_samples.clear();
+    }
+}
+
+//==============================================================================================
+// 5. Retry Management - 重试处理器
+//==============================================================================================
+
+struct RetryHandler {
+    retry_queue: VecDeque<FailedChunkInfo>,
+    delayed_retry_queue: VecDeque<DelayedChunkInfo>,
+    retry_attempts: HashMap<ChunkId, u32>,
+}
+
+#[derive(Debug)]
+struct FailedChunkInfo {
+    start: u64,
+    end: u64,
+    failure_time: Instant,
+    attempts: u32,
+}
+#[derive(Debug)]
+struct DelayedChunkInfo {
+    chunk: FailedChunkInfo,
+    retry_at: Instant,
+}
+
+impl RetryHandler {
+    fn new() -> Self {
+        Self {
+            retry_queue: VecDeque::new(),
+            delayed_retry_queue: VecDeque::new(),
+            retry_attempts: HashMap::new(),
+        }
+    }
+    fn on_chunk_failed(
+        &mut self,
+        id: ChunkId,
+        start: u64,
+        end: u64,
+        error: String,
+        state: &mut DownloadState,
+        info_tx: &broadcast::Sender<DownloadInfo>,
+    ) {
+        warn!("[RetryHandler] 收到块 {id} 的失败报告: {error}");
+        state.chunks.remove(&id);
+        let attempts = self.retry_attempts.entry(id).or_insert(0);
+        *attempts += 1;
+        if *attempts <= 10 {
+            let _ = info_tx.send(DownloadInfo::ChunkStatusChanged {
+                id,
+                status: 2,
+                message: Some(format!("将进行第 {} 次重试 (共 10 次)", *attempts)),
+            });
+            self.retry_queue.push_back(FailedChunkInfo {
+                start,
+                end,
+                failure_time: Instant::now(),
+                attempts: *attempts,
+            });
+        } else {
+            let _ = info_tx.send(DownloadInfo::ChunkStatusChanged {
+                id,
+                status: 3,
+                message: Some(format!("将在 {:?} 后重试", Duration::from_secs(10))),
+            });
+            self.delayed_retry_queue.push_back(DelayedChunkInfo {
+                chunk: FailedChunkInfo {
+                    start,
+                    end,
+                    failure_time: Instant::now(),
+                    attempts: *attempts,
+                },
+                retry_at: Instant::now() + Duration::from_secs(10),
+            });
+            self.retry_attempts.remove(&id);
+        }
+    }
+    fn process_queues(&mut self) {
+        let now = Instant::now();
+        while let Some(delayed_info) = self.delayed_retry_queue.front() {
+            if now >= delayed_info.retry_at {
+                let mut info_to_retry = self.delayed_retry_queue.pop_front().unwrap().chunk;
+                info_to_retry.failure_time = Instant::now();
+                info_to_retry.attempts = 0;
+                self.retry_queue.push_back(info_to_retry);
+            } else {
+                break;
+            }
+        }
+    }
+    fn pop_ready_chunk(&mut self) -> Option<FailedChunkInfo> {
+        if let Some(failed_chunk) = self.retry_queue.front() {
+            if failed_chunk.failure_time.elapsed() >= Duration::from_secs(2) {
+                return self.retry_queue.pop_front();
+            }
+        }
+        None
+    }
+    fn on_download_complete(&mut self, id: &ChunkId) {
+        self.retry_attempts.remove(id);
+    }
+    fn are_all_tasks_done(&self) -> bool {
+        self.retry_queue.is_empty() && self.delayed_retry_queue.is_empty()
     }
 }
