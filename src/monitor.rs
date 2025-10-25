@@ -7,6 +7,7 @@ use crate::state::{ChunkState, DownloadState};
 use crate::types::{DownloadCmd, DownloadInfo};
 use faststr::FastStr;
 use futures_util::stream::{FuturesUnordered, StreamExt};
+use log::{debug, error, info, trace, warn};
 use reqwest::Client;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -32,6 +33,10 @@ pub struct DownloadMonitor {
 impl DownloadMonitor {
     /// 创建一个新的 `DownloadMonitor` 实例。
     pub fn new(total_file_size: u64, update_interval: f64, max_workers: u64) -> Self {
+        info!(
+            "下载监控器已为 {} 字节的文件初始化，更新间隔: {}s，最大并发: {}。",
+            total_file_size, update_interval, max_workers
+        );
         Self {
             state: DownloadState::new(total_file_size),
             retry_handler: RetryHandler::new(),
@@ -55,23 +60,29 @@ impl DownloadMonitor {
         cmd_tx: &broadcast::Sender<DownloadCmd>,
         url: &FastStr,
     ) {
+        info!("下载监控器正在运行。");
         let mut ticker = interval(Duration::from_secs_f64(self.update_interval));
         let mut last_tick_time = Instant::now();
 
         'main_loop: loop {
+            trace!("监控器进入主事件循环。");
             tokio::select! {
                 // `biased` 确保优先处理已完成的任务和信息，而不是等待定时器。
                 biased;
 
                 // 一个下载任务已完成（或 panic）
                 Some(result) = tasks.next() => {
-                    if let Err(e) = result { eprintln!("[Monitor] 一个下载任务 panicked: {e}"); }
+                    if let Err(e) = result { error!("[Monitor] 一个下载任务 panicked: {e}"); }
                     // 如果所有任务都已结束，则退出循环
-                    if tasks.is_empty() && self.are_all_tasks_done() { break 'main_loop; }
+                    if tasks.is_empty() && self.are_all_tasks_done() {
+                        info!("[Monitor] 所有派生的任务已完成，退出主循环。");
+                        break 'main_loop;
+                    }
                 },
 
                 // 收到来自下载块的信息
                 Ok(info) = info_rx.recv() => {
+                    trace!("[Monitor] 收到信息: {:?}", info);
                     self.handle_download_info(info, &mut tasks, next_chunk_id, client, &writer_tx, cmd_tx, &info_tx, url);
                 },
 
@@ -80,19 +91,24 @@ impl DownloadMonitor {
                     let now = Instant::now();
                     let elapsed_secs = (now - last_tick_time).as_secs_f64();
                     last_tick_time = now;
+                    debug!("[Monitor] 定时器触发。距离上次触发时间: {:.3}s", elapsed_secs);
 
                     // 执行定期的处理逻辑
                     if self.handle_tick(elapsed_secs, &mut tasks, &info_tx, cmd_tx, client, &writer_tx, url) {
                         // 如果 tick 处理器返回 true，表示下载已完成
+                        info!("[Monitor] 下载完成。发出信号以退出主循环。");
                         break 'main_loop;
                     }
                 },
 
                 // 通道关闭或发生其他错误，退出循环
-                else => break,
+                else => {
+                    warn!("[Monitor] 主事件循环退出，可能是因为通道已关闭。");
+                    break;
+                }
             }
         }
-        println!("[Monitor] 所有下载任务已完成。监控器正在关闭。");
+        info!("[Monitor] 所有下载任务已完成。监控器正在关闭。");
     }
 
     /// 处理从下载块接收到的各种 `DownloadInfo` 消息。
@@ -114,6 +130,7 @@ impl DownloadMonitor {
                 end_byte,
                 downloaded,
             } => {
+                trace!("[Monitor] 处理块 {} 的进度，已下载: {}。", id, downloaded);
                 // 更新块的进度信息
                 let chunk = self
                     .state
@@ -133,6 +150,7 @@ impl DownloadMonitor {
                 }
             }
             DownloadInfo::DownloadComplete(id) => {
+                info!("[Monitor] 块 {} 已完成。", id);
                 // 标记一个块为已完成
                 self.state.complete_chunk(&id);
                 self.retry_handler.on_download_complete(&id);
@@ -148,15 +166,22 @@ impl DownloadMonitor {
                 end,
                 error,
             } => {
+                warn!("[Monitor] 块 {} 失败。委托给 RetryHandler。", id);
                 // 将失败的块交给重试处理器
                 self.retry_handler
                     .on_chunk_failed(id, start, end, error, &mut self.state, info_tx);
             }
             DownloadInfo::ChunkBisected {
-                new_start, new_end, ..
+                original_id,
+                new_start,
+                new_end,
             } => {
-                // 当一个块被分割时，为新的部分创建一个新的下载任务
                 let new_id = next_chunk_id.fetch_add(1, Ordering::SeqCst);
+                info!(
+                    "[Monitor] 块 {} 已分割。为新块 (ID: {}) 派生新任务，范围: {}-{}",
+                    original_id, new_id, new_start, new_end
+                );
+                // 当一个块被分割时，为新的部分创建一个新的下载任务
                 let rb = client.get(url.as_str());
                 let task = chunk_run(
                     new_id,
@@ -185,6 +210,7 @@ impl DownloadMonitor {
         writer_tx: &mpsc::Sender<DownloadCmd>,
         url: &FastStr,
     ) -> bool {
+        debug!("[Monitor] 处理定时器事件。更新速度，检查并发和重试。");
         if elapsed_secs <= 0.0 {
             return false;
         }
@@ -197,11 +223,17 @@ impl DownloadMonitor {
         self.send_monitor_update(info_tx);
 
         // 委托并发控制：让并发管理器决定是否需要分割块
+        trace!("[Monitor] 委托给 ConcurrencyManager。");
         self.concurrency_manager.decide_and_act(&self.state, cmd_tx);
 
         // 委托重试处理：处理重试队列
+        trace!("[Monitor] 委托给 RetryHandler 处理队列。");
         self.retry_handler.process_queues();
         while let Some(chunk_to_retry) = self.retry_handler.pop_ready_chunk() {
+            info!(
+                "[Monitor] 一个块准备好重试，为 id {} 创建新任务。",
+                chunk_to_retry.id
+            );
             // 如果有块准备好重试，则为其创建新任务
             let _ = info_tx.send(DownloadInfo::ChunkStatusChanged {
                 id: chunk_to_retry.id,
@@ -227,6 +259,17 @@ impl DownloadMonitor {
 
     /// 发送聚合的监控更新信息。
     fn send_monitor_update(&self, info_tx: &broadcast::Sender<DownloadInfo>) {
+        let total_downloaded = self.state.total_downloaded();
+        let total_speed = self.state.total_speed();
+        let progress = if self.state.total_file_size > 0 {
+            (total_downloaded as f64 / self.state.total_file_size as f64) * 100.0
+        } else {
+            0.0
+        };
+        debug!(
+            "[Monitor] 发送更新: {:.2}% 完成, 速度: {:.2} B/s",
+            progress, total_speed
+        );
         let chunk_details = self
             .state
             .chunks
@@ -235,8 +278,8 @@ impl DownloadMonitor {
             .collect();
         let _ = info_tx.send(DownloadInfo::MonitorUpdate {
             total_size: self.state.total_file_size,
-            total_downloaded: self.state.total_downloaded(),
-            total_speed: self.state.total_speed(),
+            total_downloaded,
+            total_speed,
             chunk_details,
         });
     }

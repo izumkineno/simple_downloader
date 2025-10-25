@@ -1,6 +1,7 @@
 //! 定义用于存储下载状态的数据结构。
 
 use crate::types::ChunkId;
+use log::{debug, info, trace};
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -31,6 +32,10 @@ pub struct ChunkState {
 impl ChunkState {
     /// 创建一个新的 `ChunkState` 实例。
     pub fn new(id: ChunkId, start_byte: u64, end_byte: u64) -> Self {
+        debug!(
+            "为块 {} 创建新的 ChunkState，范围: {}-{}",
+            id, start_byte, end_byte
+        );
         Self {
             id,
             start_byte,
@@ -46,6 +51,10 @@ impl ChunkState {
 
     /// 更新块的状态。
     pub fn update_status(&mut self, status: u8, message: Option<String>) {
+        debug!(
+            "更新块 {} 的状态: {} -> {}, 消息: {:?}",
+            self.id, self.status, status, message
+        );
         self.status = status;
         self.status_message = message;
         self.status_changed_at = Instant::now();
@@ -58,7 +67,13 @@ impl ChunkState {
 
     /// 更新块的结束字节位置（当块被分割时会发生变化）。
     pub fn update_end_byte(&mut self, end_byte: u64) {
-        self.end_byte = end_byte;
+        if self.end_byte != end_byte {
+            debug!(
+                "更新块 {} 的结束字节: {} -> {}",
+                self.id, self.end_byte, end_byte
+            );
+            self.end_byte = end_byte;
+        }
     }
 
     /// 计算块的总大小。
@@ -73,14 +88,21 @@ impl ChunkState {
             .downloaded_bytes
             .saturating_sub(self.last_sampled_bytes);
         let instantaneous_speed = newly_downloaded as f64 / elapsed_secs;
-        if self.speed == 0.0 {
+
+        let new_speed = if self.speed == 0.0 {
             // 第一次计算速度时，直接使用瞬时速度
-            self.speed = instantaneous_speed;
+            instantaneous_speed
         } else {
             // 使用平滑算法更新速度
-            self.speed =
-                (instantaneous_speed * smoothing_factor) + (self.speed * (1.0 - smoothing_factor));
-        }
+            (instantaneous_speed * smoothing_factor) + (self.speed * (1.0 - smoothing_factor))
+        };
+
+        trace!(
+            "[ChunkState id={}] 更新速度。新增下载: {}, 耗时: {:.3}s, 旧速度: {:.2}, 新速度: {:.2}",
+            self.id, newly_downloaded, elapsed_secs, self.speed, new_speed
+        );
+
+        self.speed = new_speed;
         self.last_sampled_bytes = self.downloaded_bytes;
     }
 }
@@ -98,6 +120,7 @@ pub struct DownloadState {
 impl DownloadState {
     /// 创建一个新的 `DownloadState` 实例。
     pub fn new(total_file_size: u64) -> Self {
+        info!("创建新的 DownloadState，文件总大小: {}", total_file_size);
         Self {
             total_file_size,
             chunks: HashMap::new(),
@@ -109,6 +132,10 @@ impl DownloadState {
     /// 这会将其从活跃块列表中移除，并将其下载的字节数累加到 `completed_bytes`。
     pub fn complete_chunk(&mut self, id: &ChunkId) {
         if let Some(chunk) = self.chunks.remove(id) {
+            debug!(
+                "[DownloadState] 完成块 {}。贡献了 {} 字节。",
+                id, chunk.downloaded_bytes
+            );
             self.completed_bytes += chunk.downloaded_bytes;
         }
     }

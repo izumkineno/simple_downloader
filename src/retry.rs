@@ -2,6 +2,7 @@
 
 use crate::state::DownloadState;
 use crate::types::{ChunkId, DownloadInfo};
+use log::{debug, info, trace, warn};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -45,6 +46,7 @@ pub struct RetryHandler {
 
 impl RetryHandler {
     pub fn new() -> Self {
+        debug!("RetryHandler 已创建。");
         Self {
             retry_queue: VecDeque::new(),
             delayed_retry_queue: VecDeque::new(),
@@ -62,7 +64,7 @@ impl RetryHandler {
         state: &mut DownloadState,
         info_tx: &broadcast::Sender<DownloadInfo>,
     ) {
-        eprintln!("[RetryHandler] 收到块 {id} 的失败报告: {error}");
+        warn!("[RetryHandler] 收到块 {id} 的失败报告: {error}");
 
         // 从活跃的块列表中移除该块
         state.chunks.remove(&id);
@@ -73,8 +75,8 @@ impl RetryHandler {
 
         if *attempts <= MAX_RETRIES {
             // 如果未达到最大重试次数，放入即时重试队列
-            println!(
-                "[Monitor] 块 {id} 将进行第 {} 次重试 (共 {} 次).",
+            info!(
+                "[RetryHandler] 块 {id} 将进行第 {} 次重试 (共 {} 次).",
                 *attempts, MAX_RETRIES
             );
 
@@ -97,9 +99,8 @@ impl RetryHandler {
             });
         } else {
             // 如果已达到最大重试次数，放入延迟队列，等待一段时间后再次尝试。
-            let retry_at = Instant::now() + DELAYED_RETRY_DURATION;
-            println!(
-                "[Monitor] 块 {id} 已达到最大重试次数，将延迟到 {:?} 后再次尝试。",
+            warn!(
+                "[RetryHandler] 块 {id} 已达到最大即时重试次数，将延迟 {:?} 后再次尝试。",
                 DELAYED_RETRY_DURATION
             );
 
@@ -118,7 +119,7 @@ impl RetryHandler {
                     failure_time: Instant::now(),
                     attempts: *attempts,
                 },
-                retry_at,
+                retry_at: Instant::now() + DELAYED_RETRY_DURATION,
             });
 
             // 从即时重试计数器中移除，以便它在长时间等待后能重新开始计数
@@ -128,6 +129,7 @@ impl RetryHandler {
 
     /// 处理队列，将延迟队列中到期的块移回主重试队列。
     pub fn process_queues(&mut self) {
+        debug!("[RetryHandler] 正在处理延迟重试队列。");
         let now = Instant::now();
         while let Some(delayed_info) = self.delayed_retry_queue.front() {
             if now >= delayed_info.retry_at {
@@ -138,8 +140,8 @@ impl RetryHandler {
                 info_to_retry.failure_time = Instant::now();
                 info_to_retry.attempts = 0; // 重置尝试次数
 
-                println!(
-                    "[Monitor] 块 {} 长时间等待结束，重新加入下载队列。",
+                info!(
+                    "[RetryHandler] 块 {} 长时间等待结束，重新加入下载队列。",
                     info_to_retry.id
                 );
 
@@ -154,17 +156,24 @@ impl RetryHandler {
 
     /// 从即时重试队列中弹出一个已达到重试延迟时间的块。
     pub fn pop_ready_chunk(&mut self) -> Option<FailedChunkInfo> {
+        debug!("[RetryHandler] 检查是否有块准备好进行即时重试。");
         if let Some(failed_chunk) = self.retry_queue.front() {
             if failed_chunk.failure_time.elapsed() >= RETRY_DELAY {
+                info!("[RetryHandler] 从重试队列中弹出块 {}。", failed_chunk.id);
                 return self.retry_queue.pop_front();
             }
         }
+        trace!("[RetryHandler] 没有准备好进行即时重试的块。");
         None
     }
 
     /// 当一个块最终下载成功时，清除其重试记录。
     pub fn on_download_complete(&mut self, id: &ChunkId) {
-        self.retry_attempts.remove(&id);
+        debug!(
+            "[RetryHandler] 块 {id} 下载成功，从重试跟踪中移除。",
+            id = id
+        );
+        self.retry_attempts.remove(id);
     }
 
     /// 检查所有重试队列是否都为空。

@@ -6,6 +6,7 @@ use crate::types::{DownloadCmd, DownloadInfo, Result};
 use crate::util::{file_writer_task, get_file_info};
 use faststr::FastStr;
 use futures_util::stream::FuturesUnordered;
+use log::{debug, info, trace};
 use reqwest::{Client, ClientBuilder};
 use std::sync::atomic::AtomicU64;
 use tokio::spawn;
@@ -67,10 +68,18 @@ where
     ) -> Self {
         let (cmd_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
         let (info_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
+        let url = url.into();
+        let output_path = output_path.into();
+        info!(
+            "下载器已为 URL '{}' 创建，输出到 '{}'，并发数: {}。",
+            url.as_str(),
+            output_path.as_str(),
+            workers
+        );
         Self {
             config: DownloaderConfig {
-                url: url.into(),
-                output_path: output_path.into(),
+                url,
+                output_path,
                 workers,
             },
             client_builder,
@@ -90,16 +99,23 @@ where
         ProgF: FnOnce(u64, broadcast::Receiver<DownloadInfo>) -> Fut,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
+        info!(
+            "开始下载 '{}' 到 '{}'。",
+            self.config.url, self.config.output_path
+        );
         // 构建 reqwest 客户端
         let client = (self.client_builder)().build()?;
+        debug!("Reqwest 客户端已构建。");
         // 获取文件信息（大小、是否支持范围请求）
         let (file_size, support_ranges) = get_file_info(&client, &self.config.url).await?;
+        info!("文件大小: {file_size}, Range 请求支持: {support_ranges}。");
         // 为进度处理器订阅信息通道
         let info_rx_for_progress = self.info_tx.subscribe();
         // 启动文件写入任务，并获取其命令发送端
         let writer_tx = file_writer_task(self.config.output_path.clone(), file_size).await?;
 
         // 异步执行用户提供的进度处理逻辑
+        debug!("正在派生用户提供的进度处理任务。");
         spawn(progress_handler(file_size, info_rx_for_progress));
 
         // 协调和管理所有下载任务
@@ -107,6 +123,7 @@ where
             .await?;
 
         // 下载结束后，发送终止命令以清理所有任务
+        info!("下载协调完成，发送 TerminateAll 命令以清理任务。");
         let _ = self.cmd_tx.send(DownloadCmd::TerminateAll);
         Ok(())
     }
@@ -131,6 +148,7 @@ where
         } else {
             self.config.workers
         };
+        info!("协调下载，实际并发数: {workers}。");
 
         // 创建并启动第一个下载任务，它将下载整个文件
         let initial_id = next_chunk_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -145,15 +163,18 @@ where
             file_size.saturating_sub(1),
         );
         tasks.push(spawn(task));
-        println!(
-            "[Main] 启动初始下载任务 (ID: {}), 最大并发数设置为: {}",
-            initial_id, workers
+        info!(
+            "[Main] 启动初始下载任务 (ID: {}), 范围: 0-{}",
+            initial_id,
+            file_size.saturating_sub(1)
         );
 
         // 创建下载监控器
         let monitor = DownloadMonitor::new(file_size, self.update_interval, workers);
+        debug!("下载监控器已创建。");
 
         // 运行监控器，它将接管下载过程的管理
+        info!("将控制权移交给下载监控器。");
         monitor
             .run(
                 self.info_tx.subscribe(),

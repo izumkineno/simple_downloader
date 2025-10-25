@@ -164,8 +164,11 @@ async fn progress_bar_task(file_size: u64, mut info_rx: broadcast::Receiver<Down
 async fn main() {
     // 1. --- 配置 ---
 
-    let url = "https://dlied4.myapp.com/myapp/1104466820/cos.release-40109/10040714_com.tencent.tmgp.sgame_a2480356_8.2.1.9_F0BvnI.apk";
-    let output_path = "10040714_com.tencent.tmgp.sgame_a2480356_8.2.1.9_F0BvnI.apk";
+    // let url = "https://dlied4.myapp.com/myapp/1104466820/cos.release-40109/10040714_com.tencent.tmgp.sgame_a2480356_8.2.1.9_F0BvnI.apk";
+    // let output_path = "10040714_com.tencent.tmgp.sgame_a2480356_8.2.1.9_F0BvnI.apk";
+
+    let url = "http://127.0.0.1:8000/RustRover-2025.2.1.exe";
+    let output_path = "RustRover-2025.2.1.exe";
 
     let workers = 16; // 最大并发数
     let update_interval = 0.2; // 更新间隔为 0.2 秒
