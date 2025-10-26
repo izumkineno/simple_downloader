@@ -159,6 +159,12 @@ impl MonitorActor {
                 self.retry_handler.on_download_complete(&id);
                 // 移除对已完成块资源的追踪。
                 self.active_resources.remove(&id);
+                // 向 UI 发送完成状态，便于进度条正确结束。
+                let _ = self.info_tx.send(DownloadInfo::ChunkStatusChanged {
+                    id,
+                    status: 4, // 已完成
+                    message: None,
+                });
             }
             // 一个块下载失败。
             SystemEvent::ChunkFailed {
