@@ -1,10 +1,13 @@
 /// 包含下载器 `Downloader` 的定义，作为系统的入口和监督者。
 use crate::monitor::MonitorActor;
+use crate::resource::WeightedSourceActor;
 use crate::types::{DownloadInfo, DownloaderConfig, Result, SystemCommand, SystemEvent};
 use crate::util::{get_file_info, writer_actor_task};
 use faststr::FastStr;
 use log::{debug, info};
 use reqwest::ClientBuilder;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::spawn;
 use tokio::sync::{broadcast, mpsc};
 
@@ -16,14 +19,17 @@ pub struct Downloader<F>
 where
     F: Fn() -> ClientBuilder + Send + Sync + 'static,
 {
-    /// 要下载的文件的 URL。
-    url: FastStr,
+    /// 下载源
+    urls: Vec<FastStr>,
+    /// 代理库
+    proxies: Vec<FastStr>,
+    add_no_proxy: bool,
     /// 下载文件保存的本地路径。
     output_path: FastStr,
     /// 下载过程的详细配置。
     config: DownloaderConfig,
     /// 用于创建 `reqwest::Client` 的闭包，允许用户自定义 HTTP 客户端。
-    client_builder: F,
+    client_builder: Arc<F>,
 }
 
 impl<F> Downloader<F>
@@ -44,16 +50,20 @@ where
     ///
     /// 返回一个新的 `Downloader` 实例。
     pub fn new(
-        url: impl Into<FastStr>,
+        url: Vec<impl Into<FastStr>>,
+        proxies: Vec<impl Into<FastStr>>,
+        add_no_proxy: bool,
         output_path: impl Into<FastStr>,
         config: DownloaderConfig,
         client_builder: F,
     ) -> Self {
         Self {
-            url: url.into(),
+            urls: url.into_iter().map(Into::into).collect(),
+            proxies: proxies.into_iter().map(Into::into).collect(),
+            add_no_proxy,
             output_path: output_path.into(),
             config,
-            client_builder,
+            client_builder: Arc::new(client_builder),
         }
     }
 
@@ -72,9 +82,20 @@ where
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         info!(
-            "启动下载 Actor 系统: '{}' -> '{}'",
-            self.url, self.output_path
+            "启动下载 Actor 系统: '{:?}' -> '{}'",
+            self.urls, self.output_path
         );
+
+        let (actor, handle) = WeightedSourceActor::new(
+            self.urls,
+            self.proxies,
+            self.client_builder.clone(),
+            self.add_no_proxy,
+            None,
+        );
+        spawn(actor.run());
+
+        handle.test_resources(Duration::from_secs(3)).await;
 
         // 步骤 1: 创建整个系统所需的通信信道。
         // `info_tx/rx`: 用于向用户端广播进度更新。
@@ -85,11 +106,12 @@ where
         let (event_tx, event_rx) = mpsc::channel::<SystemEvent>(self.config.channel_capacity);
 
         // 步骤 2: 获取文件信息（大小和是否支持范围请求）。
-        let client = (self.client_builder)().build()?;
-        let (file_size, _) = get_file_info(&client, &self.url).await?;
+        let (rb, _) = handle.get_request_builder().await.unwrap();
+        let (file_size, _) = get_file_info(rb).await?;
         info!("文件大小: {} 字节。", file_size);
 
         // 步骤 3: 启动文件写入 Actor，它将在一个独立的任务中处理所有文件写入请求。
+        info!("创建写入线程 位置 {}", self.output_path);
         let writer_tx = writer_actor_task(
             self.output_path.clone(),
             file_size,
@@ -98,14 +120,14 @@ where
         .await?;
 
         // 步骤 4: 派生用户提供的进度处理任务。
+        info!("创建进度条线程");
         spawn(progress_handler(file_size, info_rx_for_progress));
 
         // 步骤 5: 创建并启动核心的 MonitorActor，它是下载逻辑的中心。
         let monitor_actor = MonitorActor::new(
             file_size,
             self.config,
-            self.client_builder,
-            self.url,
+            handle,
             event_rx,
             cmd_tx.clone(),
             info_tx,

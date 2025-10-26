@@ -125,14 +125,6 @@ async fn progress_bar_task(file_size: u64, mut info_rx: broadcast::Receiver<Down
 
 #[tokio::main]
 async fn main() {
-    // --- 1. 配置 --- 1.92Gib 117Mib/s 16.8 s   19s
-    let url = "https://dlied4.myapp.com/myapp/1104466820/cos.release-40109/10040714_com.tencent.tmgp.sgame_a2480356_8.2.1.9_F0BvnI.apk";
-    let output_path = "com.tencent.tmgp.sgame_a2480356_8.2.1.9_F0BvnI.apk";
-
-    // 100m/s 19.2s
-    // let url = "http://127.0.0.1:8000/com.tencent.tmgp.sgame_a2480356_8.2.1.9_F0BvnI.apk ";
-    // let output_path = "com.tencent.tmgp.sgame_a2480356_8.2.1.9_F0BvnI.apk";
-
     // 使用 DownloaderConfig 结构体来配置下载参数
     let config = DownloaderConfig {
         workers: 16,          // 最大并发数
@@ -140,9 +132,38 @@ async fn main() {
         ..Default::default()  // 其他选项使用默认值
     };
 
-    // --- 2. 执行 ---
-    // 注意：现在 new 方法的第三个参数是 config 对象
-    let downloader = Downloader::new(url, output_path, config, || ClientBuilder::new());
+    // // --- 1. 配置 --- 1.92Gib 117Mib/s 16.8 s   19s
+    // let url = "https://dlied4.myapp.com/myapp/1104466820/cos.release-40109/10040714_com.tencent.tmgp.sgame_a2480356_8.2.1.9_F0BvnI.apk";
+    // let output_path = "com.tencent.tmgp.sgame_a2480356_8.2.1.9_F0BvnI.apk";
+    //
+    // // 100m/s 19.2s
+    // // let url = "http://127.0.0.1:8000/com.tencent.tmgp.sgame_a2480356_8.2.1.9_F0BvnI.apk ";
+    // // let output_path = "com.tencent.tmgp.sgame_a2480356_8.2.1.9_F0BvnI.apk";
+    //
+    // // --- 2. 执行 ---
+    // // 注意：现在 new 方法的第三个参数是 config 对象
+    // let downloader = Downloader::new(
+    //     vec![url],
+    //     Vec::<&str>::new(),
+    //     true,
+    //     output_path,
+    //     config,
+    //     || ClientBuilder::new(),
+    // );
+
+    let downloader = Downloader::new(
+        vec![
+            "https://github.com/ModOrganizer2/modorganizer/releases/download/v2.5.2/Mod.Organizer-2.5.2.7z",
+            "https://gh-proxy.com/https://github.com/ModOrganizer2/modorganizer/releases/download/v2.5.2/Mod.Organizer-2.5.2.7z",
+            "https://hk.gh-proxy.com/https://github.com/ModOrganizer2/modorganizer/releases/download/v2.5.2/Mod.Organizer-2.5.2.7z",
+            "https://edgeone.gh-proxy.com/https://github.com/ModOrganizer2/modorganizer/releases/download/v2.5.2/Mod.Organizer-2.5.2.7z",
+        ],
+        vec!["http://127.0.0.1:7897"],
+        true,
+        "Mod.Organizer-2.5.2.7z",
+        config,
+        || ClientBuilder::new(),
+    );
 
     println!("开始下载...");
     let start_time = std::time::Instant::now();

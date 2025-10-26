@@ -20,11 +20,26 @@ async fn main() {
 
     // --- 2. 创建 Downloader 实例 ---
     // 注意：现在 new 方法的第三个参数是 config 对象
+    // let downloader = Downloader::new(
+    //     vec!["https://dldir1.qq.com/qqfile/qq/PCQQ9.7.17/QQ9.7.17.29225.exe"],
+    //     None::<Vec<&str>>,
+    //     "QQ9.7.17.29225.exe",
+    //     config,
+    //     || ClientBuilder::new(),
+    // );
+
     let downloader = Downloader::new(
-        "https://dldir1.qq.com/qqfile/qq/PCQQ9.7.17/QQ9.7.17.29225.exe", // 下载链接
-        "QQ9.7.17.29225.exe",                                            // 保存路径
-        config,                                                          // 传入配置对象
-        || ClientBuilder::new(),                                         // 提供网络客户端构建器
+        vec![
+            "https://github.com/ModOrganizer2/modorganizer/releases/download/v2.5.2/Mod.Organizer-2.5.2.7z",
+            "https://gh-proxy.com/https://github.com/ModOrganizer2/modorganizer/releases/download/v2.5.2/Mod.Organizer-2.5.2.7z",
+            "https://hk.gh-proxy.com/https://github.com/ModOrganizer2/modorganizer/releases/download/v2.5.2/Mod.Organizer-2.5.2.7z",
+            "https://edgeone.gh-proxy.com/https://github.com/ModOrganizer2/modorganizer/releases/download/v2.5.2/Mod.Organizer-2.5.2.7z",
+        ],
+        vec!["http://127.0.0.1:7897"],
+        true,
+        "Mod.Organizer-2.5.2.7z",
+        config,
+        || ClientBuilder::new(),
     );
 
     // --- 3. 定义进度处理逻辑 ---

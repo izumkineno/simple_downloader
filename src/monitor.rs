@@ -2,12 +2,12 @@
 ///
 /// 这个模块是下载引擎的心脏，它作为一个事件中心，
 /// 管理着所有下载块（`ChunkActor`）、下载状态、并发策略和重试逻辑。
+use crate::resource::{Resource, ResourceHandle};
 use crate::types::{ChunkId, DownloadInfo, DownloaderConfig, Result, SystemCommand, SystemEvent};
 use bytes::Bytes;
-use faststr::FastStr;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use log::{debug, error, info, warn};
-use reqwest::{Client, ClientBuilder, RequestBuilder};
+use reqwest::RequestBuilder;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use tokio::spawn;
@@ -28,10 +28,7 @@ use tokio::time::interval;
 /// - 执行并发控制策略，决定何时增加下载线程 (`ConcurrencyManager`)。
 /// - 管理失败块的重试逻辑 (`RetryHandler`)。
 /// - 派生和监督所有的 `ChunkActor` 任务。
-pub(crate) struct MonitorActor<F>
-where
-    F: Fn() -> ClientBuilder,
-{
+pub(crate) struct MonitorActor {
     /// 维护下载的全局状态，如文件总大小、各块的进度等。
     state: DownloadState,
     /// 处理失败块的重试逻辑。
@@ -42,10 +39,10 @@ where
     config: DownloaderConfig,
     /// 用于为新块分配唯一的 ID。
     next_chunk_id: u64,
-    /// 用于创建 HTTP 客户端的闭包。
-    client_builder: F,
-    /// 要下载的文件的 URL。
-    url: FastStr,
+    /// 用于获取资源和构建客户端的句柄。
+    handle: ResourceHandle,
+    /// 追踪每个活动 ChunkActor 正在使用的资源。
+    active_resources: HashMap<ChunkId, Resource>,
     // --- 通信 Channel ---
     /// 接收来自 `ChunkActor` 的事件。
     event_rx: mpsc::Receiver<SystemEvent>,
@@ -59,17 +56,13 @@ where
     writer_tx: mpsc::Sender<SystemCommand>,
 }
 
-impl<F> MonitorActor<F>
-where
-    F: Fn() -> ClientBuilder + Send + Sync + 'static,
-{
+impl MonitorActor {
     /// 创建一个新的 `MonitorActor` 实例。
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         total_file_size: u64,
         config: DownloaderConfig,
-        client_builder: F,
-        url: FastStr,
+        handle: ResourceHandle,
         event_rx: mpsc::Receiver<SystemEvent>,
         cmd_tx: broadcast::Sender<SystemCommand>,
         info_tx: broadcast::Sender<DownloadInfo>,
@@ -90,8 +83,8 @@ where
             concurrency_manager,
             config,
             next_chunk_id: 0,
-            client_builder,
-            url,
+            handle,
+            active_resources: HashMap::new(),
             event_rx,
             cmd_tx,
             info_tx,
@@ -109,18 +102,10 @@ where
         let mut tasks = FuturesUnordered::<JoinHandle<()>>::new();
         let mut ticker = interval(Duration::from_secs_f64(self.config.update_interval));
         let mut last_tick_time = Instant::now();
-        // 在 Actor 内部构建 Client，确保它与 Actor 的生命周期绑定。
-        let client = (self.client_builder)()
-            .build()
-            .expect("在 MonitorActor 中构建 Client 失败");
 
         // 初始时，派生一个覆盖整个文件范围的下载块。
-        self.spawn_chunk_actor(
-            0,
-            self.state.total_file_size.saturating_sub(1),
-            &client,
-            &mut tasks,
-        );
+        self.spawn_chunk_actor(0, self.state.total_file_size.saturating_sub(1), &mut tasks)
+            .await;
 
         'main_loop: loop {
             tokio::select! {
@@ -137,14 +122,14 @@ where
                 },
                 // 监听来自 `ChunkActor` 的系统事件。
                 Some(event) = self.event_rx.recv() => {
-                    self.handle_system_event(event, &client, &mut tasks);
+                    self.handle_system_event(event, &mut tasks).await;
                 },
                 // 定时器事件，用于周期性地更新进度、执行并发控制和重试逻辑。
                 _ = ticker.tick() => {
                     let elapsed_secs = (Instant::now() - last_tick_time).as_secs_f64();
                     last_tick_time = Instant::now();
                     // 如果 `handle_tick` 返回 true，表示下载已完成。
-                    if self.handle_tick(elapsed_secs, &client, &mut tasks) {
+                    if self.handle_tick(elapsed_secs, &mut tasks).await {
                         break 'main_loop;
                     }
                 },
@@ -156,10 +141,9 @@ where
     }
 
     /// 处理来自其他 Actor 的系统事件。
-    fn handle_system_event(
+    async fn handle_system_event(
         &mut self,
         event: SystemEvent,
-        client: &Client,
         tasks: &mut FuturesUnordered<JoinHandle<()>>,
     ) {
         match event {
@@ -173,6 +157,8 @@ where
             SystemEvent::ChunkCompleted { id } => {
                 self.state.complete_chunk(&id);
                 self.retry_handler.on_download_complete(&id);
+                // 移除对已完成块资源的追踪。
+                self.active_resources.remove(&id);
             }
             // 一个块下载失败。
             SystemEvent::ChunkFailed {
@@ -181,6 +167,10 @@ where
                 end,
                 error,
             } => {
+                // 报告资源失败，以便降低其权重。
+                if let Some(resource) = self.active_resources.remove(&id) {
+                    self.handle.report_failure(resource).await;
+                }
                 self.retry_handler.on_chunk_failed(
                     id,
                     start,
@@ -201,7 +191,7 @@ where
                     chunk.update_end_byte(new_start.saturating_sub(1));
                 }
                 // 派生新的 `ChunkActor` 负责后半部分的下载。
-                self.spawn_chunk_actor(new_start, new_end, client, tasks);
+                self.spawn_chunk_actor(new_start, new_end, tasks).await;
                 debug!(
                     "[MonitorActor] 分片块 {} 成为 {}-{}",
                     original_id, new_start, new_end
@@ -212,10 +202,9 @@ where
 
     /// 处理定时器事件，用于更新进度、执行并发控制和重试逻辑。
     /// 如果下载完成，则返回 `true`。
-    fn handle_tick(
+    async fn handle_tick(
         &mut self,
         elapsed_secs: f64,
-        client: &Client,
         tasks: &mut FuturesUnordered<JoinHandle<()>>,
     ) -> bool {
         if elapsed_secs <= 0.0 {
@@ -235,7 +224,8 @@ where
 
         // 派生准备好重试的块。
         while let Some(chunk_to_retry) = self.retry_handler.pop_ready_chunk() {
-            self.spawn_chunk_actor(chunk_to_retry.start, chunk_to_retry.end, client, tasks);
+            self.spawn_chunk_actor(chunk_to_retry.start, chunk_to_retry.end, tasks)
+                .await;
         }
 
         // 如果所有任务都已完成且下载已结束，则返回 true 以退出主循环。
@@ -243,36 +233,57 @@ where
     }
 
     /// 派生一个新的 `ChunkActor` 任务来下载文件的指定范围。
-    fn spawn_chunk_actor(
+    async fn spawn_chunk_actor(
         &mut self,
         start: u64,
         end: u64,
-        client: &Client,
         tasks: &mut FuturesUnordered<JoinHandle<()>>,
     ) {
-        let id = self.next_chunk_id;
-        self.next_chunk_id += 1;
+        // 从资源管理器获取一个配置好的 RequestBuilder 和其使用的资源。
+        if let Some((rb, resource)) = self.handle.get_request_builder().await {
+            let id = self.next_chunk_id;
+            self.next_chunk_id += 1;
 
-        info!(
-            "[MonitorActor] 派生新 ChunkActor (ID: {}), 范围: {}-{}",
-            id, start, end
-        );
-        // 在状态中注册这个新块。
-        self.state
-            .chunks
-            .insert(id, ChunkState::new(id, start, end));
-        // 创建并派生任务。
-        let task = chunk_actor_task(
-            id,
-            self.event_tx.clone(),
-            self.writer_tx.clone(),
-            self.cmd_tx.subscribe(), // 每个 `ChunkActor` 都订阅命令广播。
-            client.get(self.url.as_str()),
-            start,
-            end,
-            self.config.min_chunk_size_for_split,
-        );
-        tasks.push(spawn(task));
+            info!(
+                "[MonitorActor] 派生新 ChunkActor (ID: {}), 资源: {:?}, 范围: {}-{}",
+                id, resource, start, end
+            );
+            // 在状态中注册这个新块。
+            self.state
+                .chunks
+                .insert(id, ChunkState::new(id, start, end));
+            // 追踪此块使用的资源。
+            self.active_resources.insert(id, resource);
+
+            // 创建并派生任务。
+            let task = chunk_actor_task(
+                id,
+                self.event_tx.clone(),
+                self.writer_tx.clone(),
+                self.cmd_tx.subscribe(), // 每个 `ChunkActor` 都订阅命令广播。
+                rb,
+                start,
+                end,
+                self.config.min_chunk_size_for_split,
+            );
+            tasks.push(spawn(task));
+        } else {
+            error!(
+                "[MonitorActor] 无法从资源池获取资源来下载范围 {}-{}。下载可能会暂停。",
+                start, end
+            );
+            // 如果无法获取资源，将块信息放回重试队列，以便稍后再次尝试。
+            self.retry_handler.on_chunk_failed(
+                self.next_chunk_id, // 使用一个临时的ID
+                start,
+                end,
+                "无法获取可用资源".to_string(),
+                &mut self.state, // 传递状态以保持一致性
+                &self.info_tx,
+            );
+            // 注意：因为没有实际创建块，所以这个失败的块不会存在于 state.chunks 中，
+            // on_chunk_failed 中的 state.chunks.remove(&id) 会无操作，这是安全的。
+        }
     }
 
     /// 向用户端发送聚合的进度更新。

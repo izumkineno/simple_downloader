@@ -2,8 +2,8 @@
 use crate::types::{DownloadError, Result, SystemCommand};
 use faststr::FastStr;
 use log::{debug, error, info, trace};
-use reqwest::Client;
 use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE};
+use reqwest::{Client, RequestBuilder};
 use std::io;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -17,16 +17,10 @@ use tokio::sync::mpsc;
 /// 2. 如果 `HEAD` 失败或未提供 `Content-Length`，则尝试发送一个 `Range: bytes=0-0` 的 `GET` 请求，
 ///    从 `Content-Range` 头中解析总大小。
 /// 3. 如果以上都失败，则作为最后的备用方案，检查普通 `GET` 请求的 `Content-Length`。
-pub(crate) async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
-    info!("尝试为 URL 获取文件信息: {}", url);
-
+pub(crate) async fn get_file_info(req_builder: RequestBuilder) -> Result<(u64, bool)> {
     // 尝试使用 HEAD 请求。
-    if let Ok(resp) = client
-        .head(url)
-        .send()
-        .await
-        .and_then(|r| r.error_for_status())
-    {
+    let rb = req_builder.try_clone().unwrap();
+    if let Ok(resp) = rb.send().await.and_then(|r| r.error_for_status()) {
         let headers = resp.headers();
         if let Some(len_val) = headers.get(CONTENT_LENGTH) {
             if let Ok(len_str) = len_val.to_str() {
@@ -43,8 +37,7 @@ pub(crate) async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bo
     }
 
     // 如果 HEAD 失败，尝试发送一个 0 字节的 Range 请求。
-    let range_resp = client
-        .get(url)
+    let range_resp = req_builder
         .header("Range", "bytes=0-0")
         .send()
         .await?
