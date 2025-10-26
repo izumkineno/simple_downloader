@@ -3,33 +3,33 @@
 //! 这个模块是下载引擎的心脏，它作为一个事件中心，
 //! 管理着所有下载块（ChunkActor）、下载状态、并发策略和重试逻辑。
 
-use crate::types::{ChunkId, DownloadInfo, Result, SystemCommand, SystemEvent};
+use crate::types::{ChunkId, DownloadInfo, DownloaderConfig, Result, SystemCommand, SystemEvent};
 use bytes::Bytes;
 use faststr::FastStr;
 use futures_util::stream::{FuturesUnordered, StreamExt};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use reqwest::{Client, ClientBuilder, RequestBuilder};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::spawn;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 
-const SMOOTHING_FACTOR: f64 = 0.15;
-
 //==============================================================================================
 // 1. Monitor Actor - 系统事件中心
 //==============================================================================================
 
-pub(crate) struct MonitorActor {
+pub(crate) struct MonitorActor<F>
+where
+    F: Fn() -> ClientBuilder,
+{
     state: DownloadState,
     retry_handler: RetryHandler,
     concurrency_manager: ConcurrencyManager,
-    update_interval: f64,
-    next_chunk_id: AtomicU64,
-    client: Client,
+    config: DownloaderConfig,
+    next_chunk_id: u64,
+    client_builder: F,
     url: FastStr,
     // 通信 Channel
     event_rx: mpsc::Receiver<SystemEvent>,
@@ -39,13 +39,15 @@ pub(crate) struct MonitorActor {
     writer_tx: mpsc::Sender<SystemCommand>,
 }
 
-impl MonitorActor {
+impl<F> MonitorActor<F>
+where
+    F: Fn() -> ClientBuilder + Send + Sync + 'static,
+{
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         total_file_size: u64,
-        update_interval: f64,
-        max_workers: u64,
-        client_builder: impl Fn() -> ClientBuilder + Send + Sync + 'static,
+        config: DownloaderConfig,
+        client_builder: F,
         url: FastStr,
         event_rx: mpsc::Receiver<SystemEvent>,
         cmd_tx: broadcast::Sender<SystemCommand>,
@@ -53,13 +55,21 @@ impl MonitorActor {
         writer_tx: mpsc::Sender<SystemCommand>,
         event_tx: mpsc::Sender<SystemEvent>,
     ) -> Result<Self> {
+        let retry_handler = RetryHandler::new(
+            config.max_immediate_retries,
+            config.initial_retry_delay,
+            config.long_retry_delay,
+        );
+        let concurrency_manager =
+            ConcurrencyManager::new(config.workers, config.concurrency_split_delay);
+
         Ok(Self {
             state: DownloadState::new(total_file_size),
-            retry_handler: RetryHandler::new(),
-            concurrency_manager: ConcurrencyManager::new(max_workers),
-            update_interval,
-            next_chunk_id: AtomicU64::new(0),
-            client: client_builder().build()?,
+            retry_handler,
+            concurrency_manager,
+            config,
+            next_chunk_id: 0,
+            client_builder,
             url,
             event_rx,
             cmd_tx,
@@ -73,14 +83,24 @@ impl MonitorActor {
     pub(crate) async fn run(mut self) {
         info!("[MonitorActor] 正在运行。");
         let mut tasks = FuturesUnordered::<JoinHandle<()>>::new();
-        let mut ticker = interval(Duration::from_secs_f64(self.update_interval));
+        let mut ticker = interval(Duration::from_secs_f64(self.config.update_interval));
         let mut last_tick_time = Instant::now();
+        // 在 Actor 内部构建 Client，确保它与 Actor 的生命周期绑定
+        let client = (self.client_builder)()
+            .build()
+            .expect("在 MonitorActor 中构建 Client 失败");
 
-        self.spawn_chunk_actor(0, self.state.total_file_size.saturating_sub(1), &mut tasks);
+        // 派生第一个下载块，覆盖整个文件范围
+        self.spawn_chunk_actor(
+            0,
+            self.state.total_file_size.saturating_sub(1),
+            &client,
+            &mut tasks,
+        );
 
         'main_loop: loop {
             tokio::select! {
-                biased;
+                biased; // 优先处理已完成的任务和事件，而不是定时器
                 Some(result) = tasks.next() => {
                     if let Err(e) = result { error!("[MonitorActor] 一个下载任务 panicked: {e}"); }
                     if tasks.is_empty() && self.are_all_tasks_done() {
@@ -88,12 +108,12 @@ impl MonitorActor {
                     }
                 },
                 Some(event) = self.event_rx.recv() => {
-                    self.handle_system_event(event, &mut tasks);
+                    self.handle_system_event(event, &client, &mut tasks);
                 },
                 _ = ticker.tick() => {
                     let elapsed_secs = (Instant::now() - last_tick_time).as_secs_f64();
                     last_tick_time = Instant::now();
-                    if self.handle_tick(elapsed_secs, &mut tasks) {
+                    if self.handle_tick(elapsed_secs, &client, &mut tasks) {
                         break 'main_loop;
                     }
                 },
@@ -103,9 +123,11 @@ impl MonitorActor {
         info!("[MonitorActor] 所有下载任务已完成，正在关闭。");
     }
 
+    /// 处理来自其他 Actor 的系统事件。
     fn handle_system_event(
         &mut self,
         event: SystemEvent,
+        client: &Client,
         tasks: &mut FuturesUnordered<JoinHandle<()>>,
     ) {
         match event {
@@ -138,17 +160,25 @@ impl MonitorActor {
                 new_start,
                 new_end,
             } => {
+                // 更新原始块的结束字节位置，使其只负责前半部分
                 if let Some(chunk) = self.state.chunks.get_mut(&original_id) {
                     chunk.update_end_byte(new_start.saturating_sub(1));
                 }
-                self.spawn_chunk_actor(new_start, new_end, tasks);
+                // 派生新的 ChunkActor 负责后半部分的下载
+                self.spawn_chunk_actor(new_start, new_end, client, tasks);
+                debug!(
+                    "[MonitorActor] 分片块 {} 成为 {}-{}",
+                    original_id, new_start, new_end
+                );
             }
         }
     }
 
+    /// 处理定时器事件，用于更新进度、执行并发控制和重试逻辑。
     fn handle_tick(
         &mut self,
         elapsed_secs: f64,
+        client: &Client,
         tasks: &mut FuturesUnordered<JoinHandle<()>>,
     ) -> bool {
         if elapsed_secs <= 0.0 {
@@ -156,26 +186,31 @@ impl MonitorActor {
         }
 
         for chunk in self.state.chunks.values_mut() {
-            chunk.update_speed(elapsed_secs, SMOOTHING_FACTOR);
+            chunk.update_speed(elapsed_secs, self.config.speed_smoothing_factor);
         }
         self.send_monitor_update();
         self.concurrency_manager
             .decide_and_act(&self.state, &self.cmd_tx);
         self.retry_handler.process_queues();
         while let Some(chunk_to_retry) = self.retry_handler.pop_ready_chunk() {
-            self.spawn_chunk_actor(chunk_to_retry.start, chunk_to_retry.end, tasks);
+            self.spawn_chunk_actor(chunk_to_retry.start, chunk_to_retry.end, client, tasks);
         }
 
+        // 如果所有任务都已完成且下载已结束，则返回 true 以退出主循环
         self.are_all_tasks_done() && self.state.is_download_finished()
     }
 
+    /// 派生一个新的 ChunkActor 任务。
     fn spawn_chunk_actor(
         &mut self,
         start: u64,
         end: u64,
+        client: &Client,
         tasks: &mut FuturesUnordered<JoinHandle<()>>,
     ) {
-        let id = self.next_chunk_id.fetch_add(1, Ordering::SeqCst);
+        let id = self.next_chunk_id;
+        self.next_chunk_id += 1;
+
         info!(
             "[MonitorActor] 派生新 ChunkActor (ID: {}), 范围: {}-{}",
             id, start, end
@@ -188,15 +223,17 @@ impl MonitorActor {
             self.event_tx.clone(),
             self.writer_tx.clone(),
             self.cmd_tx.subscribe(),
-            self.client.get(self.url.as_str()),
+            client.get(self.url.as_str()),
             start,
             end,
+            self.config.min_chunk_size_for_split,
         );
         tasks.push(spawn(task));
     }
 
+    /// 向用户发送聚合的进度更新。
     fn send_monitor_update(&self) {
-        let _ = self.info_tx.send(DownloadInfo::MonitorUpdate {
+        let info = DownloadInfo::MonitorUpdate {
             total_size: self.state.total_file_size,
             total_downloaded: self.state.total_downloaded(),
             total_speed: self.state.total_speed(),
@@ -206,9 +243,14 @@ impl MonitorActor {
                 .values()
                 .map(|c| (c.id, c.size(), c.downloaded_bytes, c.speed, c.status))
                 .collect(),
-        });
+        };
+        // 如果发送失败，说明用户端的接收者已关闭，这不是一个致命错误。
+        if self.info_tx.send(info).is_err() {
+            debug!("[MonitorActor] 进度信息接收者已关闭，无法发送更新。");
+        }
     }
 
+    /// 检查是否所有任务（包括等待重试的）都已处理完毕。
     fn are_all_tasks_done(&self) -> bool {
         self.state.chunks.is_empty() && self.retry_handler.are_all_tasks_done()
     }
@@ -218,8 +260,6 @@ impl MonitorActor {
 // 2. Chunk Actor - 下载工作单元
 //==============================================================================================
 
-const MIN_CHUNK_SIZE: u64 = 1024 * 10;
-
 async fn chunk_actor_task(
     id: ChunkId,
     event_tx: mpsc::Sender<SystemEvent>,
@@ -228,6 +268,7 @@ async fn chunk_actor_task(
     rb: RequestBuilder,
     start_byte: u64,
     end_byte: u64,
+    min_chunk_size_for_split: u64,
 ) {
     let mut end = end_byte;
     let mut offset = start_byte;
@@ -242,14 +283,18 @@ async fn chunk_actor_task(
     {
         Ok(resp) => resp,
         Err(e) => {
-            let _ = event_tx
-                .send(SystemEvent::ChunkFailed {
-                    id,
-                    start: start_byte,
-                    end,
-                    error: e.to_string(),
-                })
-                .await;
+            let event = SystemEvent::ChunkFailed {
+                id,
+                start: start_byte,
+                end,
+                error: e.to_string(),
+            };
+            if event_tx.send(event).await.is_err() {
+                error!(
+                    "[ChunkActor] 事件信道已关闭，无法为块 {} 报告初始失败。",
+                    id
+                );
+            }
             return;
         }
     };
@@ -260,18 +305,25 @@ async fn chunk_actor_task(
         tokio::select! {
             biased;
             Ok(cmd) = cmd_rx.recv() => {
-                if let SystemCommand::BisectDownload { id: id_ } = cmd {
-                    if id == id_ {
+                match cmd {
+                    SystemCommand::BisectDownload { id: target_id } if id == target_id => {
+                        debug!("[ChunkActor] 收到块 {} 的分片命令。", id);
                         let remaining = end.saturating_sub(offset);
-                        if remaining >= MIN_CHUNK_SIZE * 2 {
+                        if remaining >= min_chunk_size_for_split * 2 {
                             let midpoint = offset + remaining / 2;
-                            if event_tx.send(SystemEvent::ChunkBisected { original_id: id, new_start: midpoint + 1, new_end: end }).await.is_ok() {
-                                end = midpoint;
+                            let event = SystemEvent::ChunkBisected { original_id: id, new_start: midpoint + 1, new_end: end };
+                            if event_tx.send(event).await.is_ok() {
+                                end = midpoint; // 更新当前块的结束边界
+                            } else {
+                                error!("[ChunkActor] 事件信道已关闭，无法为块 {} 进行分片。", id);
                             }
                         }
                     }
-                } else if let SystemCommand::TerminateAll = cmd {
-                    break;
+                    SystemCommand::TerminateAll => {
+                        info!("[ChunkActor] 收到块 {} 的 TerminateAll 命令，正在关闭。", id);
+                        break;
+                    }
+                    _ => {}
                 }
             },
             chunk_result = stream.next() => {
@@ -284,21 +336,33 @@ async fn chunk_actor_task(
                         let write_len = std::cmp::min(allowed, len as u64);
                         let to_write: Bytes = if write_len as usize == len { chunk } else { chunk.split_to(write_len as usize) };
 
-                        if writer_tx.send(SystemCommand::WriteFile { offset, data: to_write }).await.is_err() {
-                            let _ = event_tx.send(SystemEvent::ChunkFailed { id, start: offset, end, error: "File write channel closed".to_string() }).await;
+                        let write_cmd = SystemCommand::WriteFile { offset, data: to_write };
+                        if writer_tx.send(write_cmd).await.is_err() {
+                            let event = SystemEvent::ChunkFailed { id, start: offset, end, error: "文件写入信道已关闭".to_string() };
+                            if event_tx.send(event).await.is_err() {
+                                error!("[ChunkActor] 事件信道已关闭，无法为块 {} 报告写入失败。", id);
+                            }
                             failed = true;
                             break;
                         }
                         offset = offset.saturating_add(write_len);
-                        let _ = event_tx.send(SystemEvent::ChunkProgress { id, downloaded: offset.saturating_sub(start_byte) }).await;
+                        let progress_event = SystemEvent::ChunkProgress { id, downloaded: offset.saturating_sub(start_byte) };
+                        if event_tx.send(progress_event).await.is_err() {
+                            error!("[ChunkActor] 事件信道已关闭，无法为块 {} 报告进度。任务终止。", id);
+                            failed = true; // 无法更新状态，视为失败
+                            break;
+                        }
                         if write_len < len as u64 { break; }
                     }
                     Some(Err(e)) => {
-                        let _ = event_tx.send(SystemEvent::ChunkFailed { id, start: offset, end, error: e.to_string() }).await;
+                        let event = SystemEvent::ChunkFailed { id, start: offset, end, error: e.to_string() };
+                        if event_tx.send(event).await.is_err() {
+                            error!("[ChunkActor] 事件信道已关闭，无法为块 {} 报告流错误。", id);
+                        }
                         failed = true;
                         break;
                     },
-                    None => break,
+                    None => break, // 流结束
                 }
             },
             else => break,
@@ -306,7 +370,16 @@ async fn chunk_actor_task(
     }
 
     if !failed {
-        let _ = event_tx.send(SystemEvent::ChunkCompleted { id }).await;
+        if event_tx
+            .send(SystemEvent::ChunkCompleted { id })
+            .await
+            .is_err()
+        {
+            error!(
+                "[ChunkActor] 事件信道已关闭，无法为块 {} 报告完成状态。",
+                id
+            );
+        }
     }
 }
 
@@ -405,6 +478,7 @@ struct ConcurrencyManager {
     max_speed: f64,
     last_split_time: Instant,
     stable_speed_samples: VecDeque<f64>,
+    split_delay: Duration,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -414,7 +488,7 @@ enum DownloadPhase {
 }
 
 impl ConcurrencyManager {
-    fn new(max_workers: u64) -> Self {
+    fn new(max_workers: u64, split_delay: Duration) -> Self {
         Self {
             max_workers,
             phase: if max_workers == 1 {
@@ -425,10 +499,12 @@ impl ConcurrencyManager {
             max_speed: 0.0,
             last_split_time: Instant::now(),
             stable_speed_samples: VecDeque::with_capacity(10),
+            split_delay,
         }
     }
+
     fn decide_and_act(&mut self, state: &DownloadState, cmd_tx: &broadcast::Sender<SystemCommand>) {
-        if self.last_split_time.elapsed() < Duration::from_millis(300) {
+        if self.last_split_time.elapsed() < self.split_delay {
             return;
         }
         let current_speed = state.total_speed();
@@ -457,6 +533,7 @@ impl ConcurrencyManager {
         }
         self.reactive_split(state, cmd_tx);
     }
+
     fn handle_probing_phase(
         &mut self,
         state: &DownloadState,
@@ -477,6 +554,7 @@ impl ConcurrencyManager {
             self.transition_to_stable();
         }
     }
+
     fn handle_stable_phase(
         &mut self,
         state: &DownloadState,
@@ -492,7 +570,7 @@ impl ConcurrencyManager {
             if let Some(slowest_chunk) = state
                 .chunks
                 .values()
-                .filter(|c| c.size().saturating_sub(c.downloaded_bytes) > MIN_CHUNK_SIZE * 2)
+                .filter(|c| c.size().saturating_sub(c.downloaded_bytes) > 1024 * 20) // MIN_CHUNK_SIZE * 2
                 .min_by(|a, b| {
                     a.speed
                         .partial_cmp(&b.speed)
@@ -506,9 +584,9 @@ impl ConcurrencyManager {
             }
         }
     }
+
     fn reactive_split(&mut self, state: &DownloadState, cmd_tx: &broadcast::Sender<SystemCommand>) {
-        if self.phase == DownloadPhase::Stable
-            && self.last_split_time.elapsed() > Duration::from_millis(300)
+        if self.phase == DownloadPhase::Stable && self.last_split_time.elapsed() > self.split_delay
         {
             let active_chunks = state.chunks.len() as u64;
             if active_chunks > 0 && active_chunks < self.max_workers {
@@ -518,10 +596,12 @@ impl ConcurrencyManager {
             }
         }
     }
+
     fn request_split(&mut self, id: ChunkId, cmd_tx: &broadcast::Sender<SystemCommand>) {
         let _ = cmd_tx.send(SystemCommand::BisectDownload { id });
         self.last_split_time = Instant::now();
     }
+
     fn transition_to_stable(&mut self) {
         self.phase = DownloadPhase::Stable;
         self.stable_speed_samples.clear();
@@ -536,6 +616,9 @@ struct RetryHandler {
     retry_queue: VecDeque<FailedChunkInfo>,
     delayed_retry_queue: VecDeque<DelayedChunkInfo>,
     retry_attempts: HashMap<ChunkId, u32>,
+    max_retries: u32,
+    initial_delay: Duration,
+    long_delay: Duration,
 }
 
 #[derive(Debug)]
@@ -552,13 +635,17 @@ struct DelayedChunkInfo {
 }
 
 impl RetryHandler {
-    fn new() -> Self {
+    fn new(max_retries: u32, initial_delay: Duration, long_delay: Duration) -> Self {
         Self {
             retry_queue: VecDeque::new(),
             delayed_retry_queue: VecDeque::new(),
             retry_attempts: HashMap::new(),
+            max_retries,
+            initial_delay,
+            long_delay,
         }
     }
+
     fn on_chunk_failed(
         &mut self,
         id: ChunkId,
@@ -572,12 +659,19 @@ impl RetryHandler {
         state.chunks.remove(&id);
         let attempts = self.retry_attempts.entry(id).or_insert(0);
         *attempts += 1;
-        if *attempts <= 10 {
-            let _ = info_tx.send(DownloadInfo::ChunkStatusChanged {
+
+        if *attempts <= self.max_retries {
+            let msg = DownloadInfo::ChunkStatusChanged {
                 id,
                 status: 2,
-                message: Some(format!("将进行第 {} 次重试 (共 10 次)", *attempts)),
-            });
+                message: Some(format!(
+                    "将进行第 {}/{} 次重试",
+                    *attempts, self.max_retries
+                )),
+            };
+            if info_tx.send(msg).is_err() {
+                debug!("[RetryHandler] 进度信息接收者已关闭，无法发送状态变更。");
+            }
             self.retry_queue.push_back(FailedChunkInfo {
                 start,
                 end,
@@ -585,11 +679,17 @@ impl RetryHandler {
                 attempts: *attempts,
             });
         } else {
-            let _ = info_tx.send(DownloadInfo::ChunkStatusChanged {
+            let msg = DownloadInfo::ChunkStatusChanged {
                 id,
                 status: 3,
-                message: Some(format!("将在 {:?} 后重试", Duration::from_secs(10))),
-            });
+                message: Some(format!(
+                    "超过最大重试次数，将在 {:?} 后再次尝试",
+                    self.long_delay
+                )),
+            };
+            if info_tx.send(msg).is_err() {
+                debug!("[RetryHandler] 进度信息接收者已关闭，无法发送状态变更。");
+            }
             self.delayed_retry_queue.push_back(DelayedChunkInfo {
                 chunk: FailedChunkInfo {
                     start,
@@ -597,32 +697,35 @@ impl RetryHandler {
                     failure_time: Instant::now(),
                     attempts: *attempts,
                 },
-                retry_at: Instant::now() + Duration::from_secs(10),
+                retry_at: Instant::now() + self.long_delay,
             });
-            self.retry_attempts.remove(&id);
+            self.retry_attempts.remove(&id); // 重置计数器，进入延迟队列
         }
     }
+
     fn process_queues(&mut self) {
         let now = Instant::now();
         while let Some(delayed_info) = self.delayed_retry_queue.front() {
             if now >= delayed_info.retry_at {
                 let mut info_to_retry = self.delayed_retry_queue.pop_front().unwrap().chunk;
                 info_to_retry.failure_time = Instant::now();
-                info_to_retry.attempts = 0;
+                info_to_retry.attempts = 0; // 重置尝试次数
                 self.retry_queue.push_back(info_to_retry);
             } else {
                 break;
             }
         }
     }
+
     fn pop_ready_chunk(&mut self) -> Option<FailedChunkInfo> {
         if let Some(failed_chunk) = self.retry_queue.front() {
-            if failed_chunk.failure_time.elapsed() >= Duration::from_secs(2) {
+            if failed_chunk.failure_time.elapsed() >= self.initial_delay {
                 return self.retry_queue.pop_front();
             }
         }
         None
     }
+
     fn on_download_complete(&mut self, id: &ChunkId) {
         self.retry_attempts.remove(id);
     }

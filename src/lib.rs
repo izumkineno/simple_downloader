@@ -18,7 +18,7 @@ pub mod util;
 pub use downloader::Downloader;
 
 // 导出公共类型，方便用户在类型注解和模式匹配中使用。
-pub use types::{ChunkId, DownloadError, DownloadInfo, Result};
+pub use types::{ChunkId, DownloadError, DownloadInfo, DownloaderConfig, Result};
 
 // 重新导出 `reqwest`，允许用户提供自定义的 `ClientBuilder`。
 pub use reqwest;

@@ -1,5 +1,6 @@
-use simple_downloader::reqwest::ClientBuilder;
-use simple_downloader::{DownloadInfo, Downloader};
+//! 示例 2: 使用 indicatif 库实现多进度条 UI
+
+use simple_downloader::{DownloadInfo, Downloader, DownloaderConfig, reqwest::ClientBuilder};
 use tokio::sync::broadcast;
 
 /// 使用 indicatif 库处理下载进度并渲染多进度条UI。
@@ -56,8 +57,9 @@ async fn progress_bar_task(file_size: u64, mut info_rx: broadcast::Receiver<Down
                 total_pb.set_length(total_size);
                 total_pb.set_position(total_downloaded);
                 total_pb.set_message(format!(
-                    "总进度 ({:.2} MB/s)",
-                    total_speed / 1024.0 / 1024.0
+                    "总进度 ({:.2} MB/s), 分块数: {}",
+                    total_speed / 1024.0 / 1024.0,
+                    chunk_details.len()
                 ));
 
                 // 2. 遍历并更新所有下载块的进度条
@@ -124,20 +126,22 @@ async fn progress_bar_task(file_size: u64, mut info_rx: broadcast::Receiver<Down
 #[tokio::main]
 async fn main() {
     // --- 1. 配置 ---
-    let url = "http://127.0.0.1:8000/RustRover-2025.2.1.exe";
-    let output_path = "RustRover-2025.2.1.exe";
+    let url = "https://dlied4.myapp.com/myapp/1104466820/cos.release-40109/10040714_com.tencent.tmgp.sgame_a2480356_8.2.1.9_F0BvnI.apk";
+    let output_path = "com.tencent.tmgp.sgame_a2480356_8.2.1.9_F0BvnI.apk";
 
-    // 备用公共链接
-    // let url = "https://proof.ovh.net/files/100Mio.dat";
-    // let output_path = "100Mio.dat";
+    // let url = "http://127.0.0.1:8000/RustRover-2025.2.1.exe";
+    // let output_path = "RustRover-2025.2.1.exe";
 
-    let workers = 16; // 最大并发数
-    let update_interval = 0.2; // UI 更新间隔为 0.2 秒
+    // 使用 DownloaderConfig 结构体来配置下载参数
+    let config = DownloaderConfig {
+        workers: 16,          // 最大并发数
+        update_interval: 0.2, // UI 更新间隔为 0.2 秒
+        ..Default::default()  // 其他选项使用默认值
+    };
 
     // --- 2. 执行 ---
-    let downloader = Downloader::new(url, output_path, workers, update_interval, || {
-        ClientBuilder::new()
-    });
+    // 注意：现在 new 方法的第三个参数是 config 对象
+    let downloader = Downloader::new(url, output_path, config, || ClientBuilder::new());
 
     println!("开始下载...");
     let start_time = std::time::Instant::now();

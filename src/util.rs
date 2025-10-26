@@ -16,6 +16,7 @@ pub(crate) async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bo
 
     info!("尝试为 URL 获取文件信息: {}", url);
 
+    // 尝试使用 HEAD 请求获取信息，效率最高
     if let Ok(resp) = client
         .head(url)
         .send()
@@ -35,6 +36,7 @@ pub(crate) async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bo
         }
     }
 
+    // 如果 HEAD 失败或信息不全，尝试发送一个 0 字节的 Range 请求
     let range_resp = client
         .get(url)
         .header("Range", "bytes=0-0")
@@ -52,6 +54,7 @@ pub(crate) async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bo
         }
     }
 
+    // 作为最后的备用方案，检查普通 GET 请求的 Content-Length
     if let Some(len_val) = headers.get(CONTENT_LENGTH) {
         if let Ok(len_str) = len_val.to_str() {
             if let Ok(content_length) = len_str.parse::<u64>() {
@@ -64,12 +67,23 @@ pub(crate) async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bo
 }
 
 /// 创建并运行一个文件写入 Actor。
+///
+/// 这个 Actor 在一个独立的任务中运行，监听 `WriteFile` 命令，
+/// 并将接收到的数据写入到指定文件的正确偏移位置。
+///
+/// # 参数
+/// * `filepath`: 要写入的文件的路径。
+/// * `size`: 文件的总大小，用于预分配空间。
+/// * `queue_capacity`: 此 Actor 的消息信道容量。
+///
+/// # 返回
+/// 一个 `Result`，其中包含用于与该 Actor 通信的信道发送端。
 pub(crate) async fn writer_actor_task(
     filepath: FastStr,
     size: u64,
+    queue_capacity: usize,
 ) -> Result<mpsc::Sender<SystemCommand>> {
-    const WRITER_QUEUE_CAP: usize = 128;
-    let (tx, mut rx) = mpsc::channel::<SystemCommand>(WRITER_QUEUE_CAP);
+    let (tx, mut rx) = mpsc::channel::<SystemCommand>(queue_capacity);
 
     let mut file = OpenOptions::new()
         .write(true)
@@ -77,6 +91,7 @@ pub(crate) async fn writer_actor_task(
         .truncate(true)
         .open(&*filepath)
         .await?;
+    // 预分配文件大小，可以减少碎片并提高性能
     file.set_len(size).await?;
     debug!("[WriterActor] 文件已打开并预分配大小。");
 
@@ -86,7 +101,7 @@ pub(crate) async fn writer_actor_task(
             match command {
                 SystemCommand::WriteFile { offset, data } => {
                     trace!(
-                        "[WriterActor] 收到 WriteFile，offset: {}, 大小: {}。",
+                        "[WriterActor] 收到 WriteFile，偏移: {}, 大小: {}。",
                         offset,
                         data.len()
                     );
@@ -101,11 +116,13 @@ pub(crate) async fn writer_actor_task(
                     info!("[WriterActor] 收到 TerminateAll，正在关闭。");
                     break;
                 }
-                _ => {}
+                _ => {} // 忽略其他命令
             }
         }
         info!("[WriterActor] 正在刷新文件并退出任务。");
-        let _ = file.flush().await;
+        if let Err(e) = file.flush().await {
+            error!("[WriterActor] 刷新文件失败: {}", e);
+        }
     });
 
     Ok(tx)
