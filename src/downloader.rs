@@ -14,7 +14,7 @@ use tokio::sync::{broadcast, mpsc};
 /// 和 `WriterActor`，并管理它们的生命周期。
 pub struct Downloader<F>
 where
-    F: Fn() -> ClientBuilder,
+    F: Fn() -> ClientBuilder + Send + Sync + 'static,
 {
     /// 要下载的文件的 URL。
     url: FastStr,

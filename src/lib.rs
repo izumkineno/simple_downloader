@@ -18,55 +18,12 @@
 //!   聚合进度信息，执行并发策略和重试逻辑。
 //! - **`ChunkActor`**: 独立的下载工作单元，负责下载文件的特定范围（一个块）。
 //! - **`WriterActor`**: 独立的文件写入单元，负责将所有下载的数据块按正确的顺序写入文件，避免了多线程写入的锁竞争。
-//!
-//! # 使用示例
-//!
-//! ```rust,no_run
-//! use downloader_rs::{Downloader, DownloaderConfig};
-//! use tokio::sync::broadcast;
-//! use std::time::Duration;
-//!
-//! #[tokio::main]
-//! async fn main() {
-//!     let url = "https://example.com/largefile.zip";
-//!     let output_path = "largefile.zip";
-//!     let config = DownloaderConfig {
-//!         workers: 16,
-//!         ..Default::default()
-//!     };
-//!
-//!     let downloader = Downloader::new(url, output_path, config, || reqwest::ClientBuilder::new());
-//!
-//!     let progress_handler = |total_size: u64, mut info_rx: broadcast::Receiver<downloader_rs::DownloadInfo>| async move {
-//!         while let Ok(info) = info_rx.recv().await {
-//!             if let downloader_rs::DownloadInfo::MonitorUpdate { total_downloaded, total_speed, .. } = info {
-//!                 let progress = if total_size > 0 {
-//!                     total_downloaded as f64 / total_size as f64 * 100.0
-//!                 } else {
-//!                     0.0
-//!                 };
-//!                 println!(
-//!                     "下载进度: {:.2}%, 速度: {:.2} MB/s",
-//!                     progress,
-//!                     total_speed / 1024.0 / 1024.0
-//!                 );
-//!             }
-//!         }
-//!     };
-//!
-//!     if let Err(e) = downloader.run(progress_handler).await {
-//!         eprintln!("下载失败: {}", e);
-//!     } else {
-//!         println!("下载成功！");
-//!     }
-//! }
-//! ```
 
 mod downloader;
 mod monitor;
+mod resource;
 mod types;
 mod util;
-
 // --- 公共 API 导出 ---
 
 // 导出核心的 `Downloader`，它是用户的主要入口点。
