@@ -99,12 +99,12 @@ impl Default for DownloaderConfig {
             update_interval: 1.0,
             channel_capacity: 1024,
             writer_queue_capacity: 128,
-            min_chunk_size_for_split: 1024 * 10, // 10 KB
-            speed_smoothing_factor: 0.15,
+            min_chunk_size_for_split: 1024 * 1024, // 1 MB
+            speed_smoothing_factor: 0.4,
             max_immediate_retries: 10,
             initial_retry_delay: Duration::from_secs(2),
             long_retry_delay: Duration::from_secs(10),
-            concurrency_split_delay: Duration::from_millis(200),
+            concurrency_split_delay: Duration::from_millis(100),
         }
     }
 }

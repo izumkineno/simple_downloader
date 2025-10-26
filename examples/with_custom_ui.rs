@@ -125,12 +125,13 @@ async fn progress_bar_task(file_size: u64, mut info_rx: broadcast::Receiver<Down
 
 #[tokio::main]
 async fn main() {
-    // --- 1. 配置 ---
+    // --- 1. 配置 --- 1.92Gib 117Mib/s 16.8 s   19s
     let url = "https://dlied4.myapp.com/myapp/1104466820/cos.release-40109/10040714_com.tencent.tmgp.sgame_a2480356_8.2.1.9_F0BvnI.apk";
     let output_path = "com.tencent.tmgp.sgame_a2480356_8.2.1.9_F0BvnI.apk";
 
-    // let url = "http://127.0.0.1:8000/RustRover-2025.2.1.exe";
-    // let output_path = "RustRover-2025.2.1.exe";
+    // 100m/s 19.2s
+    // let url = "http://127.0.0.1:8000/com.tencent.tmgp.sgame_a2480356_8.2.1.9_F0BvnI.apk ";
+    // let output_path = "com.tencent.tmgp.sgame_a2480356_8.2.1.9_F0BvnI.apk";
 
     // 使用 DownloaderConfig 结构体来配置下载参数
     let config = DownloaderConfig {

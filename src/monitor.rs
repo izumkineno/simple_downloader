@@ -493,6 +493,12 @@ impl ChunkState {
     fn size(&self) -> u64 {
         self.end_byte.saturating_sub(self.start_byte) + 1
     }
+    fn size_remaining(&self) -> u64 {
+        self.end_byte
+            .saturating_sub(self.start_byte)
+            .saturating_add(1)
+            .saturating_sub(self.downloaded_bytes)
+    }
     /// 使用指数移动平均 (EMA) 更新速度。
     fn update_speed(&mut self, elapsed_secs: f64, smoothing_factor: f64) {
         let newly_downloaded = self
@@ -628,7 +634,7 @@ impl ConcurrencyManager {
         self.reactive_split(state, cmd_tx);
     }
 
-    /// 处理探测阶段的逻辑。
+    /// 处理探测阶段的逻辑（使用指数分裂策略）。
     fn handle_probing_phase(
         &mut self,
         state: &DownloadState,
@@ -641,11 +647,17 @@ impl ConcurrencyManager {
             self.transition_to_stable();
             return;
         }
-        // 如果速度显著提升，则分裂最大的块以继续探测。
+        // 如果速度显著提升，则对所有块进行指数分裂以快速增加并发。
         if avg_speed > self.max_speed * 1.2 || self.max_speed == 0.0 {
             self.max_speed = avg_speed;
-            if let Some(largest_chunk) = state.chunks.values().max_by_key(|c| c.size()) {
-                self.request_split(largest_chunk.id, cmd_tx);
+            // 收集所有可分裂的块ID
+            let chunks_to_split: Vec<ChunkId> = state.chunks.values().map(|c| c.id).collect();
+            // 对每个块发送分裂命令，实现指数增长
+            for chunk_id in chunks_to_split {
+                if active_chunks * 2 > self.max_workers {
+                    break; // 避免超过最大并发数
+                }
+                self.request_split(chunk_id, cmd_tx);
             }
         } else if active_chunks > 1 && self.stable_speed_samples.len() >= 3 {
             // 如果速度不再提升，则切换到稳定阶段。
@@ -671,7 +683,7 @@ impl ConcurrencyManager {
                 .chunks
                 .values()
                 // 确保块足够大以便分裂
-                .filter(|c| c.size().saturating_sub(c.downloaded_bytes) > 1024 * 20)
+                .filter(|c| c.size_remaining() > 1024 * 20)
                 .min_by(|a, b| {
                     a.speed
                         .partial_cmp(&b.speed)
@@ -692,7 +704,9 @@ impl ConcurrencyManager {
         {
             let active_chunks = state.chunks.len() as u64;
             if active_chunks > 0 && active_chunks < self.max_workers {
-                if let Some(largest_chunk) = state.chunks.values().max_by_key(|c| c.size()) {
+                if let Some(largest_chunk) =
+                    state.chunks.values().max_by_key(|c| c.size_remaining())
+                {
                     self.request_split(largest_chunk.id, cmd_tx);
                 }
             }
