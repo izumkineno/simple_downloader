@@ -90,57 +90,52 @@ async fn main() {
 }
 ```
 
-#### 代码逻辑
+#### 架构概览
+
+README 中的图只保留概念级视角；更完整、权威的运行时时序、重试与动态分片细节见 [`docs/architecture.md`](docs/architecture.md)。
+
 ```mermaid
-graph TD
-    subgraph 用户交互
-        User(["👤 用户"]) -- " 1. 调用 Downloader.run(进度处理器) " --> D["🚀 下载器 Downloader"]
-        PH["📊 进度处理器"]
+flowchart LR
+    userNode["用户 / 调用方"] --> downloaderNode["Downloader<br/>入口编排"]
+    downloaderNode --> probeNode["get_file_info<br/>HEAD / Range 探测"]
+    downloaderNode --> writerNode["file_writer_task<br/>独立写入任务"]
+    downloaderNode --> monitorNode["DownloadMonitor<br/>控制循环"]
+    downloaderNode --> initialChunk["Chunk Worker 0<br/>初始全量范围"]
+
+    subgraph monitorBoundary["Monitor 拥有的控制面"]
+        monitorNode --> stateNode["DownloadState<br/>分块状态 / 速度"]
+        monitorNode --> concurrencyNode["ConcurrencyManager<br/>并发探测 / 分割决策"]
+        monitorNode --> retryNode["RetryHandler<br/>即时 / 延迟重试队列"]
     end
 
-    subgraph 核心逻辑
-        D -- " 2. 启动 " --> PH
-        D -- " 3. 启动 " --> FW["📝 文件写入任务"]
-        D -- " 4. 创建并运行 " --> M["🧠 下载监控器"]
-        D -- " 5. 启动初始 " --> C1["⚙️ 下载块任务 (Worker 1)"]
-
-        subgraph "监控器的助手"
-            M -- " 拥有并委托给 " --> CM["📈 并发管理器"]
-            M -- " 拥有并委托给 " --> RH["🔄 重试处理器"]
-            M -- " 拥有并修改 " --> DS["🗃️ 下载状态"]
-        end
-
-        CM -- " 分析 " --> DS
-        RH -- " 管理失败的块 " --> DS
-        M -- " 在分割/重试时启动新任务 " --> C2["⚙️ 下载块任务 (Worker N)"]
+    subgraph channelBoundary["消息通道"]
+        infoBus["broadcast&lt;DownloadInfo&gt;<br/>进度 / 状态事件"]
+        controlBus["broadcast&lt;DownloadCmd&gt;<br/>Bisect / Terminate 控制"]
+        writerQueue["mpsc&lt;DownloadCmd&gt;<br/>WriteFile 写入队列"]
     end
 
-    subgraph 通信通道
-        style InfoChannel fill: #cde4ff, stroke: #333, stroke-width: 2px
-        style CmdChannel fill: #ffcdcd, stroke: #333, stroke-width: 2px
-        style DataChannel fill: #d5f5e3, stroke: #333, stroke-width: 2px
-        InfoChannel("📢 广播: 下载信息 DownloadInfo")
-        CmdChannel("📡 广播: 控制命令 DownloadCmd")
-        DataChannel("📥 MPSC: 文件写入数据")
+    subgraph executionBoundary["执行面"]
+        chunkN["Chunk Worker N<br/>动态分片任务"]
     end
 
-    subgraph 外部
-        Server["🌐 远程服务器"]
-        Disk["💾 磁盘文件"]
-    end
+    serverNode["远程服务器<br/>HTTP Range"]
+    diskNode["磁盘文件"]
+    progressNode["ProgressHandler / UI"]
 
-%% --- 数据与事件流 ---
-    C1 & C2 -- " 发送块进度、失败等信息 " --> InfoChannel
-    M -- " 发送聚合后的监控更新 " --> InfoChannel
-    InfoChannel -- " 接收事件 " --> M
-    InfoChannel -- " 接收事件 " --> PH
-%% --- 命令流 ---
-    CM -- " 发送 BisectDownload 命令 " --> CmdChannel
-    CmdChannel -- " 接收命令 (如分割、终止) " --> C1 & C2
-%% --- 文件写入流 ---
-    C1 & C2 -- " 发送已下载的数据 " --> DataChannel
-    DataChannel -- " 接收数据块 " --> FW
-    FW -- " 写入到 " --> Disk
-%% --- 网络流 ---
-    C1 & C2 -- " 发送 HTTP Range 请求 " --> Server
+    initialChunk -->|"HTTP Range"| serverNode
+    chunkN -->|"HTTP Range"| serverNode
+    initialChunk -->|"WriteFile"| writerQueue
+    chunkN -->|"WriteFile"| writerQueue
+    writerQueue --> writerNode --> diskNode
+    initialChunk -->|"ChunkProgress / Failed / Complete"| infoBus
+    chunkN -->|"ChunkProgress / Failed / Complete"| infoBus
+    monitorNode -->|"MonitorUpdate / StatusChanged"| infoBus
+    infoBus --> progressNode
+    infoBus --> monitorNode
+    concurrencyNode -->|"BisectDownload"| controlBus
+    monitorNode -->|"TerminateAll"| controlBus
+    controlBus --> initialChunk
+    controlBus --> chunkN
+    retryNode -->|"到期后重启任务"| monitorNode
+    monitorNode -->|"spawn"| chunkN
 ```

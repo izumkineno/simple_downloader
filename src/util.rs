@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 ///
 /// # 返回
 /// 一个元组 `(u64, bool)`，分别代表文件总大小和服务器是否支持范围请求。
-pub(crate) async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
+pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
     use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE};
 
     // 1. 尝试 HEAD 请求
@@ -90,7 +90,7 @@ pub(crate) async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bo
 ///
 /// # 返回
 /// 一个 `mpsc::Sender<DownloadCmd>`，其他任务可以通过它发送 `WriteFile` 命令。
-pub(crate) async fn file_writer_task(
+pub async fn file_writer_task(
     filepath: FastStr,
     size: u64,
 ) -> Result<mpsc::Sender<DownloadCmd>> {
@@ -130,3 +130,4 @@ pub(crate) async fn file_writer_task(
 
     Ok(tx)
 }
+

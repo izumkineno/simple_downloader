@@ -1,3 +1,4 @@
+
 //! 定义和管理单个下载块（chunk）的执行逻辑。
 
 use crate::types::{ChunkId, DownloadCmd, DownloadInfo};
@@ -23,7 +24,7 @@ pub(crate) const MIN_CHUNK_SIZE: u64 = 1024 * 10; // 10 KB
 /// - `rb`: 一个 `reqwest::RequestBuilder`，用于创建下载请求。
 /// - `start_byte`: 此块下载的起始字节位置。
 /// - `end_byte`: 此块下载的结束字节位置。
-pub(crate) async fn chunk_run(
+pub async fn chunk_run(
     id: ChunkId,
     cmd_tx: mpsc::Sender<DownloadCmd>,
     mut bd_rx: broadcast::Receiver<DownloadCmd>,
@@ -158,3 +159,4 @@ pub(crate) async fn chunk_run(
         let _ = bd_tx.send(DownloadInfo::DownloadComplete(id));
     }
 }
+
