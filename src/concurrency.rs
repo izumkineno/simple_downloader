@@ -192,10 +192,10 @@ impl ConcurrencyManager {
     ) {
         if self.phase == DownloadPhase::Stable && self.split_is_useful(avg_speed, estimated_time) {
             let active_chunks = state.chunks.len() as u64;
-            if active_chunks > 0
-                && active_chunks < self.max_workers
-                && let Some(largest_chunk) = self.find_largest_splittable_chunk(&state.chunks)
-            {
+            if active_chunks == 0 || active_chunks >= self.max_workers {
+                return;
+            }
+            if let Some(largest_chunk) = self.find_largest_splittable_chunk(&state.chunks) {
                 self.request_split(largest_chunk.id, cmd_tx);
             }
         }
