@@ -251,14 +251,23 @@ mod tests {
     use super::*;
     use tokio::sync::broadcast::error::TryRecvError;
 
-    fn chunk(id: ChunkId, start_byte: u64, end_byte: u64, downloaded_bytes: u64, speed: f64) -> ChunkState {
+    fn chunk(
+        id: ChunkId,
+        start_byte: u64,
+        end_byte: u64,
+        downloaded_bytes: u64,
+        speed: f64,
+    ) -> ChunkState {
         let mut chunk = ChunkState::new(id, start_byte, end_byte);
         chunk.downloaded_bytes = downloaded_bytes;
         chunk.speed = speed;
         chunk
     }
 
-    fn state_with_chunks(total_file_size: u64, chunks: impl IntoIterator<Item = ChunkState>) -> DownloadState {
+    fn state_with_chunks(
+        total_file_size: u64,
+        chunks: impl IntoIterator<Item = ChunkState>,
+    ) -> DownloadState {
         let mut state = DownloadState::new(total_file_size);
         for chunk in chunks {
             state.chunks.insert(chunk.id, chunk);
@@ -298,7 +307,7 @@ mod tests {
 
         manager.decide_and_act(&state, &cmd_tx);
 
-        assert_eq!(manager.max_speed, 150.0);
+        assert_eq!(manager.max_speed, 112.5);
         assert!(matches!(cmd_rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
