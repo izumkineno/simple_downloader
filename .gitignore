@@ -3,3 +3,4 @@
 .venv
 .omx
 __pycache__
+.claude
