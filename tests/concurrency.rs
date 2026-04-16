@@ -147,9 +147,9 @@ fn split_target_prefers_remaining_splittable_work_over_original_size() {
     let saturated_state = state_with(
         1_600_000,
         [
-            active_chunk(1, 0, 999_999, 900_000, 100_000.0),
-            active_chunk(2, 1_000_000, 1_499_999, 0, 100_000.0),
-            active_chunk(3, 1_500_000, 1_599_999, 0, 100_000.0),
+            active_chunk(1, 0, 999_999, 900_000, 25_000.0),
+            active_chunk(2, 1_000_000, 1_499_999, 0, 25_000.0),
+            active_chunk(3, 1_500_000, 1_599_999, 0, 25_000.0),
         ],
     );
     let (cmd_tx, mut cmd_rx) = command_channel();
@@ -162,9 +162,9 @@ fn split_target_prefers_remaining_splittable_work_over_original_size() {
         1_600_000,
         [
             // Largest original range, but only 10 KiB remains.
-            active_chunk(1, 0, 999_999, 989_760, 100_000.0),
+            active_chunk(1, 0, 999_999, 989_760, 25_000.0),
             // Smaller original range, but much more remaining splittable work.
-            active_chunk(2, 1_000_000, 1_499_999, 0, 100_000.0),
+            active_chunk(2, 1_000_000, 1_499_999, 0, 25_000.0),
         ],
     );
 
