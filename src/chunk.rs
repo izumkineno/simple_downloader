@@ -1,4 +1,3 @@
-
 //! 定义和管理单个下载块（chunk）的执行逻辑。
 
 use crate::types::{ChunkId, DownloadCmd, DownloadInfo};
@@ -10,6 +9,17 @@ use tokio::sync::{broadcast, mpsc};
 /// 定义一个块（chunk）的最小尺寸。
 /// 当一个块被分割时，分割后的每个块的大小不能小于此值。
 pub(crate) const MIN_CHUNK_SIZE: u64 = 1024 * 10; // 10 KB
+
+fn split_range(offset: u64, end: u64) -> Option<(u64, u64)> {
+    let remaining_bytes = end.saturating_sub(offset).saturating_add(1);
+    if remaining_bytes < MIN_CHUNK_SIZE * 2 {
+        return None;
+    }
+
+    let left_chunk_size = remaining_bytes / 2;
+    let midpoint = offset + left_chunk_size - 1;
+    Some((midpoint, midpoint + 1))
+}
 
 /// 单个下载块（worker）的执行任务。
 ///
@@ -72,12 +82,9 @@ pub async fn chunk_run(
             Ok(cmd) = bd_rx.recv() => match cmd {
                 // 如果收到分割命令且目标是当前块
                 DownloadCmd::BisectDownload { id: id_ } if id == id_ => {
-                    let remaining = end.saturating_sub(offset);
-                    // 如果剩余大小不足以分割成两个最小块，则忽略
-                    if remaining < MIN_CHUNK_SIZE * 2 { continue; }
-
-                    let midpoint = offset + remaining / 2;
-                    let new_chunk_start = midpoint + 1;
+                    let Some((midpoint, new_chunk_start)) = split_range(offset, end) else {
+                        continue;
+                    };
 
                     // 广播“块已分割”事件，通知监控器创建新任务
                     if bd_tx.send(DownloadInfo::ChunkBisected {
@@ -160,3 +167,24 @@ pub async fn chunk_run(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_range_allows_exactly_two_minimum_chunks() {
+        let end = (MIN_CHUNK_SIZE * 2) - 1;
+
+        assert_eq!(
+            split_range(0, end),
+            Some((MIN_CHUNK_SIZE - 1, MIN_CHUNK_SIZE))
+        );
+    }
+
+    #[test]
+    fn split_range_rejects_ranges_smaller_than_two_minimum_chunks() {
+        let end = (MIN_CHUNK_SIZE * 2) - 2;
+
+        assert_eq!(split_range(0, end), None);
+    }
+}
