@@ -66,6 +66,16 @@ impl ChunkState {
         self.end_byte.saturating_sub(self.start_byte) + 1
     }
 
+    /// 计算块当前剩余的未下载字节数。
+    pub fn remaining_bytes(&self) -> u64 {
+        self.size().saturating_sub(self.downloaded_bytes)
+    }
+
+    /// 判断当前块是否还能被安全地一分为二。
+    pub fn is_splittable(&self, min_chunk_size: u64) -> bool {
+        self.remaining_bytes() >= min_chunk_size * 2
+    }
+
     /// 根据新下载的字节数和经过的时间来更新速度。
     /// 使用指数移动平均法（EMA）进行平滑处理。
     pub fn update_speed(&mut self, elapsed_secs: f64, smoothing_factor: f64) {

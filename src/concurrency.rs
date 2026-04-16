@@ -52,7 +52,7 @@ impl ConcurrencyManager {
                 DownloadPhase::Probing
             },
             max_speed: 0.0,
-            last_split_time: Instant::now(),
+            last_split_time: Instant::now() - MIN_SPLIT_INTERVAL,
             stable_speed_samples: VecDeque::with_capacity(10),
         }
     }
@@ -89,17 +89,31 @@ impl ConcurrencyManager {
         } else {
             f64::MAX
         };
+        let previous_max_speed = self.max_speed;
+        if avg_speed > 0.0 {
+            self.max_speed = self.max_speed.max(avg_speed);
+        }
 
         // 根据当前阶段执行不同的逻辑
         match self.phase {
-            DownloadPhase::Probing => self.handle_probing_phase(state, avg_speed, cmd_tx),
-            DownloadPhase::Stable => {
-                self.handle_stable_phase(state, avg_speed, estimated_time, cmd_tx)
-            }
+            DownloadPhase::Probing => self.handle_probing_phase(
+                state,
+                avg_speed,
+                estimated_time,
+                previous_max_speed,
+                cmd_tx,
+            ),
+            DownloadPhase::Stable => self.handle_stable_phase(
+                state,
+                avg_speed,
+                estimated_time,
+                previous_max_speed,
+                cmd_tx,
+            ),
         }
 
         // 执行被动分割逻辑
-        self.reactive_split(state, cmd_tx);
+        self.reactive_split(state, avg_speed, estimated_time, cmd_tx);
     }
 
     /// 处理探测阶段的逻辑。
@@ -107,6 +121,8 @@ impl ConcurrencyManager {
         &mut self,
         state: &DownloadState,
         avg_speed: f64,
+        estimated_time: f64,
+        previous_max_speed: f64,
         cmd_tx: &broadcast::Sender<DownloadCmd>,
     ) {
         let active_chunks = state.chunks.len() as u64;
@@ -116,12 +132,17 @@ impl ConcurrencyManager {
             return;
         }
 
+        if !self.split_is_useful(avg_speed, estimated_time) {
+            return;
+        }
+
         // 如果当前速度显著高于历史最大速度，说明增加并发带来了好处
-        if avg_speed > self.max_speed * BANDWIDTH_PROBE_FACTOR || self.max_speed == 0.0 {
-            self.max_speed = avg_speed;
+        if avg_speed > previous_max_speed * BANDWIDTH_PROBE_FACTOR || previous_max_speed == 0.0 {
             // 分割当前最大的块，以期进一步提升速度
-            if let Some(largest_chunk) = self.find_largest_chunk(&state.chunks) {
+            if let Some(largest_chunk) = self.find_largest_splittable_chunk(&state.chunks) {
                 self.request_split(largest_chunk.id, cmd_tx);
+            } else {
+                self.transition_to_stable();
             }
         } else if active_chunks > 1 && self.stable_speed_samples.len() >= 3 {
             // 如果增加并发后速度没有显著提升，则认为已达到带宽瓶颈，转换到稳定阶段
@@ -135,13 +156,18 @@ impl ConcurrencyManager {
         state: &DownloadState,
         avg_speed: f64,
         estimated_time: f64,
+        previous_max_speed: f64,
         cmd_tx: &broadcast::Sender<DownloadCmd>,
     ) {
-        // 当速度发生较大波动（上升或下降），且剩余下载时间较长，并且未达到最大并发数时
+        // 上升的速度样本只需要刷新基准，不需要因此立刻继续分片。
+        if avg_speed >= previous_max_speed || previous_max_speed == 0.0 {
+            return;
+        }
+
+        // 当速度显著下降时，尝试通过重新分片最慢的块来恢复吞吐。
         if self.stable_speed_samples.len() > 3
-            && (avg_speed > self.max_speed * BANDWIDTH_PROBE_FACTOR
-                || avg_speed < self.max_speed * STABLE_SPLIT_THRESHOLD)
-            && estimated_time > MIN_REMAINING_TIME_FOR_SPLIT
+            && avg_speed < previous_max_speed * STABLE_SPLIT_THRESHOLD
+            && self.split_is_useful(avg_speed, estimated_time)
             && (state.chunks.len() as u64) < self.max_workers
         {
             // 尝试分割最慢的块，因为它可能是瓶颈
@@ -157,15 +183,20 @@ impl ConcurrencyManager {
 
     /// 被动分割逻辑：在稳定阶段，如果并发数未满，则周期性地分割最大的块。
     /// 这有助于处理某些块提前完成导致并发数下降的情况。
-    fn reactive_split(&mut self, state: &DownloadState, cmd_tx: &broadcast::Sender<DownloadCmd>) {
-        if self.phase == DownloadPhase::Stable
-            && self.last_split_time.elapsed() > MIN_SPLIT_INTERVAL
-        {
+    fn reactive_split(
+        &mut self,
+        state: &DownloadState,
+        avg_speed: f64,
+        estimated_time: f64,
+        cmd_tx: &broadcast::Sender<DownloadCmd>,
+    ) {
+        if self.phase == DownloadPhase::Stable && self.split_is_useful(avg_speed, estimated_time) {
             let active_chunks = state.chunks.len() as u64;
-            if active_chunks > 0 && active_chunks < self.max_workers {
-                if let Some(largest_chunk) = self.find_largest_chunk(&state.chunks) {
-                    self.request_split(largest_chunk.id, cmd_tx);
-                }
+            if active_chunks > 0
+                && active_chunks < self.max_workers
+                && let Some(largest_chunk) = self.find_largest_splittable_chunk(&state.chunks)
+            {
+                self.request_split(largest_chunk.id, cmd_tx);
             }
         }
     }
@@ -183,12 +214,19 @@ impl ConcurrencyManager {
         self.stable_speed_samples.clear();
     }
 
-    /// 在所有块中找到尺寸最大的一个。
-    fn find_largest_chunk<'a>(
+    fn split_is_useful(&self, avg_speed: f64, estimated_time: f64) -> bool {
+        avg_speed > 0.0 && estimated_time > MIN_REMAINING_TIME_FOR_SPLIT
+    }
+
+    /// 在所有块中找到剩余工作量最大的、且可继续分割的块。
+    fn find_largest_splittable_chunk<'a>(
         &self,
         chunks: &'a HashMap<ChunkId, ChunkState>,
     ) -> Option<&'a ChunkState> {
-        chunks.values().max_by_key(|c| c.size())
+        chunks
+            .values()
+            .filter(|c| c.is_splittable(MIN_CHUNK_SIZE))
+            .max_by_key(|c| c.remaining_bytes())
     }
 
     /// 找到最慢且可以被分割的块。
@@ -199,7 +237,7 @@ impl ConcurrencyManager {
     ) -> Option<&'a ChunkState> {
         chunks
             .values()
-            .filter(|c| c.size().saturating_sub(c.downloaded_bytes) > MIN_CHUNK_SIZE * 2)
+            .filter(|c| c.is_splittable(MIN_CHUNK_SIZE))
             .min_by(|a, b| {
                 a.speed
                     .partial_cmp(&b.speed)
@@ -213,14 +251,23 @@ mod tests {
     use super::*;
     use tokio::sync::broadcast::error::TryRecvError;
 
-    fn chunk(id: ChunkId, start_byte: u64, end_byte: u64, downloaded_bytes: u64, speed: f64) -> ChunkState {
+    fn chunk(
+        id: ChunkId,
+        start_byte: u64,
+        end_byte: u64,
+        downloaded_bytes: u64,
+        speed: f64,
+    ) -> ChunkState {
         let mut chunk = ChunkState::new(id, start_byte, end_byte);
         chunk.downloaded_bytes = downloaded_bytes;
         chunk.speed = speed;
         chunk
     }
 
-    fn state_with_chunks(total_file_size: u64, chunks: impl IntoIterator<Item = ChunkState>) -> DownloadState {
+    fn state_with_chunks(
+        total_file_size: u64,
+        chunks: impl IntoIterator<Item = ChunkState>,
+    ) -> DownloadState {
         let mut state = DownloadState::new(total_file_size);
         for chunk in chunks {
             state.chunks.insert(chunk.id, chunk);
@@ -260,7 +307,7 @@ mod tests {
 
         manager.decide_and_act(&state, &cmd_tx);
 
-        assert_eq!(manager.max_speed, 150.0);
+        assert_eq!(manager.max_speed, 112.5);
         assert!(matches!(cmd_rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
