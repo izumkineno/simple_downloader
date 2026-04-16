@@ -207,3 +207,85 @@ impl ConcurrencyManager {
             })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    fn chunk(id: ChunkId, start_byte: u64, end_byte: u64, downloaded_bytes: u64, speed: f64) -> ChunkState {
+        let mut chunk = ChunkState::new(id, start_byte, end_byte);
+        chunk.downloaded_bytes = downloaded_bytes;
+        chunk.speed = speed;
+        chunk
+    }
+
+    fn state_with_chunks(total_file_size: u64, chunks: impl IntoIterator<Item = ChunkState>) -> DownloadState {
+        let mut state = DownloadState::new(total_file_size);
+        for chunk in chunks {
+            state.chunks.insert(chunk.id, chunk);
+        }
+        state
+    }
+
+    #[test]
+    fn probing_phase_does_not_split_without_positive_speed_evidence() {
+        let mut manager = ConcurrencyManager::new(4);
+        manager.last_split_time = Instant::now() - MIN_SPLIT_INTERVAL;
+
+        let state = state_with_chunks(100_000, [chunk(1, 0, 99_999, 0, 0.0)]);
+        let (cmd_tx, mut cmd_rx) = broadcast::channel(4);
+
+        manager.decide_and_act(&state, &cmd_tx);
+
+        assert!(matches!(cmd_rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn stable_phase_refreshes_max_speed_without_forcing_split() {
+        let mut manager = ConcurrencyManager::new(2);
+        manager.phase = DownloadPhase::Stable;
+        manager.max_speed = 100.0;
+        manager.last_split_time = Instant::now() - MIN_SPLIT_INTERVAL;
+        manager.stable_speed_samples = VecDeque::from(vec![100.0, 100.0, 100.0]);
+
+        let state = state_with_chunks(
+            50_000,
+            [
+                chunk(1, 0, 19_999, 5_000, 75.0),
+                chunk(2, 20_000, 39_999, 5_000, 75.0),
+            ],
+        );
+        let (cmd_tx, mut cmd_rx) = broadcast::channel(4);
+
+        manager.decide_and_act(&state, &cmd_tx);
+
+        assert_eq!(manager.max_speed, 150.0);
+        assert!(matches!(cmd_rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn reactive_split_prefers_largest_remaining_splittable_chunk() {
+        let mut manager = ConcurrencyManager::new(3);
+        manager.phase = DownloadPhase::Stable;
+        manager.max_speed = 1_000.0;
+        manager.last_split_time = Instant::now() - MIN_SPLIT_INTERVAL;
+        manager.stable_speed_samples = VecDeque::from(vec![1_000.0, 1_000.0, 1_000.0]);
+
+        let state = state_with_chunks(
+            200_000,
+            [
+                chunk(1, 0, 60_000, 55_000, 500.0),
+                chunk(2, 60_001, 120_000, 15_000, 500.0),
+            ],
+        );
+        let (cmd_tx, mut cmd_rx) = broadcast::channel(4);
+
+        manager.decide_and_act(&state, &cmd_tx);
+
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(DownloadCmd::BisectDownload { id }) if id == 2
+        ));
+    }
+}
