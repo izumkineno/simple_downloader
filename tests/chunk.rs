@@ -1,7 +1,7 @@
-use simple_downloader::chunk::*;
-use simple_downloader::types::{ChunkId, DownloadCmd, DownloadInfo};
 use mockito::Server;
 use reqwest::Client;
+use simple_downloader::chunk::*;
+use simple_downloader::types::{ChunkId, DownloadCmd, DownloadInfo};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 
@@ -10,9 +10,10 @@ async fn test_chunk_download_success() {
     // 创建模拟服务器
     let mut server = Server::new_async().await;
     let test_data = b"Hello World! This is a test file content.";
-    
+
     // 模拟范围请求
-    let mock = server.mock("GET", "/testfile")
+    let mock = server
+        .mock("GET", "/testfile")
         .match_header("Range", "bytes=0-44")
         .with_status(206)
         .with_header("Content-Range", "bytes 0-44/45")
@@ -83,8 +84,9 @@ async fn test_chunk_bisect() {
     // 创建模拟服务器，返回一个较大的数据流
     let mut server = Server::new_async().await;
     let test_data = vec![0u8; 100 * 1024]; // 100KB数据
-    
-    let mock = server.mock("GET", "/testfile")
+
+    let mock = server
+        .mock("GET", "/testfile")
         .match_header("Range", "bytes=0-99999")
         .with_status(206)
         .with_header("Content-Range", "bytes 0-99999/100000")
@@ -107,7 +109,16 @@ async fn test_chunk_bisect() {
     // 启动chunk任务
     let chunk_id: ChunkId = 1;
     let handle = tokio::spawn(async move {
-        chunk_run(chunk_id, cmd_tx, cmd_bd_rx, info_bd_tx.clone(), rb, 0, 99999).await;
+        chunk_run(
+            chunk_id,
+            cmd_tx,
+            cmd_bd_rx,
+            info_bd_tx.clone(),
+            rb,
+            0,
+            99999,
+        )
+        .await;
     });
 
     // 等待下载开始
@@ -122,7 +133,11 @@ async fn test_chunk_bisect() {
     let mut new_end = 0;
     while let Ok(info) = info_bd_rx.recv().await {
         match info {
-            DownloadInfo::ChunkBisected { original_id, new_start: ns, new_end: ne } if original_id == chunk_id => {
+            DownloadInfo::ChunkBisected {
+                original_id,
+                new_start: ns,
+                new_end: ne,
+            } if original_id == chunk_id => {
                 bisected_received = true;
                 new_start = ns;
                 new_end = ne;
@@ -147,8 +162,9 @@ async fn test_chunk_bisect() {
 async fn test_chunk_request_failure() {
     // 创建模拟服务器，返回错误
     let mut server = Server::new_async().await;
-    
-    let mock = server.mock("GET", "/testfile")
+
+    let mock = server
+        .mock("GET", "/testfile")
         .with_status(500)
         .create_async()
         .await;

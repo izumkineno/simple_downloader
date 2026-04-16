@@ -90,10 +90,7 @@ pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
 ///
 /// # 返回
 /// 一个 `mpsc::Sender<DownloadCmd>`，其他任务可以通过它发送 `WriteFile` 命令。
-pub async fn file_writer_task(
-    filepath: FastStr,
-    size: u64,
-) -> Result<mpsc::Sender<DownloadCmd>> {
+pub async fn file_writer_task(filepath: FastStr, size: u64) -> Result<mpsc::Sender<DownloadCmd>> {
     const WRITER_QUEUE_CAP: usize = 128;
     let (tx, mut rx) = mpsc::channel::<DownloadCmd>(WRITER_QUEUE_CAP);
 
@@ -130,4 +127,3 @@ pub async fn file_writer_task(
 
     Ok(tx)
 }
-
