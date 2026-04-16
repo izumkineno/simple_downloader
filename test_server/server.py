@@ -1,13 +1,21 @@
 import http.server
 import socketserver
 import os
+import sys
 import time
 import configparser
 import re
 from threading import Lock, Thread, get_ident
 import socket
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+except ImportError:
+    Observer = None
+
+    class FileSystemEventHandler:
+        pass
 
 # --- Configuration Parsing and Locks ---
 config = configparser.ConfigParser()
@@ -26,6 +34,7 @@ PORT = config.getint('server', 'port', fallback=8000)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE_PATH = os.path.join(SCRIPT_DIR, 'config.ini')
 DIRECTORY = config.get('server', 'directory', fallback=os.path.join(SCRIPT_DIR, 'files'))
+FILES_MANIFEST_PATH = '/__files__'
 
 def parse_speed(speed_str):
     """Parse speed string (e.g., '10m', '512k') into bytes/sec."""
@@ -59,8 +68,13 @@ class SpeedMonitor:
         with self.lock:
             now = time.time()
             elapsed = now - self.last_time
-            if elapsed > 1.0:  # Update every second
-                self.current_speed = self.bytes_sent_since_last_check / elapsed
+            if elapsed <= 0:
+                return self.current_speed
+
+            # Keep the display responsive by refreshing on every sample,
+            # while still using ~1s windows for accumulation reset.
+            self.current_speed = self.bytes_sent_since_last_check / elapsed
+            if elapsed >= 1.0:
                 self.bytes_sent_since_last_check = 0
                 self.last_time = now
         return self.current_speed
@@ -77,6 +91,38 @@ def format_speed(speed_bytes_per_sec):
         return f"{speed_bytes_per_sec / (1024 * 1024 * 1024):.2f} GB/s"
 
 speed_monitor = SpeedMonitor()
+
+# --- Thread-Safe Console Output ---
+console_lock = Lock()
+console_mode = "text"
+console_status_width = 0
+console_is_tty = sys.stdout.isatty() and sys.stdin.isatty()
+
+def console_print(*args, sep=" ", end="\n", flush=True):
+    """Serialize normal console output across threads."""
+    global console_mode
+    message = sep.join(str(arg) for arg in args)
+    with console_lock:
+        if console_mode == "status" and message:
+            sys.stdout.write("\n")
+        sys.stdout.write(message + end)
+        if flush:
+            sys.stdout.flush()
+        console_mode = "text"
+
+def console_status(message):
+    """Render a live-updating status line without garbling other output."""
+    global console_mode, console_status_width
+    if not console_is_tty:
+        console_print(message)
+        return
+
+    with console_lock:
+        padded = message.ljust(console_status_width)
+        sys.stdout.write("\r" + padded)
+        sys.stdout.flush()
+        console_status_width = len(message)
+        console_mode = "status"
 
 # --- Global Bandwidth Manager (Thread-Safe) ---
 class BandwidthManager:
@@ -153,6 +199,39 @@ class ThrottledHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         ThrottledHTTPRequestHandler.directory = DIRECTORY
         super().__init__(*args, **kwargs)
+
+    def _normalized_path(self):
+        return self.path.split('?', 1)[0].rstrip('/') or '/'
+
+    def _serve_files_manifest(self, include_body: bool):
+        entries = []
+        for name in sorted(os.listdir('.')):
+            if os.path.isfile(name):
+                entries.append((name, os.path.getsize(name)))
+
+        body = '\n'.join(f'{name}\t{size}' for name, size in entries)
+        if body:
+            body += '\n'
+        body_bytes = body.encode('utf-8')
+
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain; charset=utf-8')
+        self.send_header('Content-Length', str(len(body_bytes)))
+        self.end_headers()
+        if include_body:
+            self.wfile.write(body_bytes)
+
+    def do_GET(self):
+        if self._normalized_path() == FILES_MANIFEST_PATH:
+            self._serve_files_manifest(True)
+            return
+        super().do_GET()
+
+    def do_HEAD(self):
+        if self._normalized_path() == FILES_MANIFEST_PATH:
+            self._serve_files_manifest(False)
+            return
+        super().do_HEAD()
 
     def send_head(self):
         path = self.translate_path(self.path)
@@ -251,7 +330,7 @@ class ThrottledHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             # This is expected when a download client closes a partial connection
             pass
         except Exception as e:
-            print(f"\nAn error occurred during transfer of '{self.path}': {e}")
+            console_print(f"\nAn error occurred during transfer of '{self.path}': {e}")
         finally:
             with downloads_lock:
                 ACTIVE_DOWNLOADS.pop(thread_id, None)
@@ -271,24 +350,24 @@ class ThrottledHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
                         
                         average_speed = total_size_bytes / duration if duration > 0 else float('inf')
 
-                        print(f"\n[Download Complete] File '{self.path}' has finished downloading.")
-                        print(f"  - Total Time: {duration:.2f} seconds")
-                        print(f"  - Average Speed: {format_speed(average_speed)}")
-                        print("> ", end="", flush=True) # Restore console prompt
+                        console_print(f"\n[Download Complete] File '{self.path}' has finished downloading.")
+                        console_print(f"  - Total Time: {duration:.2f} seconds")
+                        console_print(f"  - Average Speed: {format_speed(average_speed)}")
+                        console_print("> ", end="", flush=True) # Restore console prompt
 
 
 # --- Speed Monitoring Function ---
 def monitor_speed(monitor):
     while True:
         speed = monitor.get_speed()
-        print(f"Current Total Speed: {format_speed(speed)}   ", end='\r')
-        time.sleep(1)
+        console_status(f"Current Total Speed: {format_speed(speed)}")
+        time.sleep(0.5)
 
 # --- Configuration Reloading and Monitoring ---
 def reload_config():
     """Thread-safely reload configuration and update limiters."""
     global TOTAL_MAX_SPEED, PER_THREAD_MAX_SPEED
-    print("\n[CONFIG] Detected config.ini change, reloading...")
+    console_print("\n[CONFIG] Detected config.ini change, reloading...")
     
     with config_lock:
         config.read(CONFIG_FILE_PATH, encoding='utf-8')
@@ -301,10 +380,10 @@ def reload_config():
     total_speed_str = config.get('throttling', 'total_max_speed', fallback='Unlimited')
     per_thread_speed_str = config.get('throttling', 'per_thread_max_speed', fallback='Unlimited')
     
-    print(f"[CONFIG] Configuration updated.")
-    print(f"[CONFIG] New total speed limit: {total_speed_str}")
-    print(f"[CONFIG] New per-thread speed limit: {per_thread_speed_str}")
-    print("> ", end="", flush=True)
+    console_print(f"[CONFIG] Configuration updated.")
+    console_print(f"[CONFIG] New total speed limit: {total_speed_str}")
+    console_print(f"[CONFIG] New per-thread speed limit: {per_thread_speed_str}")
+    console_print("> ", end="", flush=True)
 
 class ConfigurationWatcher(FileSystemEventHandler):
     """Triggers an event when config.ini is modified."""
@@ -317,45 +396,45 @@ def handle_list(args):
     """Handles the 'list' command."""
     with downloads_lock:
         if not ACTIVE_DOWNLOADS:
-            print("No active downloads.")
+            console_print("No active downloads.")
         else:
-            print("-" * 80)
-            print(f"{'Thread ID':<15} {'Client':<22} {'File':<30} {'Duration'}")
-            print("-" * 80)
+            console_print("-" * 80)
+            console_print(f"{'Thread ID':<15} {'Client':<22} {'File':<30} {'Duration'}")
+            console_print("-" * 80)
             for tid, info in ACTIVE_DOWNLOADS.items():
                 duration = time.time() - info['start_time']
-                print(f"{tid:<15} {info['client'][0]}:{info['client'][1]:<15} {info['file']:<30} {int(duration)}s")
-            print("-" * 80)
+                console_print(f"{tid:<15} {info['client'][0]}:{info['client'][1]:<15} {info['file']:<30} {int(duration)}s")
+            console_print("-" * 80)
 
 def handle_disconnect(args):
     """Handles the 'disconnect' command."""
     if len(args) != 1:
-        print("Usage: disconnect <Thread ID>")
+        console_print("Usage: disconnect <Thread ID>")
         return
     try:
         tid_to_disconnect = int(args[0])
         with downloads_lock:
             if tid_to_disconnect in ACTIVE_DOWNLOADS:
-                print(f"Disconnecting thread {tid_to_disconnect}...")
+                console_print(f"Disconnecting thread {tid_to_disconnect}...")
                 sock = ACTIVE_DOWNLOADS[tid_to_disconnect]['socket']
                 sock.shutdown(socket.SHUT_RDWR)
                 sock.close()
-                print(f"Disconnection signal sent to thread {tid_to_disconnect}.")
+                console_print(f"Disconnection signal sent to thread {tid_to_disconnect}.")
             else:
-                print(f"Error: Thread with ID {tid_to_disconnect} not found.")
+                console_print(f"Error: Thread with ID {tid_to_disconnect} not found.")
     except ValueError:
-        print("Error: Thread ID must be an integer.")
+        console_print("Error: Thread ID must be an integer.")
     except Exception as e:
-        print(f"Error while trying to disconnect thread: {e}")
+        console_print(f"Error while trying to disconnect thread: {e}")
 
 def handle_help(args):
     """Handles the 'help' command."""
-    print("\nAvailable commands:")
+    console_print("\nAvailable commands:")
     for cmd, description in COMMAND_DESCRIPTIONS.items():
         aliases = [alias for alias, full_cmd in ALIASES.items() if full_cmd == cmd]
         alias_str = f"(aliases: {', '.join(aliases)})" if aliases else ""
-        print(f"  {cmd:<15} {alias_str:<20} - {description}")
-    print()
+        console_print(f"  {cmd:<15} {alias_str:<20} - {description}")
+    console_print()
 
 COMMAND_DESCRIPTIONS = {
     'list': 'List all active download connections.',
@@ -377,10 +456,14 @@ ALIASES = {
 
 def console_control():
     """Run the interactive console for server management."""
-    print("\nConsole started. Type 'help' or 'h' for available commands.")
+    console_print("\nConsole started. Type 'help' or 'h' for available commands.")
     while True:
         try:
-            command_line = input("> ").strip()
+            console_print("> ", end="", flush=True)
+            command_line = sys.stdin.readline()
+            if command_line == "":
+                raise EOFError
+            command_line = command_line.strip()
             if not command_line:
                 continue
 
@@ -394,25 +477,29 @@ def console_control():
             if handler:
                 handler(args)
             else:
-                print(f"Unknown command: '{base_command}'. Type 'help' or 'h' for assistance.")
+                console_print(f"Unknown command: '{base_command}'. Type 'help' or 'h' for assistance.")
 
         except (EOFError, KeyboardInterrupt):
-            print("\nPlease use Ctrl+C in the main program window to stop the server.")
+            console_print("\nPlease use Ctrl+C in the main program window to stop the server.")
 
 # --- Server Initialization ---
 if __name__ == "__main__":
     if not os.path.exists(DIRECTORY):
-        print(f"Warning: Directory '{DIRECTORY}' does not exist. Creating it...")
+        console_print(f"Warning: Directory '{DIRECTORY}' does not exist. Creating it...")
         os.makedirs(DIRECTORY)
     
     os.chdir(SCRIPT_DIR)
     
-    event_handler = ConfigurationWatcher()
-    observer = Observer()
-    observer.schedule(event_handler, path='.', recursive=False)
-    observer.daemon = True
-    observer.start()
-    print("Monitoring of config.ini has started.")
+    observer = None
+    if Observer is not None:
+        event_handler = ConfigurationWatcher()
+        observer = Observer()
+        observer.schedule(event_handler, path='.', recursive=False)
+        observer.daemon = True
+        observer.start()
+        console_print("Monitoring of config.ini has started.")
+    else:
+        console_print("watchdog is unavailable; config.ini hot reload is disabled.")
     
     os.chdir(DIRECTORY)
 
@@ -421,14 +508,14 @@ if __name__ == "__main__":
     try:
         httpd = socketserver.ThreadingTCPServer((HOST, PORT), Handler)
     except OSError as e:
-        print(f"Error: Could not start server on {HOST}:{PORT} - {e}")
+        console_print(f"Error: Could not start server on {HOST}:{PORT} - {e}")
         exit(1)
 
-    print(f"Multi-threaded file server is running at http://{HOST}:{PORT}")
-    print(f"Serving files from: {os.path.abspath(os.getcwd())}")
-    print(f"Total download speed limit: {config.get('throttling', 'total_max_speed', fallback='Unlimited')}")
-    print(f"Per-thread speed limit: {config.get('throttling', 'per_thread_max_speed', fallback='Unlimited')}")
-    print("Server now supports concurrent multi-threaded downloads (range requests).")
+    console_print(f"Multi-threaded file server is running at http://{HOST}:{PORT}")
+    console_print(f"Serving files from: {os.path.abspath(os.getcwd())}")
+    console_print(f"Total download speed limit: {config.get('throttling', 'total_max_speed', fallback='Unlimited')}")
+    console_print(f"Per-thread speed limit: {config.get('throttling', 'per_thread_max_speed', fallback='Unlimited')}")
+    console_print("Server now supports concurrent multi-threaded downloads (range requests).")
 
     monitor_thread = Thread(target=monitor_speed, args=(speed_monitor,), daemon=True)
     monitor_thread.start()
@@ -436,13 +523,14 @@ if __name__ == "__main__":
     control_thread = Thread(target=console_control, daemon=True)
     control_thread.start()
 
-    print("\nPress Ctrl+C to stop the server")
+    console_print("\nPress Ctrl+C to stop the server")
 
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\nShutting down the server...")
+        console_print("\nShutting down the server...")
         observer.stop()
         httpd.server_close()
 
-    observer.join()
+    if observer is not None:
+        observer.join()

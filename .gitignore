@@ -2,3 +2,4 @@
 /test_server/files
 .venv
 .omx
+__pycache__
