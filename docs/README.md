@@ -6,6 +6,7 @@
 
 - [`../README.md`](../README.md)：项目功能概览、公开用法、概念级 Mermaid 图。
 - [`architecture.md`](./architecture.md)：当前实现的**权威运行时说明**，覆盖启动链路、控制面、消息协议、动态分片与重试行为。
+- `tests/concurrency.rs`：并发策略回归测试，覆盖“无吞吐证据不分片”“空闲槽位不盲目补位”“接近完成不继续切分”“按剩余工作量而非原始尺寸选目标”等行为。
 - `tests/chunk.rs`：分片下载成功/失败路径，以及保留中的 bisect 行为测试骨架。
 - `tests/util.rs`：文件信息探测回退链路、写入任务和基础工具行为。
 - `test_server/server.py`：本地可控 Range/限速测试服务，适合集成验证与手工观察并发行为。
@@ -25,6 +26,11 @@ simple_downloader 是一个基于 Rust 与 Tokio 的异步下载库，当前实�
 
 ### 1. 自动化测试
 
+- `tests/concurrency.rs`
+  - 无正向吞吐证据时不继续探测分片
+  - 仅因 worker 槽位空闲不会触发补位分片
+  - 接近完成时不会为了补位继续切分
+  - 补位目标按“剩余可分片工作量”而不是原始区间尺寸选择
 - `tests/util.rs`
   - `HEAD` 成功获取文件信息
   - `HEAD` 失败后回退 `GET Range: bytes=0-0`

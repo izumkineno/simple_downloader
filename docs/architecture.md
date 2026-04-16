@@ -57,7 +57,7 @@ Downloader.run(progress_handler)
 - **Chunk worker**：只处理一个当前 byte range 的网络拉取、写入请求和事件上报。它不会直接修改全局状态。
 - **FileWriter**：通过有界 `mpsc<DownloadCmd>` 接收 `WriteFile`，执行 seek + write，并在结束前 flush。
 - **DownloadMonitor**：消费 `DownloadInfo`，更新 `DownloadState`，定期计算速度/总进度，驱动并发分片和重试队列。
-- **ConcurrencyManager**：作为 monitor 的内部策略组件，基于速度、剩余时间、稳定性采样和最大并发限制决定是否广播 `BisectDownload`。
+- **ConcurrencyManager**：作为 monitor 的内部策略组件，基于速度、剩余时间、稳定性采样和最大并发限制决定是否广播 `BisectDownload`；当前策略会避免在吞吐证据不足、接近完成或只是“恰好有空闲 worker 槽位”时盲目继续分片。
 - **RetryHandler**：作为 monitor 的内部恢复组件，维护即时重试队列和延迟重试队列，决定失败 range 何时重新生成 chunk。
 - **ProgressHandler / UI**：只消费 `DownloadInfo`，不参与调度决策。
 
@@ -171,7 +171,14 @@ chunk 拉取远端字节流后，把数据通过 `mpsc<DownloadCmd>` 发送给 `
 
 ### 6.4 动态分片
 
-`ConcurrencyManager` 是 monitor 内部的决策器。它根据当前总速度、稳定性样本、剩余时间、最小分片间隔、最大并发数等因素决定是否发送 `BisectDownload`。收到命令的 chunk 自己调整当前 range 并上报 `ChunkBisected`，monitor 再为新增 range 生成新 chunk。
+`ConcurrencyManager` 是 monitor 内部的决策器。它根据当前总速度、稳定性样本、剩余时间、最小分片间隔、最大并发数等因素决定是否发送 `BisectDownload`。当前实现的关键策略是：
+
+- **探测阶段**：只有在正向吞吐样本表明确有带宽增益时才继续扩容；如果没有可安全切分的 range，则直接转入稳定阶段。
+- **稳定阶段**：速度上升只会刷新历史基线，不会因为“速度又涨了”就立刻重新探测；只有当吞吐相对历史基线显著下降、且仍有足够剩余时间时，才尝试切分最慢的可分片 chunk。
+- **补位分片**：并发槽位空出来后，也只有在当前平均速度为正、剩余完成时间仍值得分片、并且存在足够大的剩余 range 时，才会补充分片。
+- **目标选择**：无论主动恢复还是补位，优先选择“剩余未下载字节数最多且仍可安全二分”的 chunk，而不是按原始 chunk 总尺寸粗暴排序。
+
+收到命令的 chunk 自己调整当前 range 并上报 `ChunkBisected`，monitor 再为新增 range 生成新 chunk。
 
 ### 6.5 即时重试与延迟恢复
 
@@ -186,7 +193,7 @@ chunk 完成后上报 `DownloadComplete`。monitor 标记该 chunk 完成并清�
 - 启动与编排：`src/downloader.rs:88-169`
 - 文件信息探测与写入任务：`src/util.rs:13-132`
 - monitor 主循环与运行时接管：`src/monitor.rs:20-247`
-- 动态分片策略：`src/concurrency.rs:20-208`
+- 动态分片策略：`src/concurrency.rs:20-247`
 - 重试队列与延迟恢复：`src/retry.rs:9-173`
 - chunk 下载、切分、写入、事件上报：`src/chunk.rs:12-150`
 - 状态与 EMA 速度：`src/state.rs:7-137`
