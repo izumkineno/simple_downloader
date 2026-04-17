@@ -20,21 +20,35 @@ except ImportError:
 # --- Configuration Parsing and Locks ---
 config = configparser.ConfigParser()
 config_lock = Lock()
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE_PATH = os.path.join(SCRIPT_DIR, 'config.ini')
+
+def env_override(name):
+    value = os.environ.get(f'SIMPLE_DOWNLOADER_TEST_SERVER_{name}')
+    if value is None:
+        return None
+    value = value.strip()
+    return value if value else None
+
+def config_value(section, option, fallback, env_name):
+    override = env_override(env_name)
+    if override is not None:
+        return override
+    return config.get(section, option, fallback=fallback)
 
 def load_config():
     """Load configuration from config.ini."""
     with config_lock:
-        config.read('config.ini', encoding='utf-8')
+        config.read(CONFIG_FILE_PATH, encoding='utf-8')
 
 # Initial load
 load_config()
 
-HOST = config.get('server', 'host', fallback='0.0.0.0')
-PORT = config.getint('server', 'port', fallback=8000)
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE_PATH = os.path.join(SCRIPT_DIR, 'config.ini')
-DIRECTORY = config.get('server', 'directory', fallback=os.path.join(SCRIPT_DIR, 'files'))
+HOST = config_value('server', 'host', '0.0.0.0', 'HOST')
+PORT = int(config_value('server', 'port', '8000', 'PORT'))
+DIRECTORY = config_value('server', 'directory', os.path.join(SCRIPT_DIR, 'files'), 'DIRECTORY')
 FILES_MANIFEST_PATH = '/__files__'
+STATS_PATH = '/__stats__'
 
 def parse_speed(speed_str):
     """Parse speed string (e.g., '10m', '512k') into bytes/sec."""
@@ -49,8 +63,10 @@ def parse_speed(speed_str):
         return float(speed_str[:-1]) * 1024 * 1024 * 1024
     return float(speed_str)
 
-TOTAL_MAX_SPEED = parse_speed(config.get('throttling', 'total_max_speed', fallback=''))
-PER_THREAD_MAX_SPEED = parse_speed(config.get('throttling', 'per_thread_max_speed', fallback=''))
+TOTAL_MAX_SPEED_LABEL = config_value('throttling', 'total_max_speed', '', 'TOTAL_MAX_SPEED')
+PER_THREAD_MAX_SPEED_LABEL = config_value('throttling', 'per_thread_max_speed', '', 'PER_THREAD_MAX_SPEED')
+TOTAL_MAX_SPEED = parse_speed(TOTAL_MAX_SPEED_LABEL)
+PER_THREAD_MAX_SPEED = parse_speed(PER_THREAD_MAX_SPEED_LABEL)
 
 # --- Global Speed Monitor (Thread-Safe) ---
 class SpeedMonitor:
@@ -171,6 +187,17 @@ downloads_lock = Lock()
 FILE_DOWNLOADS = {}
 file_downloads_lock = Lock()
 
+REQUEST_STATS = {
+    "head_requests": 0,
+    "get_requests": 0,
+    "range_requests": 0,
+}
+request_stats_lock = Lock()
+
+def add_request_stat(name, amount=1):
+    with request_stats_lock:
+        REQUEST_STATS[name] = REQUEST_STATS.get(name, 0) + amount
+
 # --- Throttled File Reader ---
 class ThrottledFileReader:
     def __init__(self, file_obj, thread_manager, speed_monitor_instance):
@@ -221,15 +248,35 @@ class ThrottledHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         if include_body:
             self.wfile.write(body_bytes)
 
+    def _serve_stats(self, include_body: bool):
+        with request_stats_lock:
+            body = ''.join(f'{name}\t{value}\n' for name, value in sorted(REQUEST_STATS.items()))
+        body_bytes = body.encode('utf-8')
+
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain; charset=utf-8')
+        self.send_header('Content-Length', str(len(body_bytes)))
+        self.end_headers()
+        if include_body:
+            self.wfile.write(body_bytes)
+
     def do_GET(self):
+        add_request_stat("get_requests")
         if self._normalized_path() == FILES_MANIFEST_PATH:
             self._serve_files_manifest(True)
+            return
+        if self._normalized_path() == STATS_PATH:
+            self._serve_stats(True)
             return
         super().do_GET()
 
     def do_HEAD(self):
+        add_request_stat("head_requests")
         if self._normalized_path() == FILES_MANIFEST_PATH:
             self._serve_files_manifest(False)
+            return
+        if self._normalized_path() == STATS_PATH:
+            self._serve_stats(False)
             return
         super().do_HEAD()
 
@@ -267,6 +314,7 @@ class ThrottledHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         if range_header:
             range_match = self.range_re.match(range_header)
             if range_match:
+                add_request_stat("range_requests")
                 start_byte, end_byte = range_match.groups()
                 start_byte = int(start_byte)
                 
@@ -366,19 +414,21 @@ def monitor_speed(monitor):
 # --- Configuration Reloading and Monitoring ---
 def reload_config():
     """Thread-safely reload configuration and update limiters."""
-    global TOTAL_MAX_SPEED, PER_THREAD_MAX_SPEED
+    global TOTAL_MAX_SPEED, PER_THREAD_MAX_SPEED, TOTAL_MAX_SPEED_LABEL, PER_THREAD_MAX_SPEED_LABEL
     console_print("\n[CONFIG] Detected config.ini change, reloading...")
     
     with config_lock:
         config.read(CONFIG_FILE_PATH, encoding='utf-8')
         
-        TOTAL_MAX_SPEED = parse_speed(config.get('throttling', 'total_max_speed', fallback=''))
-        PER_THREAD_MAX_SPEED = parse_speed(config.get('throttling', 'per_thread_max_speed', fallback=''))
+        TOTAL_MAX_SPEED_LABEL = config_value('throttling', 'total_max_speed', '', 'TOTAL_MAX_SPEED')
+        PER_THREAD_MAX_SPEED_LABEL = config_value('throttling', 'per_thread_max_speed', '', 'PER_THREAD_MAX_SPEED')
+        TOTAL_MAX_SPEED = parse_speed(TOTAL_MAX_SPEED_LABEL)
+        PER_THREAD_MAX_SPEED = parse_speed(PER_THREAD_MAX_SPEED_LABEL)
         
         total_bandwidth_manager.limit = TOTAL_MAX_SPEED
     
-    total_speed_str = config.get('throttling', 'total_max_speed', fallback='Unlimited')
-    per_thread_speed_str = config.get('throttling', 'per_thread_max_speed', fallback='Unlimited')
+    total_speed_str = TOTAL_MAX_SPEED_LABEL or 'Unlimited'
+    per_thread_speed_str = PER_THREAD_MAX_SPEED_LABEL or 'Unlimited'
     
     console_print(f"[CONFIG] Configuration updated.")
     console_print(f"[CONFIG] New total speed limit: {total_speed_str}")
@@ -491,7 +541,8 @@ if __name__ == "__main__":
     os.chdir(SCRIPT_DIR)
     
     observer = None
-    if Observer is not None:
+    watch_config = env_override('DISABLE_CONFIG_WATCH') not in {'1', 'true', 'yes'}
+    if Observer is not None and watch_config:
         event_handler = ConfigurationWatcher()
         observer = Observer()
         observer.schedule(event_handler, path='.', recursive=False)
@@ -517,11 +568,15 @@ if __name__ == "__main__":
     console_print(f"Per-thread speed limit: {config.get('throttling', 'per_thread_max_speed', fallback='Unlimited')}")
     console_print("Server now supports concurrent multi-threaded downloads (range requests).")
 
-    monitor_thread = Thread(target=monitor_speed, args=(speed_monitor,), daemon=True)
-    monitor_thread.start()
+    status_enabled = env_override('DISABLE_STATUS') not in {'1', 'true', 'yes'}
+    if status_enabled:
+        monitor_thread = Thread(target=monitor_speed, args=(speed_monitor,), daemon=True)
+        monitor_thread.start()
     
-    control_thread = Thread(target=console_control, daemon=True)
-    control_thread.start()
+    console_enabled = env_override('DISABLE_CONSOLE') not in {'1', 'true', 'yes'}
+    if console_enabled:
+        control_thread = Thread(target=console_control, daemon=True)
+        control_thread.start()
 
     console_print("\nPress Ctrl+C to stop the server")
 
@@ -529,7 +584,8 @@ if __name__ == "__main__":
         httpd.serve_forever()
     except KeyboardInterrupt:
         console_print("\nShutting down the server...")
-        observer.stop()
+        if observer is not None:
+            observer.stop()
         httpd.server_close()
 
     if observer is not None:
