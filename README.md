@@ -26,29 +26,66 @@
 #### 6. **高兼容性的文件信息探测**
 - **智能回退 (Fallback)**: `get_file_info` 函数优先使用 `HEAD` 请求获取文件信息。若失败或响应头不完整，则自动回退至发送 `Range: bytes=0-0` 的 `GET` 请求，通过解析 `Content-Range` 头获取总大小，显著提高了对各类服务器的兼容性。
 
+#### 7. **多源 / 多代理下载基础能力**
+- **多源入口**: `MultiSourceConfig`、`SourceConfig` 与 `Downloader::new_multi(...)` 已支持为同一个输出文件配置多个镜像 URL。
+- **代理维度建模**: `SourceConfig::with_proxies(...)` 与 `LaneModel` 可把“源”或“源 + 代理”建模为调度 lane，并通过 `max_chunks_per_lane` / `max_chunks_per_source` 控制并发占用。
+- **源可用性筛选**: 多源启动阶段会探测候选源；不可用、文件大小不一致或不支持 Range 的源会被跳过，全部不可用时返回 `NoAvailableSources`。
+- **失败隔离**: lane 连续失败达到阈值后会进入黑名单，调度器会优先切换到其他健康 lane。
+- **repo-native 验证**: `tests/multi_source.rs` 已覆盖本地 `test_server/` 的多限速源、三源异构、无效源跳过等场景；`examples/manual_multi_source_test_server.rs` 提供 500 MiB 手工观察示例。
+
 ---
 
 ### 待实现的功能 (TODO List)
 
-目标：实现一个开箱即用、自带断点续传、任务队列、对接入 UI 友好，能自适应下载的多源多线程下载库。
+目标：实现一个开箱即用、自带断点续传、任务队列、对接入 UI 友好，能自适应下载的多源多线程下载库。下面按“已落地 / 待完善”同步当前状态。
 
 #### 1. **核心功能：断点续传 (Breakpoint Continuation)**
 -   [ ] **进度持久化**: 创建元数据文件（如 `.download`），在程序退出时安全地将 `DownloadState` 中的分块信息（各块的起止点、已下载位置等）写入其中。
 -   [ ] **任务恢复**: 程序启动时检查元数据文件。若存在，则直接读取状态并恢复下载任务，从上次中断的位置继续。
 
 #### 2. **核心功能：多源多代理下载 (Multi-Source Downloading)**
--   [ ] **支持多个URL和多个代理同时下载一个文件**: 改造 `DownloaderConfig`，使其可接受一组镜像 URL。
--   [ ] **智能源调度**: 在 `DownloadMonitor` / `ConcurrencyManager` 控制面中实现源调度逻辑。例如，为每个块动态选择响应最快或历史下载速度最快的源，并能在某个源失败时自动切换到其他可用源。
+-   [x] **支持多个 URL 下载同一个文件**: 通过 `MultiSourceConfig::with_sources(...)` 配置一组镜像 URL，并使用 `Downloader::new_multi(...)` 启动多源下载。
+-   [x] **支持源 / 代理 lane 建模**: 通过 `SourceConfig::with_proxies(...)`、`LaneModel::PerSource` / `LaneModel::PerSourceProxy` 表达多源多代理调度维度。
+-   [x] **源可用性与一致性校验**: 启动时跳过不可用源、不支持 Range 的源，以及文件大小与首个有效源不一致的源。
+-   [x] **无效源跳过与基础失败隔离**: 已有测试覆盖无效源跳过；lane 连续失败后可被黑名单隔离。
+-   [x] **repo-native `test_server` 集成测试**: 已用多个不同限速的本地服务器覆盖 fast/slow、三源异构、invalid + valid 等真实 Range 下载场景。
+-   [x] **手工观察示例**: `cargo run --example manual_multi_source_test_server` 会生成 500 MiB 测试文件，启动 fast=16m / slow=2m 两个本地源，并实时刷新总进度、速度和源侧 stats 摘要。
+-   [ ] **更智能的源调度评分**: 当前调度仍是基础 lane 选择与失败隔离；后续应引入响应时间、历史吞吐、失败率等动态评分，为每个块选择更优源。
+-   [ ] **更完整的多代理真实集成验证**: 当前代理维度已有配置与调度模型，后续应补充真实代理链路的端到端测试矩阵。
 
 #### 3. **核心功能：速度限制 (Speed Limiting)**
 -   [ ] **实现可配置的速度限制器**: 允许用户设置全局下载速度上限。在 `chunk_run` 或 `monitor` 层面引入节流（throttling）逻辑，确保总速度不超过设定值。
+-   [ ] **分源 / 分代理限速策略**: 当前 `test_server` 可用于模拟不同源限速；库本身后续还应支持调用方配置全局、单源或单 lane 的下载限速策略。
 
 #### 4. **其他改进**
 -   [ ] **配置灵活性**: 允许用户在运行时动态调整配置，如并发数、重试策略（次数、延迟算法）等。虽然已通过 `ClientBuilder` 提供了网络层面的高度自定义能力（如代理、超时），但应用层的策略也应更灵活。
+-   [ ] **任务队列 API**: 在单个下载任务之外，提供可暂停、恢复、取消、查询状态的任务队列抽象。
+-   [ ] **更稳定的 UI 对接层**: 将 `DownloadInfo` 事件语义整理成面向 UI 的稳定契约，并补充字段兼容性说明。
 
 
 
 #### 示例
+
+##### 多源手工观察示例
+
+如果想观察多源下载、不同源限速以及实时进度刷新，可运行：
+
+```bash
+cargo run --example manual_multi_source_test_server
+```
+
+该示例会：
+
+- 在系统临时目录生成一个 500 MiB 的确定性测试文件；
+- 自动启动两个 repo-native `test_server/server.py` 实例；
+- 将 fast 源限速为 `16m`，slow 源限速为 `2m`；
+- 使用 `Downloader::new_multi(...)` 对两个本地源执行真实多源下载；
+- 在终端中持续刷新总进度、总速度和 fast / slow 源侧 `/__stats__` 摘要；
+- 下载完成后做字节级一致性校验，并确认两个源都参与了 Range 请求。
+
+注意：示例中的源侧 stats 只用于观察参与度，不是精确的 per-source 吞吐率统计。
+
+##### 基础单源用法
 
 ```rust
 use simple_downloader::{Downloader, DownloadInfo, reqwest::ClientBuilder};
