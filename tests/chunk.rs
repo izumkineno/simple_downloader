@@ -24,7 +24,7 @@ async fn test_chunk_download_success() {
     // 创建通道
     let (cmd_tx, mut cmd_rx) = mpsc::channel(10);
     // 命令广播通道：发送命令给chunk
-    let (cmd_bd_tx, cmd_bd_rx) = broadcast::channel(10);
+    let (_cmd_bd_tx, cmd_bd_rx) = broadcast::channel(10);
     // 状态广播通道：chunk发送状态更新
     let (info_bd_tx, mut info_bd_rx) = broadcast::channel(10);
 
@@ -172,7 +172,7 @@ async fn test_chunk_request_failure() {
     // 创建通道
     let (cmd_tx, _cmd_rx) = mpsc::channel(10);
     // 命令广播通道：发送命令给chunk
-    let (cmd_bd_tx, cmd_bd_rx) = broadcast::channel(10);
+    let (_cmd_bd_tx, cmd_bd_rx) = broadcast::channel(10);
     // 状态广播通道：chunk发送状态更新
     let (info_bd_tx, mut info_bd_rx) = broadcast::channel(10);
 

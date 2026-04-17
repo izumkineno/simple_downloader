@@ -2,12 +2,14 @@
 
 use crate::chunk::chunk_run;
 use crate::concurrency::ConcurrencyManager;
+use crate::lane::MultiRuntime;
 use crate::retry::RetryHandler;
 use crate::state::{ChunkState, DownloadState};
-use crate::types::{DownloadCmd, DownloadInfo};
+use crate::types::{ChunkId, DownloadCmd, DownloadInfo};
 use faststr::FastStr;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
@@ -25,6 +27,8 @@ pub struct DownloadMonitor {
     retry_handler: RetryHandler,
     /// 动态并发控制管理器。
     concurrency_manager: ConcurrencyManager,
+    /// 多源模式下的 chunk -> lane 绑定。
+    lane_bindings: HashMap<ChunkId, FastStr>,
     /// 状态更新的间隔时间（秒）。
     update_interval: f64,
 }
@@ -36,6 +40,7 @@ impl DownloadMonitor {
             state: DownloadState::new(total_file_size),
             retry_handler: RetryHandler::new(),
             concurrency_manager: ConcurrencyManager::new(max_workers),
+            lane_bindings: HashMap::new(),
             update_interval,
         }
     }
@@ -53,8 +58,14 @@ impl DownloadMonitor {
         client: &Client,
         writer_tx: mpsc::Sender<DownloadCmd>,
         cmd_tx: &broadcast::Sender<DownloadCmd>,
-        url: &FastStr,
+        url: Option<&FastStr>,
+        initial_lanes: Vec<(ChunkId, FastStr)>,
+        mut multi_runtime: Option<MultiRuntime>,
     ) {
+        for (chunk_id, lane_id) in initial_lanes {
+            self.lane_bindings.insert(chunk_id, lane_id);
+        }
+
         let mut ticker = interval(Duration::from_secs_f64(self.update_interval));
         let mut last_tick_time = Instant::now();
 
@@ -72,7 +83,17 @@ impl DownloadMonitor {
 
                 // 收到来自下载块的信息
                 Ok(info) = info_rx.recv() => {
-                    self.handle_download_info(info, &mut tasks, next_chunk_id, client, &writer_tx, cmd_tx, &info_tx, url);
+                    self.handle_download_info(
+                        info,
+                        &mut tasks,
+                        next_chunk_id,
+                        client,
+                        &writer_tx,
+                        cmd_tx,
+                        &info_tx,
+                        url,
+                        multi_runtime.as_mut(),
+                    );
                 },
 
                 // 定时器触发
@@ -82,7 +103,16 @@ impl DownloadMonitor {
                     last_tick_time = now;
 
                     // 执行定期的处理逻辑
-                    if self.handle_tick(elapsed_secs, &mut tasks, &info_tx, cmd_tx, client, &writer_tx, url) {
+                    if self.handle_tick(
+                        elapsed_secs,
+                        &mut tasks,
+                        &info_tx,
+                        cmd_tx,
+                        client,
+                        &writer_tx,
+                        url,
+                        multi_runtime.as_mut(),
+                    ) {
                         // 如果 tick 处理器返回 true，表示下载已完成
                         break 'main_loop;
                     }
@@ -105,7 +135,8 @@ impl DownloadMonitor {
         writer_tx: &mpsc::Sender<DownloadCmd>,
         cmd_tx: &broadcast::Sender<DownloadCmd>,
         info_tx: &broadcast::Sender<DownloadInfo>,
-        url: &FastStr,
+        url: Option<&FastStr>,
+        multi_runtime: Option<&mut MultiRuntime>,
     ) {
         match info {
             DownloadInfo::ChunkProgress {
@@ -135,6 +166,12 @@ impl DownloadMonitor {
             DownloadInfo::DownloadComplete(id) => {
                 // 标记一个块为已完成
                 self.state.complete_chunk(&id);
+                if let Some(lane_id) = self.lane_bindings.remove(&id) {
+                    if let Some(runtime) = multi_runtime {
+                        runtime.record_success(&lane_id);
+                        runtime.release_chunk(&lane_id);
+                    }
+                }
                 self.retry_handler.on_download_complete(&id);
                 let _ = info_tx.send(DownloadInfo::ChunkStatusChanged {
                     id,
@@ -148,6 +185,12 @@ impl DownloadMonitor {
                 end,
                 error,
             } => {
+                if let Some(lane_id) = self.lane_bindings.remove(&id) {
+                    if let Some(runtime) = multi_runtime {
+                        runtime.record_failure(&lane_id);
+                        runtime.release_chunk(&lane_id);
+                    }
+                }
                 // 将失败的块交给重试处理器
                 self.retry_handler
                     .on_chunk_failed(id, start, end, error, &mut self.state, info_tx);
@@ -157,7 +200,12 @@ impl DownloadMonitor {
             } => {
                 // 当一个块被分割时，为新的部分创建一个新的下载任务
                 let new_id = next_chunk_id.fetch_add(1, Ordering::SeqCst);
-                let rb = client.get(url.as_str());
+                let Some((lane_id, rb)) = build_request(client, url, multi_runtime) else {
+                    return;
+                };
+                if let Some(lane_id) = lane_id {
+                    self.lane_bindings.insert(new_id, lane_id);
+                }
                 let task = chunk_run(
                     new_id,
                     writer_tx.clone(),
@@ -183,7 +231,8 @@ impl DownloadMonitor {
         cmd_tx: &broadcast::Sender<DownloadCmd>,
         client: &Client,
         writer_tx: &mpsc::Sender<DownloadCmd>,
-        url: &FastStr,
+        url: Option<&FastStr>,
+        mut multi_runtime: Option<&mut MultiRuntime>,
     ) -> bool {
         if elapsed_secs <= 0.0 {
             return false;
@@ -208,7 +257,13 @@ impl DownloadMonitor {
                 status: 1, // 状态：重试中
                 message: Some(format!("正在进行第 {} 次重试", chunk_to_retry.attempts)),
             });
-            let rb = client.get(url.as_str());
+            let Some((lane_id, rb)) = build_request(client, url, multi_runtime.as_deref_mut())
+            else {
+                continue;
+            };
+            if let Some(lane_id) = lane_id {
+                self.lane_bindings.insert(chunk_to_retry.id, lane_id);
+            }
             let task = chunk_run(
                 chunk_to_retry.id,
                 writer_tx.clone(),
@@ -245,4 +300,18 @@ impl DownloadMonitor {
     fn are_all_tasks_done(&self) -> bool {
         self.state.chunks.is_empty() && self.retry_handler.are_all_tasks_done()
     }
+}
+
+fn build_request(
+    client: &Client,
+    url: Option<&FastStr>,
+    multi_runtime: Option<&mut MultiRuntime>,
+) -> Option<(Option<FastStr>, reqwest::RequestBuilder)> {
+    if let Some(runtime) = multi_runtime {
+        let (lane_id, rb) = runtime.claim_request_builder()?;
+        return Some((Some(lane_id), rb));
+    }
+
+    let url = url?;
+    Some((None, client.get(url.as_str())))
 }

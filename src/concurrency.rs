@@ -138,7 +138,9 @@ impl ConcurrencyManager {
         }
 
         // 如果处于观察状态，处理样本收集
-        if self.phase == DownloadPhase::Stable && self.observation_state == ObservationState::Observing {
+        if self.phase == DownloadPhase::Stable
+            && self.observation_state == ObservationState::Observing
+        {
             if let Some(ref mut observation) = self.current_observation {
                 observation.collected_samples += 1;
                 observation.best_speed_seen = observation.best_speed_seen.max(current_speed);
@@ -159,12 +161,9 @@ impl ConcurrencyManager {
                 previous_max_speed,
                 cmd_tx,
             ),
-            DownloadPhase::Stable => self.handle_stable_phase(
-                state,
-                avg_speed,
-                estimated_time,
-                cmd_tx,
-            ),
+            DownloadPhase::Stable => {
+                self.handle_stable_phase(state, avg_speed, estimated_time, cmd_tx)
+            }
         }
     }
 
@@ -202,7 +201,10 @@ impl ConcurrencyManager {
             self.consecutive_probe_no_gain += 1;
 
             // 连续2次没有增益且有足够样本，转换到稳定阶段
-            if active_chunks > 1 && self.stable_speed_samples.len() >= 3 && self.consecutive_probe_no_gain >= 2 {
+            if active_chunks > 1
+                && self.stable_speed_samples.len() >= 3
+                && self.consecutive_probe_no_gain >= 2
+            {
                 self.transition_to_stable();
             }
         }
@@ -244,8 +246,7 @@ impl ConcurrencyManager {
         // 1. 当前速度显著低于最近最佳速度（可能有慢块瓶颈）
         // 2. 还有可用的并发槽位
         // 3. 分割是有用的
-        let should_consider_split =
-            avg_speed < self.recent_best_speed * STABLE_SPLIT_THRESHOLD
+        let should_consider_split = avg_speed < self.recent_best_speed * STABLE_SPLIT_THRESHOLD
             && active_chunks < self.max_workers
             && self.split_is_useful(avg_speed, estimated_time);
 
@@ -269,8 +270,10 @@ impl ConcurrencyManager {
             // 组合增益门：
             // 1. 观察期最佳速度 > 分割前基准速度（分割带来了提升）
             // 2. 观察期最佳速度不显著低于分割前的最近最佳速度（没有倒退）
-            let gain_vs_pre_split = observation.best_speed_seen > observation.pre_split_speed * 1.05;
-            let no_regression_vs_recent_best = observation.best_speed_seen > observation.pre_split_recent_best * 0.95;
+            let gain_vs_pre_split =
+                observation.best_speed_seen > observation.pre_split_speed * 1.05;
+            let no_regression_vs_recent_best =
+                observation.best_speed_seen > observation.pre_split_recent_best * 0.95;
 
             if gain_vs_pre_split && no_regression_vs_recent_best {
                 // 分割成功，更新最近最佳速度
@@ -278,7 +281,9 @@ impl ConcurrencyManager {
 
                 // 如果还有可用并发槽位且分割仍然有用，可以考虑继续分割
                 let active_chunks = state.chunks.len() as u64;
-                if active_chunks < self.max_workers && self.split_is_useful(avg_speed, estimated_time) {
+                if active_chunks < self.max_workers
+                    && self.split_is_useful(avg_speed, estimated_time)
+                {
                     // 分割当前最大的块以进一步提升
                     if let Some(largest_chunk) = self.find_largest_splittable_chunk(&state.chunks) {
                         self.request_split_with_observation(largest_chunk.id, avg_speed, cmd_tx);
@@ -314,7 +319,6 @@ impl ConcurrencyManager {
             best_speed_seen: current_speed,
         });
     }
-
 
     /// 发送一个分割请求。
     fn request_split(&mut self, id: ChunkId, cmd_tx: &broadcast::Sender<DownloadCmd>) {
@@ -519,7 +523,10 @@ mod tests {
         );
         let (cmd_tx, mut cmd_rx) = broadcast::channel(4);
         manager.decide_and_act(&state1, &cmd_tx);
-        assert!(matches!(cmd_rx.try_recv(), Ok(DownloadCmd::BisectDownload { id: 2 })));
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(DownloadCmd::BisectDownload { id: 2 })
+        ));
 
         // 重置分割间隔，允许下一次调用
         manager.last_split_time = Instant::now() - MIN_SPLIT_INTERVAL;
@@ -577,7 +584,10 @@ mod tests {
         );
         let (cmd_tx, mut cmd_rx) = broadcast::channel(4);
         manager.decide_and_act(&state1, &cmd_tx);
-        assert!(matches!(cmd_rx.try_recv(), Ok(DownloadCmd::BisectDownload { id: 2 })));
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(DownloadCmd::BisectDownload { id: 2 })
+        ));
 
         // 重置分割间隔
         manager.last_split_time = Instant::now() - MIN_SPLIT_INTERVAL;

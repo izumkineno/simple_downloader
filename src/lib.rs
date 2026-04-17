@@ -47,6 +47,7 @@
 pub mod chunk;
 pub mod concurrency;
 pub mod downloader;
+pub mod lane;
 pub mod monitor;
 pub mod retry;
 pub mod state;
@@ -57,6 +58,10 @@ pub mod util;
 
 // 导出核心的 `Downloader`，它是用户的主要入口点。
 pub use downloader::Downloader;
+pub use lane::{
+    LaneCandidate, LaneHealth, LaneModel, LaneScheduler, MultiSourceConfig, ProxyConfig,
+    SourceConfig,
+};
 
 // 导出公共类型，方便用户在类型注解和模式匹配中使用。
 pub use types::{ChunkId, DownloadCmd, DownloadError, DownloadInfo, Result};

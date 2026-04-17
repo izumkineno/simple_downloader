@@ -25,6 +25,9 @@ pub enum DownloadError {
     /// 无法从服务器响应头中获取文件大小（Content-Length）。
     #[error("无法从服务器响应头中获取文件大小 (Content-Length)")]
     MissingContentLength,
+    /// 多源模式下没有可用的下载源。
+    #[error("没有可用的下载源")]
+    NoAvailableSources,
 }
 
 /// 发送给下载器组件的控制命令。
