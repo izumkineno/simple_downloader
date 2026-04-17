@@ -323,8 +323,39 @@ async fn test_server_invalid_source_is_skipped_while_valid_throttled_sources_com
     .await
     .expect("download succeeds through valid sources");
 
-    assert!(read_file(&path) == file.bytes);
-    assert_all_servers_served_ranges(&[valid_a, valid_b])
-        .await
-        .unwrap();
+    let temp = NamedTempFile::new().expect("temp file");
+    let path = temp.path().to_path_buf();
+    download_from_sources(
+        &path,
+        2,
+        vec![
+            SourceConfig::new(cluster.missing_url(0)).with_id("invalid"),
+            SourceConfig::new(cluster.source_url(0, file_name)).with_id("valid-a"),
+            SourceConfig::new(cluster.source_url(1, file_name)).with_id("valid-b"),
+        ],
+    )
+    .await;
+
+    assert!(read_file(&path) == body);
+    assert!(
+        cluster
+            .get_count(0, "missing.bin")
+            .await
+            .expect("missing stats")
+            > 0
+    );
+    assert!(
+        cluster
+            .get_count(0, file_name)
+            .await
+            .expect("valid-a stats")
+            > 0
+    );
+    assert!(
+        cluster
+            .get_count(1, file_name)
+            .await
+            .expect("valid-b stats")
+            > 0
+    );
 }
