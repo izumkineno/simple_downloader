@@ -115,6 +115,15 @@ impl DownloadState {
         }
     }
 
+    /// 创建带有已验证完成字节数的状态，用于断点续传启动。
+    pub fn with_completed(total_file_size: u64, completed_bytes: u64) -> Self {
+        Self {
+            total_file_size,
+            chunks: HashMap::new(),
+            completed_bytes: completed_bytes.min(total_file_size),
+        }
+    }
+
     /// 将一个块标记为已完成。
     /// 这会将其从活跃块列表中移除，并将其下载的字节数累加到 `completed_bytes`。
     pub fn complete_chunk(&mut self, id: &ChunkId) {

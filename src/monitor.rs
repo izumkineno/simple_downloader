@@ -36,8 +36,17 @@ pub struct DownloadMonitor {
 impl DownloadMonitor {
     /// 创建一个新的 `DownloadMonitor` 实例。
     pub fn new(total_file_size: u64, update_interval: f64, max_workers: u64) -> Self {
+        Self::new_with_completed(total_file_size, 0, update_interval, max_workers)
+    }
+
+    pub fn new_with_completed(
+        total_file_size: u64,
+        completed_bytes: u64,
+        update_interval: f64,
+        max_workers: u64,
+    ) -> Self {
         Self {
-            state: DownloadState::new(total_file_size),
+            state: DownloadState::with_completed(total_file_size, completed_bytes),
             retry_handler: RetryHandler::new(),
             concurrency_manager: ConcurrencyManager::new(max_workers),
             lane_bindings: HashMap::new(),

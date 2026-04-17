@@ -4,40 +4,19 @@ use crate::chunk::chunk_run;
 use crate::lane::MultiRuntime;
 use crate::lane::MultiSourceConfig;
 use crate::monitor::DownloadMonitor;
+use crate::resume::ResumePlan;
 use crate::types::{DownloadCmd, DownloadInfo, Result};
-use crate::util::{file_writer_task, get_file_info};
+use crate::util::{file_writer_task_with_resume, get_file_info};
 use faststr::FastStr;
 use futures_util::stream::FuturesUnordered;
 use reqwest::{Client, ClientBuilder};
+use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use tokio::spawn;
 use tokio::sync::{broadcast, mpsc};
 
 const MIN_CHUNK_SIZE: u64 = 1024 * 1024; // 1 MB
 const CHANNEL_CAPACITY: usize = 1024;
-
-fn initial_ranges(file_size: u64, workers: u64) -> Vec<(u64, u64)> {
-    if file_size == 0 {
-        return Vec::new();
-    }
-
-    let chunks = workers.max(1).min(file_size).min(usize::MAX as u64) as usize;
-    let base = file_size / chunks as u64;
-    let mut remainder = file_size % chunks as u64;
-    let mut start = 0_u64;
-    let mut ranges = Vec::with_capacity(chunks);
-
-    for _ in 0..chunks {
-        let extra = u64::from(remainder > 0);
-        remainder = remainder.saturating_sub(extra);
-        let size = base + extra;
-        let end = start + size - 1;
-        ranges.push((start, end));
-        start = end + 1;
-    }
-
-    ranges
-}
 
 /// 下载器的配置信息。
 #[derive(Clone)]
@@ -74,6 +53,8 @@ where
     info_tx: broadcast::Sender<DownloadInfo>,
     /// 进度更新的间隔时间（秒）。
     update_interval: f64,
+    /// 是否启用自动断点续传。
+    resume_enabled: bool,
 }
 
 impl<F> Downloader<F>
@@ -108,6 +89,7 @@ where
             cmd_tx,
             info_tx,
             update_interval,
+            resume_enabled: true,
         }
     }
 
@@ -120,7 +102,14 @@ where
             client_builder,
             cmd_tx,
             info_tx,
+            resume_enabled: true,
         }
+    }
+
+    /// 显式启用或关闭自动断点续传。默认启用。
+    pub fn with_resume(mut self, enabled: bool) -> Self {
+        self.resume_enabled = enabled;
+        self
     }
 
     /// 启动下载过程。
@@ -168,8 +157,25 @@ where
             };
         // 为进度处理器订阅信息通道
         let info_rx_for_progress = self.info_tx.subscribe();
+        let writer_path_string = writer_path.to_string();
+        let resume_plan = ResumePlan::prepare(
+            Path::new(&writer_path_string),
+            file_size,
+            self.resume_enabled,
+        )?;
+        if resume_plan.completed_bytes > 0 && !support_ranges {
+            return Err(crate::types::DownloadError::ResumeMetadata(
+                "partial resume requires HTTP Range support".to_owned(),
+            ));
+        }
+        let truncate_output = resume_plan.truncate_output;
+        let initial_ranges = resume_plan.remaining_ranges.clone();
+        let completed_bytes = resume_plan.completed_bytes;
+        let resume_recorder = resume_plan.into_recorder();
         // 启动文件写入任务，并获取其命令发送端
-        let writer_tx = file_writer_task(writer_path, file_size).await?;
+        let (writer_tx, writer_handle) =
+            file_writer_task_with_resume(writer_path, file_size, truncate_output, resume_recorder)
+                .await?;
         let writer_shutdown_tx = writer_tx.clone();
 
         // 异步执行用户提供的进度处理逻辑
@@ -184,10 +190,13 @@ where
             download_url.as_ref(),
             workers,
             multi_runtime,
+            initial_ranges,
+            completed_bytes,
         )
         .await?;
 
         let _ = writer_shutdown_tx.send(DownloadCmd::TerminateAll).await;
+        let _ = writer_handle.await;
         // 下载结束后，发送终止命令以清理所有任务
         let _ = self.cmd_tx.send(DownloadCmd::TerminateAll);
         Ok(())
@@ -203,6 +212,8 @@ where
         url: Option<&FastStr>,
         workers: u64,
         mut multi_runtime: Option<MultiRuntime>,
+        resume_ranges: Vec<(u64, u64)>,
+        completed_bytes: u64,
     ) -> Result<()> {
         // 使用 FuturesUnordered 来管理所有并发的下载任务
         let tasks = FuturesUnordered::new();
@@ -218,11 +229,7 @@ where
         };
 
         let mut initial_lanes = Vec::new();
-        let initial_ranges = if multi_runtime.is_some() {
-            initial_ranges(file_size, workers)
-        } else {
-            vec![(0, file_size.saturating_sub(1))]
-        };
+        let initial_ranges = split_resume_ranges(resume_ranges, workers, multi_runtime.is_some());
         for (start_byte, end_byte) in initial_ranges {
             let id = next_chunk_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let (lane_id, rb) = if let Some(runtime) = multi_runtime.as_mut() {
@@ -255,7 +262,12 @@ where
         );
 
         // 创建下载监控器
-        let monitor = DownloadMonitor::new(file_size, self.update_interval, workers);
+        let monitor = DownloadMonitor::new_with_completed(
+            file_size,
+            completed_bytes,
+            self.update_interval,
+            workers,
+        );
 
         // 运行监控器，它将接管下载过程的管理
         monitor
@@ -273,5 +285,54 @@ where
             )
             .await;
         Ok(())
+    }
+}
+
+fn split_resume_ranges(
+    ranges: Vec<(u64, u64)>,
+    workers: u64,
+    split_for_multi_source: bool,
+) -> Vec<(u64, u64)> {
+    if !split_for_multi_source {
+        return ranges;
+    }
+    let target = workers.max(1) as usize;
+    let mut ranges = ranges;
+
+    while ranges.len() < target {
+        let Some((index, (start, end))) = ranges
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by_key(|(_, (start, end))| end.saturating_sub(*start).saturating_add(1))
+        else {
+            break;
+        };
+
+        let len = end.saturating_sub(start).saturating_add(1);
+        if len <= 1 {
+            break;
+        }
+
+        let left_len = len / 2;
+        let mid = start + left_len - 1;
+        ranges.splice(index..=index, [(start, mid), (mid + 1, end)]);
+    }
+
+    ranges
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_resume_ranges;
+
+    #[test]
+    fn split_resume_ranges_caps_initial_ranges_to_worker_count() {
+        let ranges = vec![(0, 9), (20, 29)];
+
+        let split = split_resume_ranges(ranges, 2, true);
+
+        assert_eq!(split.len(), 2);
+        assert_eq!(split, vec![(0, 9), (20, 29)]);
     }
 }

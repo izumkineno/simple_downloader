@@ -1,5 +1,6 @@
 //! 提供工具函数，如获取文件信息和处理文件写入。
 
+use crate::resume::ResumeRecorder;
 use crate::types::DownloadCmd;
 use crate::types::{DownloadError, Result};
 use faststr::FastStr;
@@ -7,8 +8,8 @@ use reqwest::Client;
 use std::io;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-use tokio::spawn;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 /// 从 URL 检索文件元数据（大小和是否支持范围请求）。
 ///
@@ -90,31 +91,51 @@ pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
 ///
 /// # 返回
 /// 一个 `mpsc::Sender<DownloadCmd>`，其他任务可以通过它发送 `WriteFile` 命令。
-pub async fn file_writer_task(filepath: FastStr, size: u64) -> Result<mpsc::Sender<DownloadCmd>> {
+pub async fn file_writer_task(
+    filepath: FastStr,
+    size: u64,
+) -> Result<(mpsc::Sender<DownloadCmd>, JoinHandle<()>)> {
+    file_writer_task_with_resume(filepath, size, true, None).await
+}
+
+pub async fn file_writer_task_with_resume(
+    filepath: FastStr,
+    size: u64,
+    truncate: bool,
+    mut resume_recorder: Option<ResumeRecorder>,
+) -> Result<(mpsc::Sender<DownloadCmd>, JoinHandle<()>)> {
     const WRITER_QUEUE_CAP: usize = 128;
     let (tx, mut rx) = mpsc::channel::<DownloadCmd>(WRITER_QUEUE_CAP);
 
     // 打开（或创建）文件
     let mut file = OpenOptions::new()
+        .read(true)
         .write(true)
         .create(true)
-        .truncate(true) // 如果文件已存在，则清空
+        .truncate(truncate)
         .open(&*filepath)
         .await?;
     // 预分配文件大小，防止磁盘空间不足，并可能提高写入性能
     file.set_len(size).await?;
 
     // 异步执行文件写入循环
-    spawn(async move {
+    let writer_handle = tokio::spawn(async move {
         while let Some(command) = rx.recv().await {
             match command {
                 DownloadCmd::WriteFile { offset, data } => {
+                    let len = data.len() as u64;
                     // 移动到指定偏移量并写入数据
                     if file.seek(io::SeekFrom::Start(offset)).await.is_err()
                         || file.write_all(&data).await.is_err()
                     {
                         eprintln!("[FileWriter] 写入文件失败！");
                         break; // 发生错误时退出
+                    }
+                    if let Some(recorder) = resume_recorder.as_mut() {
+                        if let Err(error) = recorder.record_write(&mut file, offset, len).await {
+                            eprintln!("[FileWriter] 更新断点续传元数据失败: {error}");
+                            break;
+                        }
                     }
                 }
                 DownloadCmd::TerminateAll => break, // 收到终止命令时退出
@@ -125,5 +146,5 @@ pub async fn file_writer_task(filepath: FastStr, size: u64) -> Result<mpsc::Send
         let _ = file.flush().await;
     });
 
-    Ok(tx)
+    Ok((tx, writer_handle))
 }

@@ -4,6 +4,7 @@ use mockito::Server;
 use reqwest::Client;
 use simple_downloader::types::DownloadCmd;
 use simple_downloader::util::*;
+use std::io::Write;
 use tempfile::NamedTempFile;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
@@ -26,6 +27,29 @@ async fn test_get_file_info_head_success() {
     assert_eq!(size, 102400);
     assert!(accept_ranges);
     mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn file_writer_task_with_resume_does_not_truncate_existing_file() {
+    let mut temp_file = NamedTempFile::new().unwrap();
+    temp_file.write_all(b"existing-data").unwrap();
+    let path = temp_file.path().to_str().unwrap();
+
+    let (tx, handle) = file_writer_task_with_resume(FastStr::new(path), 32, false, None)
+        .await
+        .unwrap();
+    tx.send(DownloadCmd::WriteFile {
+        offset: 16,
+        data: Bytes::from_static(b"tail"),
+    })
+    .await
+    .unwrap();
+    tx.send(DownloadCmd::TerminateAll).await.unwrap();
+    handle.await.unwrap();
+
+    let content = std::fs::read(path).unwrap();
+    assert_eq!(&content[..13], b"existing-data");
+    assert_eq!(&content[16..20], b"tail");
 }
 
 #[tokio::test]
@@ -94,7 +118,7 @@ async fn test_file_writer_task() {
     let file_size = 100u64;
 
     // 创建写入任务
-    let tx = file_writer_task(FastStr::new(path), file_size)
+    let (tx, handle) = file_writer_task(FastStr::new(path), file_size)
         .await
         .unwrap();
 
@@ -114,7 +138,7 @@ async fn test_file_writer_task() {
     tx.send(DownloadCmd::TerminateAll).await.unwrap();
 
     // 等待写入完成
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    handle.await.unwrap();
 
     // 读取文件内容验证
     let mut file = fs::File::open(path).await.unwrap();

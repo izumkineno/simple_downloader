@@ -2,6 +2,7 @@
 
 use bytes::Bytes;
 use std::io;
+use std::path::PathBuf;
 use thiserror::Error;
 
 /// 下载块（线程）ID 的类型别名。
@@ -28,6 +29,12 @@ pub enum DownloadError {
     /// 多源模式下没有可用的下载源。
     #[error("没有可用的下载源")]
     NoAvailableSources,
+    /// 断点续传元数据存在，但目标文件不存在。
+    #[error("断点续传元数据存在，但目标文件不存在: {0}")]
+    ResumeTargetMissing(PathBuf),
+    /// 断点续传元数据无效。
+    #[error("断点续传元数据无效: {0}")]
+    ResumeMetadata(String),
 }
 
 /// 发送给下载器组件的控制命令。

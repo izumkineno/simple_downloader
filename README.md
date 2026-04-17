@@ -26,12 +26,20 @@
 #### 6. **高兼容性的文件信息探测**
 - **智能回退 (Fallback)**: `get_file_info` 函数优先使用 `HEAD` 请求获取文件信息。若失败或响应头不完整，则自动回退至发送 `Range: bytes=0-0` 的 `GET` 请求，通过解析 `Content-Range` 头获取总大小，显著提高了对各类服务器的兼容性。
 
-#### 7. **多源 / 多代理下载基础能力**
+#### 7. **断点续传 (Breakpoint Resume)**
+- **默认自动恢复**: 当目标文件与 sidecar 元数据同时存在时，下载器会默认尝试恢复；调用方也可通过 `with_resume(false)` 显式关闭恢复逻辑。
+- **哈希校验驱动的恢复**: 续传不是简单信任文件长度，而是基于固定 segment ledger + 持久化哈希校验，仅复用已验证通过的本地字节范围。
+- **按覆盖恢复而非按旧拓扑恢复**: 恢复时不会依赖上一次的 chunk 拓扑，而是重建为“已验证完成范围 + 剩余待下载范围”。
+- **单源 / 多源统一恢复路径**: `Downloader::new(...)` 与 `Downloader::new_multi(...)` 都走同一套恢复模型。
+- **安全失败策略**: 如果元数据存在但目标文件缺失，会直接 fail-stop，而不是静默从零开始；如果某个已验证 segment 被篡改，只会使该 segment 失效并重新下载。
+- **进程级中断恢复已验证**: 当前测试已覆盖单源控制台中断后恢复，以及多源子进程被 kill / 崩溃式终止后恢复。
+
+#### 8. **多源 / 多代理下载基础能力**
 - **多源入口**: `MultiSourceConfig`、`SourceConfig` 与 `Downloader::new_multi(...)` 已支持为同一个输出文件配置多个镜像 URL。
 - **代理维度建模**: `SourceConfig::with_proxies(...)` 与 `LaneModel` 可把“源”或“源 + 代理”建模为调度 lane，并通过 `max_chunks_per_lane` / `max_chunks_per_source` 控制并发占用。
 - **源可用性筛选**: 多源启动阶段会探测候选源；不可用、文件大小不一致或不支持 Range 的源会被跳过，全部不可用时返回 `NoAvailableSources`。
 - **失败隔离**: lane 连续失败达到阈值后会进入黑名单，调度器会优先切换到其他健康 lane。
-- **repo-native 验证**: `tests/multi_source.rs` 已覆盖本地 `test_server/` 的多限速源、三源异构、无效源跳过等场景；`examples/manual_multi_source_test_server.rs` 提供 500 MiB 手工观察示例。
+- **repo-native 验证**: `tests/multi_source.rs` 已覆盖本地 `test_server/` 的多限速源、三源异构、无效源跳过等场景；`examples/manual_multi_source_test_server.rs` 提供 500 MiB 手工观察示例；`tests/process_resume.rs` 进一步覆盖了进程级恢复。
 
 ---
 
@@ -40,8 +48,14 @@
 目标：实现一个开箱即用、自带断点续传、任务队列、对接入 UI 友好，能自适应下载的多源多线程下载库。下面按“已落地 / 待完善”同步当前状态。
 
 #### 1. **核心功能：断点续传 (Breakpoint Continuation)**
--   [ ] **进度持久化**: 创建元数据文件（如 `.download`），在程序退出时安全地将 `DownloadState` 中的分块信息（各块的起止点、已下载位置等）写入其中。
--   [ ] **任务恢复**: 程序启动时检查元数据文件。若存在，则直接读取状态并恢复下载任务，从上次中断的位置继续。
+-   [x] **二进制元数据 sidecar**: 已使用 `bitcode` 持久化恢复元数据，而不是仅依赖文件长度或内存状态。
+-   [x] **哈希校验恢复**: 已基于固定 segment ledger + 持久化哈希校验恢复已完成范围，不再要求保留旧 chunk 拓扑。
+-   [x] **默认自动恢复 + 显式禁用**: 文件与 sidecar 同时存在时默认恢复；调用方可通过 `with_resume(false)` 强制走全新下载路径。
+-   [x] **缺文件 fail-stop**: sidecar 存在但目标文件不存在时会直接报错停止，不会静默重下。
+-   [x] **单源 / 多源恢复**: 已覆盖 `Downloader::new(...)` 与 `Downloader::new_multi(...)` 的恢复路径。
+-   [x] **进程级恢复测试**: 已补充单源控制台中断恢复、多源 kill / 崩溃式终止恢复的集成测试。
+-   [ ] **元数据 schema 演进策略**: 当前已带版本号，但后续仍可补充更完整的跨版本迁移 / 兼容策略。
+-   [ ] **可观测性增强**: 后续可补充更清晰的“本次恢复复用了哪些 segment / 哪些 segment 被判定失效”的日志或事件。
 
 #### 2. **核心功能：多源多代理下载 (Multi-Source Downloading)**
 -   [x] **支持多个 URL 下载同一个文件**: 通过 `MultiSourceConfig::with_sources(...)` 配置一组镜像 URL，并使用 `Downloader::new_multi(...)` 启动多源下载。
@@ -65,6 +79,22 @@
 
 
 #### 示例
+
+##### 断点续传 / 进程级恢复验证
+
+当前仓库已经内置下列恢复测试：
+
+```bash
+cargo test --test resume -- --nocapture --test-threads=1
+cargo test --test process_resume -- --nocapture --test-threads=1
+```
+
+其中：
+
+- `tests/resume.rs` 主要覆盖恢复元数据、损坏 segment、缺文件 fail-stop、单源 / 多源恢复与显式禁用恢复；
+- `tests/process_resume.rs` 主要覆盖**真实子进程级**的中断恢复：
+  - 单源：控制台中断后恢复；
+  - 多源：子进程被 kill / 崩溃式终止后恢复。
 
 ##### 多源手工观察示例
 
@@ -99,7 +129,8 @@ async fn main() {
         16,                                       // 最大并发线程数
         1.0,                                      // 进度更新间隔(秒)
         || ClientBuilder::new(),                  // 提供网络客户端构建器
-    );
+    )
+    .with_resume(true); // 默认就是 true，这里显式写出仅用于示例说明
 
     // 定义一个处理下载进度的闭包
     let progress_handler = |total_size: u64, mut info_rx: broadcast::Receiver<DownloadInfo>| async move {

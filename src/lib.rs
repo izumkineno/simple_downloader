@@ -49,6 +49,7 @@ pub mod concurrency;
 pub mod downloader;
 pub mod lane;
 pub mod monitor;
+pub mod resume;
 pub mod retry;
 pub mod state;
 pub mod types;
