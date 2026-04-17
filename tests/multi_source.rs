@@ -7,33 +7,42 @@ use tempfile::NamedTempFile;
 
 mod test_server_harness;
 
-use test_server_harness::{ServerSpec, TestServerCluster};
-
 fn read_file(path: &std::path::Path) -> Vec<u8> {
     std::fs::read(path).expect("read downloaded file")
 }
 
-fn deterministic_payload(size: usize) -> Vec<u8> {
-    (0..size)
-        .map(|index| ((index.wrapping_mul(31).wrapping_add(17)) % 251) as u8)
-        .collect()
+fn temp_output_path() -> std::path::PathBuf {
+    NamedTempFile::new()
+        .expect("temp output file")
+        .into_temp_path()
+        .to_path_buf()
 }
 
-async fn download_from_sources(
-    output_path: &std::path::Path,
-    workers: u64,
+async fn run_multi_source_download(
     sources: Vec<SourceConfig>,
-) {
-    let config = MultiSourceConfig::new(output_path.to_string_lossy().to_string(), workers, 0.05)
-        .with_max_chunks_per_lane(1)
+    workers: u64,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let path = temp_output_path();
+    let config = MultiSourceConfig::new(path.to_string_lossy().to_string(), workers, 0.05)
         .with_sources(sources);
-
     let downloader = Downloader::new_multi(config, ClientBuilder::new);
-    downloader
-        .run(|_, _| async {})
-        .await
-        .expect("download succeeds");
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    downloader.run(|_, _| async {}).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    Ok(path)
+}
+
+async fn assert_all_servers_served_ranges(
+    servers: &[test_server_harness::RunningTestServer],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    for server in servers {
+        let stats = server.stats().await?;
+        assert!(
+            stats.get("range_requests").copied().unwrap_or_default() > 0,
+            "expected server {} to serve at least one range request; stats={stats:?}",
+            server.base_url()
+        );
+    }
+    Ok(())
 }
 
 #[test]
@@ -220,130 +229,107 @@ async fn multi_source_downloader_uses_multiple_sources_for_initial_chunks() {
 }
 
 #[tokio::test]
-async fn test_server_multi_source_downloads_byte_correct_file_from_fast_and_slow_sources() {
-    let file_name = "fast-slow.bin";
-    let body = deterministic_payload(2 * 1024 * 1024);
-    let cluster = TestServerCluster::start(
-        file_name,
-        &body,
-        &[
-            ServerSpec {
-                id: "fast",
-                total_max_speed: "16m",
-                per_thread_max_speed: "16m",
-            },
-            ServerSpec {
-                id: "slow",
-                total_max_speed: "512k",
-                per_thread_max_speed: "512k",
-            },
+async fn test_server_fast_and_slow_sources_download_byte_correct_output() {
+    let file = test_server_harness::TestServerFile::new(
+        "phase1-fast-slow.bin",
+        test_server_harness::deterministic_bytes(2 * 1024 * 1024),
+    )
+    .expect("test file");
+    let fast =
+        test_server_harness::RunningTestServer::spawn(file.directory(), "64m", "64m")
+            .await
+            .expect("fast test_server");
+    let slow =
+        test_server_harness::RunningTestServer::spawn(file.directory(), "16m", "16m")
+            .await
+            .expect("slow test_server");
+
+    let path = run_multi_source_download(
+        vec![
+            SourceConfig::new(fast.url_for(&file.name)).with_id("fast"),
+            SourceConfig::new(slow.url_for(&file.name)).with_id("slow"),
         ],
+        2,
     )
     .await
-    .expect("test servers start");
+    .expect("download succeeds");
 
-    let temp = NamedTempFile::new().expect("temp file");
-    let path = temp.path().to_path_buf();
-    download_from_sources(
-        &path,
-        2,
-        vec![
-            SourceConfig::new(cluster.source_url(0, file_name)).with_id("fast"),
-            SourceConfig::new(cluster.source_url(1, file_name)).with_id("slow"),
-        ],
-    )
-    .await;
-
-    assert!(read_file(&path) == body);
-    assert!(cluster.get_count(0, file_name).await.expect("fast stats") > 0);
-    assert!(cluster.get_count(1, file_name).await.expect("slow stats") > 0);
+    assert!(read_file(&path) == file.bytes);
+    assert_all_servers_served_ranges(&[fast, slow]).await.unwrap();
 }
 
 #[tokio::test]
-async fn test_server_multi_source_downloads_byte_correct_file_from_three_heterogeneous_sources() {
-    let file_name = "three-sources.bin";
-    let body = deterministic_payload(3 * 1024 * 1024);
-    let cluster = TestServerCluster::start(
-        file_name,
-        &body,
-        &[
-            ServerSpec {
-                id: "fast",
-                total_max_speed: "16m",
-                per_thread_max_speed: "16m",
-            },
-            ServerSpec {
-                id: "medium",
-                total_max_speed: "4m",
-                per_thread_max_speed: "4m",
-            },
-            ServerSpec {
-                id: "slow",
-                total_max_speed: "768k",
-                per_thread_max_speed: "768k",
-            },
-        ],
+async fn test_server_three_heterogeneous_sources_download_byte_correct_output() {
+    let file = test_server_harness::TestServerFile::new(
+        "phase1-three-source.bin",
+        test_server_harness::deterministic_bytes(3 * 1024 * 1024),
     )
-    .await
-    .expect("test servers start");
+    .expect("test file");
+    let fastest =
+        test_server_harness::RunningTestServer::spawn(file.directory(), "96m", "96m")
+            .await
+            .expect("fastest test_server");
+    let middle =
+        test_server_harness::RunningTestServer::spawn(file.directory(), "48m", "48m")
+            .await
+            .expect("middle test_server");
+    let slowest =
+        test_server_harness::RunningTestServer::spawn(file.directory(), "24m", "24m")
+            .await
+            .expect("slowest test_server");
 
-    let temp = NamedTempFile::new().expect("temp file");
-    let path = temp.path().to_path_buf();
-    download_from_sources(
-        &path,
+    let path = run_multi_source_download(
+        vec![
+            SourceConfig::new(fastest.url_for(&file.name)).with_id("fastest"),
+            SourceConfig::new(middle.url_for(&file.name)).with_id("middle"),
+            SourceConfig::new(slowest.url_for(&file.name)).with_id("slowest"),
+        ],
         3,
-        vec![
-            SourceConfig::new(cluster.source_url(0, file_name)).with_id("fast"),
-            SourceConfig::new(cluster.source_url(1, file_name)).with_id("medium"),
-            SourceConfig::new(cluster.source_url(2, file_name)).with_id("slow"),
-        ],
     )
-    .await;
+    .await
+    .expect("download succeeds");
 
-    assert!(read_file(&path) == body);
-    assert!(cluster.get_count(0, file_name).await.expect("fast stats") > 0);
-    assert!(cluster.get_count(1, file_name).await.expect("medium stats") > 0);
-    assert!(cluster.get_count(2, file_name).await.expect("slow stats") > 0);
+    assert!(read_file(&path) == file.bytes);
+    assert_all_servers_served_ranges(&[fastest, middle, slowest])
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
-async fn test_server_multi_source_skips_invalid_source_and_uses_remaining_throttled_sources() {
-    let file_name = "valid-sources.bin";
-    let body = deterministic_payload(2 * 1024 * 1024);
-    let cluster = TestServerCluster::start(
-        file_name,
-        &body,
-        &[
-            ServerSpec {
-                id: "valid-a",
-                total_max_speed: "4m",
-                per_thread_max_speed: "4m",
-            },
-            ServerSpec {
-                id: "valid-b",
-                total_max_speed: "1m",
-                per_thread_max_speed: "1m",
-            },
+async fn test_server_invalid_source_is_skipped_while_valid_throttled_sources_complete() {
+    let file = test_server_harness::TestServerFile::new(
+        "phase1-invalid-source.bin",
+        test_server_harness::deterministic_bytes(2 * 1024 * 1024),
+    )
+    .expect("test file");
+    let valid_a =
+        test_server_harness::RunningTestServer::spawn(file.directory(), "40m", "40m")
+            .await
+            .expect("valid test_server A");
+    let valid_b =
+        test_server_harness::RunningTestServer::spawn(file.directory(), "20m", "20m")
+            .await
+            .expect("valid test_server B");
+    let invalid_port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("unused port")
+        .local_addr()
+        .expect("unused port addr")
+        .port();
+    let invalid_url = format!("http://127.0.0.1:{invalid_port}/{}", file.name);
+
+    let path = run_multi_source_download(
+        vec![
+            SourceConfig::new(invalid_url).with_id("invalid"),
+            SourceConfig::new(valid_a.url_for(&file.name)).with_id("valid-a"),
+            SourceConfig::new(valid_b.url_for(&file.name)).with_id("valid-b"),
         ],
+        2,
     )
     .await
-    .expect("test servers start");
+    .expect("download succeeds through valid sources");
 
-    let temp = NamedTempFile::new().expect("temp file");
-    let path = temp.path().to_path_buf();
-    download_from_sources(
-        &path,
-        2,
-        vec![
-            SourceConfig::new(cluster.missing_url(0)).with_id("invalid"),
-            SourceConfig::new(cluster.source_url(0, file_name)).with_id("valid-a"),
-            SourceConfig::new(cluster.source_url(1, file_name)).with_id("valid-b"),
-        ],
-    )
-    .await;
-
-    assert!(read_file(&path) == body);
-    assert!(cluster.get_count(0, "missing.bin").await.expect("missing stats") > 0);
-    assert!(cluster.get_count(0, file_name).await.expect("valid-a stats") > 0);
-    assert!(cluster.get_count(1, file_name).await.expect("valid-b stats") > 0);
+    assert!(read_file(&path) == file.bytes);
+    assert_all_servers_served_ranges(&[valid_a, valid_b])
+        .await
+        .unwrap();
 }
