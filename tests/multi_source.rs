@@ -235,14 +235,12 @@ async fn test_server_fast_and_slow_sources_download_byte_correct_output() {
         test_server_harness::deterministic_bytes(2 * 1024 * 1024),
     )
     .expect("test file");
-    let fast =
-        test_server_harness::RunningTestServer::spawn(file.directory(), "64m", "64m")
-            .await
-            .expect("fast test_server");
-    let slow =
-        test_server_harness::RunningTestServer::spawn(file.directory(), "16m", "16m")
-            .await
-            .expect("slow test_server");
+    let fast = test_server_harness::RunningTestServer::spawn(file.directory(), "64m", "64m")
+        .await
+        .expect("fast test_server");
+    let slow = test_server_harness::RunningTestServer::spawn(file.directory(), "16m", "16m")
+        .await
+        .expect("slow test_server");
 
     let path = run_multi_source_download(
         vec![
@@ -255,7 +253,9 @@ async fn test_server_fast_and_slow_sources_download_byte_correct_output() {
     .expect("download succeeds");
 
     assert!(read_file(&path) == file.bytes);
-    assert_all_servers_served_ranges(&[fast, slow]).await.unwrap();
+    assert_all_servers_served_ranges(&[fast, slow])
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -265,18 +265,15 @@ async fn test_server_three_heterogeneous_sources_download_byte_correct_output() 
         test_server_harness::deterministic_bytes(3 * 1024 * 1024),
     )
     .expect("test file");
-    let fastest =
-        test_server_harness::RunningTestServer::spawn(file.directory(), "96m", "96m")
-            .await
-            .expect("fastest test_server");
-    let middle =
-        test_server_harness::RunningTestServer::spawn(file.directory(), "48m", "48m")
-            .await
-            .expect("middle test_server");
-    let slowest =
-        test_server_harness::RunningTestServer::spawn(file.directory(), "24m", "24m")
-            .await
-            .expect("slowest test_server");
+    let fastest = test_server_harness::RunningTestServer::spawn(file.directory(), "96m", "96m")
+        .await
+        .expect("fastest test_server");
+    let middle = test_server_harness::RunningTestServer::spawn(file.directory(), "48m", "48m")
+        .await
+        .expect("middle test_server");
+    let slowest = test_server_harness::RunningTestServer::spawn(file.directory(), "24m", "24m")
+        .await
+        .expect("slowest test_server");
 
     let path = run_multi_source_download(
         vec![
@@ -302,14 +299,12 @@ async fn test_server_invalid_source_is_skipped_while_valid_throttled_sources_com
         test_server_harness::deterministic_bytes(2 * 1024 * 1024),
     )
     .expect("test file");
-    let valid_a =
-        test_server_harness::RunningTestServer::spawn(file.directory(), "40m", "40m")
-            .await
-            .expect("valid test_server A");
-    let valid_b =
-        test_server_harness::RunningTestServer::spawn(file.directory(), "20m", "20m")
-            .await
-            .expect("valid test_server B");
+    let valid_a = test_server_harness::RunningTestServer::spawn(file.directory(), "40m", "40m")
+        .await
+        .expect("valid test_server A");
+    let valid_b = test_server_harness::RunningTestServer::spawn(file.directory(), "20m", "20m")
+        .await
+        .expect("valid test_server B");
     let invalid_port = std::net::TcpListener::bind(("127.0.0.1", 0))
         .expect("unused port")
         .local_addr()
