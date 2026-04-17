@@ -5,7 +5,6 @@ import sys
 import time
 import configparser
 import re
-import argparse
 from threading import Lock, Thread, get_ident
 import socket
 
@@ -24,6 +23,19 @@ config_lock = Lock()
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE_PATH = os.path.join(SCRIPT_DIR, 'config.ini')
 
+def env_override(name):
+    value = os.environ.get(f'SIMPLE_DOWNLOADER_TEST_SERVER_{name}')
+    if value is None:
+        return None
+    value = value.strip()
+    return value if value else None
+
+def config_value(section, option, fallback, env_name):
+    override = env_override(env_name)
+    if override is not None:
+        return override
+    return config.get(section, option, fallback=fallback)
+
 def load_config():
     """Load configuration from config.ini."""
     with config_lock:
@@ -32,9 +44,9 @@ def load_config():
 # Initial load
 load_config()
 
-HOST = config.get('server', 'host', fallback='0.0.0.0')
-PORT = config.getint('server', 'port', fallback=8000)
-DIRECTORY = config.get('server', 'directory', fallback=os.path.join(SCRIPT_DIR, 'files'))
+HOST = config_value('server', 'host', '0.0.0.0', 'HOST')
+PORT = int(config_value('server', 'port', '8000', 'PORT'))
+DIRECTORY = config_value('server', 'directory', os.path.join(SCRIPT_DIR, 'files'), 'DIRECTORY')
 FILES_MANIFEST_PATH = '/__files__'
 STATS_PATH = '/__stats__'
 
@@ -175,51 +187,16 @@ downloads_lock = Lock()
 FILE_DOWNLOADS = {}
 file_downloads_lock = Lock()
 
-REQUEST_COUNTS = {}
-request_counts_lock = Lock()
+REQUEST_STATS = {
+    "head_requests": 0,
+    "get_requests": 0,
+    "range_requests": 0,
+}
+request_stats_lock = Lock()
 
-def parse_args():
-    """Parse additive runtime overrides for deterministic test instances."""
-    parser = argparse.ArgumentParser(description="Throttled Range-capable test file server")
-    parser.add_argument('--host', default=os.environ.get('TEST_SERVER_HOST'))
-    parser.add_argument('--port', type=int, default=os.environ.get('TEST_SERVER_PORT'))
-    parser.add_argument('--directory', default=os.environ.get('TEST_SERVER_DIRECTORY'))
-    parser.add_argument('--total-max-speed', default=os.environ.get('TEST_SERVER_TOTAL_MAX_SPEED'))
-    parser.add_argument('--per-thread-max-speed', default=os.environ.get('TEST_SERVER_PER_THREAD_MAX_SPEED'))
-    parser.add_argument('--no-watch-config', action='store_true', default=os.environ.get('TEST_SERVER_NO_WATCH_CONFIG') == '1')
-    parser.add_argument('--no-console', action='store_true', default=os.environ.get('TEST_SERVER_NO_CONSOLE') == '1')
-    parser.add_argument('--no-speed-monitor', action='store_true', default=os.environ.get('TEST_SERVER_NO_SPEED_MONITOR') == '1')
-    parser.add_argument('--quiet', action='store_true', default=os.environ.get('TEST_SERVER_QUIET') == '1')
-    return parser.parse_args()
-
-def apply_runtime_overrides(args):
-    """Apply per-process overrides without mutating the shared config.ini."""
-    global HOST, PORT, DIRECTORY, TOTAL_MAX_SPEED, PER_THREAD_MAX_SPEED
-    if args.host:
-        HOST = args.host
-    if args.port:
-        PORT = args.port
-    if args.directory:
-        DIRECTORY = os.path.abspath(args.directory)
-    if args.total_max_speed is not None:
-        TOTAL_MAX_SPEED = parse_speed(args.total_max_speed)
-        total_bandwidth_manager.limit = TOTAL_MAX_SPEED
-    if args.per_thread_max_speed is not None:
-        PER_THREAD_MAX_SPEED = parse_speed(args.per_thread_max_speed)
-
-def record_request(method, path):
-    normalized = path.split('?', 1)[0].rstrip('/') or '/'
-    with request_counts_lock:
-        key = (method.upper(), normalized)
-        REQUEST_COUNTS[key] = REQUEST_COUNTS.get(key, 0) + 1
-
-def format_request_counts():
-    with request_counts_lock:
-        lines = [
-            f"{method}\t{path}\t{count}"
-            for (method, path), count in sorted(REQUEST_COUNTS.items())
-        ]
-    return ''.join(f"{line}\n" for line in lines)
+def add_request_stat(name, amount=1):
+    with request_stats_lock:
+        REQUEST_STATS[name] = REQUEST_STATS.get(name, 0) + amount
 
 # --- Throttled File Reader ---
 class ThrottledFileReader:
@@ -247,21 +224,17 @@ class ThrottledHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     range_re = re.compile(r'bytes\s*=\s*(\d+)\s*-\s*(\d*)', re.I)
 
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, directory=DIRECTORY, **kwargs)
-
-    def log_message(self, format, *args):
-        if not getattr(self.server, 'quiet', False):
-            super().log_message(format, *args)
+        ThrottledHTTPRequestHandler.directory = DIRECTORY
+        super().__init__(*args, **kwargs)
 
     def _normalized_path(self):
         return self.path.split('?', 1)[0].rstrip('/') or '/'
 
     def _serve_files_manifest(self, include_body: bool):
         entries = []
-        for name in sorted(os.listdir(DIRECTORY)):
-            path = os.path.join(DIRECTORY, name)
-            if os.path.isfile(path):
-                entries.append((name, os.path.getsize(path)))
+        for name in sorted(os.listdir('.')):
+            if os.path.isfile(name):
+                entries.append((name, os.path.getsize(name)))
 
         body = '\n'.join(f'{name}\t{size}' for name, size in entries)
         if body:
@@ -276,7 +249,10 @@ class ThrottledHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(body_bytes)
 
     def _serve_stats(self, include_body: bool):
-        body_bytes = format_request_counts().encode('utf-8')
+        with request_stats_lock:
+            body = ''.join(f'{name}\t{value}\n' for name, value in sorted(REQUEST_STATS.items()))
+        body_bytes = body.encode('utf-8')
+
         self.send_response(200)
         self.send_header('Content-type', 'text/plain; charset=utf-8')
         self.send_header('Content-Length', str(len(body_bytes)))
@@ -285,23 +261,21 @@ class ThrottledHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(body_bytes)
 
     def do_GET(self):
-        record_request('GET', self._normalized_path())
-        normalized_path = self._normalized_path()
-        if normalized_path == FILES_MANIFEST_PATH:
+        add_request_stat("get_requests")
+        if self._normalized_path() == FILES_MANIFEST_PATH:
             self._serve_files_manifest(True)
             return
-        if normalized_path == STATS_PATH:
+        if self._normalized_path() == STATS_PATH:
             self._serve_stats(True)
             return
         super().do_GET()
 
     def do_HEAD(self):
-        record_request('HEAD', self._normalized_path())
-        normalized_path = self._normalized_path()
-        if normalized_path == FILES_MANIFEST_PATH:
+        add_request_stat("head_requests")
+        if self._normalized_path() == FILES_MANIFEST_PATH:
             self._serve_files_manifest(False)
             return
-        if normalized_path == STATS_PATH:
+        if self._normalized_path() == STATS_PATH:
             self._serve_stats(False)
             return
         super().do_HEAD()
@@ -560,9 +534,6 @@ def console_control():
 
 # --- Server Initialization ---
 if __name__ == "__main__":
-    args = parse_args()
-    apply_runtime_overrides(args)
-
     if not os.path.exists(DIRECTORY):
         console_print(f"Warning: Directory '{DIRECTORY}' does not exist. Creating it...")
         os.makedirs(DIRECTORY)
@@ -570,36 +541,40 @@ if __name__ == "__main__":
     os.chdir(SCRIPT_DIR)
     
     observer = None
-    if not args.no_watch_config and Observer is not None:
+    watch_config = env_override('DISABLE_CONFIG_WATCH') not in {'1', 'true', 'yes'}
+    if Observer is not None and watch_config:
         event_handler = ConfigurationWatcher()
         observer = Observer()
         observer.schedule(event_handler, path='.', recursive=False)
         observer.daemon = True
         observer.start()
         console_print("Monitoring of config.ini has started.")
-    elif not args.no_watch_config:
+    else:
         console_print("watchdog is unavailable; config.ini hot reload is disabled.")
     
+    os.chdir(DIRECTORY)
+
     Handler = ThrottledHTTPRequestHandler
     socketserver.ThreadingTCPServer.allow_reuse_address = True
     try:
         httpd = socketserver.ThreadingTCPServer((HOST, PORT), Handler)
-        httpd.quiet = args.quiet
     except OSError as e:
         console_print(f"Error: Could not start server on {HOST}:{PORT} - {e}")
         exit(1)
 
     console_print(f"Multi-threaded file server is running at http://{HOST}:{PORT}")
-    console_print(f"Serving files from: {os.path.abspath(DIRECTORY)}")
-    console_print(f"Total download speed limit: {format_speed(TOTAL_MAX_SPEED) if TOTAL_MAX_SPEED != float('inf') else 'Unlimited'}")
-    console_print(f"Per-thread speed limit: {format_speed(PER_THREAD_MAX_SPEED) if PER_THREAD_MAX_SPEED != float('inf') else 'Unlimited'}")
+    console_print(f"Serving files from: {os.path.abspath(os.getcwd())}")
+    console_print(f"Total download speed limit: {config.get('throttling', 'total_max_speed', fallback='Unlimited')}")
+    console_print(f"Per-thread speed limit: {config.get('throttling', 'per_thread_max_speed', fallback='Unlimited')}")
     console_print("Server now supports concurrent multi-threaded downloads (range requests).")
 
-    if not args.no_speed_monitor:
+    status_enabled = env_override('DISABLE_STATUS') not in {'1', 'true', 'yes'}
+    if status_enabled:
         monitor_thread = Thread(target=monitor_speed, args=(speed_monitor,), daemon=True)
         monitor_thread.start()
     
-    if not args.no_console:
+    console_enabled = env_override('DISABLE_CONSOLE') not in {'1', 'true', 'yes'}
+    if console_enabled:
         control_thread = Thread(target=console_control, daemon=True)
         control_thread.start()
 

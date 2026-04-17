@@ -80,28 +80,8 @@ impl RunningTestServer {
         Ok(server)
     }
 
-    async fn wait_ready(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let client = Client::new();
-        let url = format!("{}/__files__", self.base_url);
-        let mut last_error = String::from("server did not respond");
-
-        for _ in 0..50 {
-            if let Some(status) = self.child.try_wait()? {
-                return Err(format!("test_server {} exited early: {status}", self.id).into());
-            }
-
-            match client.get(&url).send().await {
-                Ok(response) if response.status().is_success() => return Ok(()),
-                Ok(response) => {
-                    last_error = format!("unexpected readiness status {}", response.status())
-                }
-                Err(error) => last_error = error.to_string(),
-            }
-
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-
-        Err(format!("test_server {} not ready: {last_error}", self.id).into())
+    pub fn url_for(&self, file_name: &str) -> String {
+        format!("{}/{}", self.base_url(), file_name)
     }
 
     pub fn base_url(&self) -> String {
