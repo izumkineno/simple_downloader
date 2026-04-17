@@ -2,7 +2,7 @@ use bytes::Bytes;
 use faststr::FastStr;
 use mockito::Server;
 use reqwest::Client;
-use simple_downloader::types::DownloadCmd;
+use simple_downloader::internal::DownloadCmd;
 use simple_downloader::util::*;
 use std::io::Write;
 use tempfile::NamedTempFile;
@@ -29,6 +29,7 @@ async fn test_get_file_info_head_success() {
     mock.assert_async().await;
 }
 
+#[cfg(feature = "resume")]
 #[tokio::test]
 async fn file_writer_task_with_resume_does_not_truncate_existing_file() {
     let mut temp_file = NamedTempFile::new().unwrap();

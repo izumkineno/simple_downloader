@@ -1,7 +1,10 @@
+#![cfg(feature = "resume")]
+
 use mockito::Server;
 use reqwest::ClientBuilder;
-use simple_downloader::resume::{ResumeMetadata, metadata_path_for};
-use simple_downloader::{DownloadError, Downloader, MultiSourceConfig, SourceConfig};
+use simple_downloader::{DownloadError, Downloader, ResumeMetadata, hash_bytes, metadata_path_for};
+#[cfg(feature = "multi-source")]
+use simple_downloader::{MultiSourceConfig, SourceConfig};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
@@ -27,8 +30,8 @@ fn assert_file_eq(path: &Path, expected: &[u8]) {
         "downloaded file length mismatch"
     );
     assert_eq!(
-        simple_downloader::resume::hash_bytes(&actual),
-        simple_downloader::resume::hash_bytes(expected),
+        hash_bytes(&actual),
+        hash_bytes(expected),
         "downloaded file hash mismatch"
     );
 }
@@ -45,12 +48,13 @@ async fn run_single_source_download(url: String, output_path: &Path) -> Result<(
         0.05,
         ClientBuilder::new,
     )
-    .run(|_, _| async {})
+    .download()
     .await?;
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     Ok(())
 }
 
+#[cfg(feature = "multi-source")]
 async fn run_multi_source_download(
     sources: Vec<SourceConfig>,
     output_path: &Path,
@@ -58,7 +62,7 @@ async fn run_multi_source_download(
     let config = MultiSourceConfig::new(output_path.to_string_lossy().to_string(), 2, 0.05)
         .with_sources(sources);
     Downloader::new_multi(config, ClientBuilder::new)
-        .run(|_, _| async {})
+        .download()
         .await?;
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     Ok(())
@@ -67,10 +71,7 @@ async fn run_multi_source_download(
 fn seed_metadata_for_prefix(output_path: &Path, file_size: u64, verified_len: usize) {
     let mut metadata = ResumeMetadata::new(file_size, verified_len as u64);
     let bytes = read_file(output_path);
-    metadata.set_segment_hash(
-        0,
-        simple_downloader::resume::hash_bytes(&bytes[..verified_len]),
-    );
+    metadata.set_segment_hash(0, hash_bytes(&bytes[..verified_len]));
     metadata
         .save_atomic(&metadata_path_for(output_path))
         .expect("save metadata");
@@ -225,7 +226,7 @@ async fn disabling_resume_uses_fresh_download_path() {
         ClientBuilder::new,
     )
     .with_resume(false)
-    .run(|_, _| async {})
+    .download()
     .await
     .expect("fresh download succeeds");
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -236,6 +237,7 @@ async fn disabling_resume_uses_fresh_download_path() {
 }
 
 #[tokio::test]
+#[cfg(feature = "multi-source")]
 async fn multi_source_resumes_verified_prefix_through_real_runtime_path() {
     let root = TempDir::new().expect("temp dir");
     let output = workspace_file(&root, "multi.bin");

@@ -1,7 +1,8 @@
 use mockito::Server;
 use reqwest::Client;
+use simple_downloader::ChunkId;
 use simple_downloader::chunk::*;
-use simple_downloader::types::{ChunkId, DownloadCmd, DownloadInfo};
+use simple_downloader::internal::{DownloadCmd, DownloadInfo};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 

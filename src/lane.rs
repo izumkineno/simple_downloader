@@ -1,7 +1,9 @@
 use crate::types::{DownloadError, Result};
 use crate::util::get_file_info;
 use faststr::FastStr;
-use reqwest::{Client, ClientBuilder, Proxy};
+#[cfg(feature = "proxy")]
+use reqwest::Proxy;
+use reqwest::{Client, ClientBuilder};
 use std::collections::HashMap;
 
 const BLACKLIST_THRESHOLD: u32 = 3;
@@ -9,6 +11,7 @@ const BLACKLIST_THRESHOLD: u32 = 3;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaneModel {
     PerSource,
+    #[cfg(feature = "proxy")]
     PerSourceProxy,
 }
 
@@ -18,12 +21,14 @@ pub enum LaneHealth {
     Blacklisted,
 }
 
+#[cfg(feature = "proxy")]
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
     pub id: FastStr,
     pub url: FastStr,
 }
 
+#[cfg(feature = "proxy")]
 impl ProxyConfig {
     pub fn new(url: impl Into<FastStr>) -> Self {
         let url = url.into();
@@ -41,6 +46,7 @@ impl ProxyConfig {
 pub struct SourceConfig {
     pub id: FastStr,
     pub url: FastStr,
+    #[cfg(feature = "proxy")]
     pub proxies: Vec<ProxyConfig>,
 }
 
@@ -51,6 +57,7 @@ impl SourceConfig {
         Self {
             id,
             url,
+            #[cfg(feature = "proxy")]
             proxies: Vec::new(),
         }
     }
@@ -60,6 +67,7 @@ impl SourceConfig {
         self
     }
 
+    #[cfg(feature = "proxy")]
     pub fn with_proxies(mut self, proxies: Vec<ProxyConfig>) -> Self {
         self.proxies = proxies;
         self
@@ -84,7 +92,7 @@ impl MultiSourceConfig {
             workers,
             update_interval,
             sources: Vec::new(),
-            lane_model: LaneModel::PerSourceProxy,
+            lane_model: LaneModel::PerSource,
             max_chunks_per_lane: 1,
             max_chunks_per_source: None,
         }
@@ -120,6 +128,7 @@ pub struct LaneCandidate {
 }
 
 impl LaneCandidate {
+    #[cfg_attr(not(any(test, feature = "multi-source")), allow(dead_code))]
     pub fn new(
         lane_id: impl Into<FastStr>,
         source_id: impl Into<FastStr>,
@@ -171,7 +180,6 @@ fn normalize_candidates(
     lane_model: LaneModel,
 ) -> Vec<LaneCandidate> {
     match lane_model {
-        LaneModel::PerSourceProxy => candidates,
         LaneModel::PerSource => candidates
             .into_iter()
             .map(|mut candidate| {
@@ -180,6 +188,8 @@ fn normalize_candidates(
                 candidate
             })
             .collect(),
+        #[cfg(feature = "proxy")]
+        LaneModel::PerSourceProxy => candidates,
     }
 }
 
@@ -220,6 +230,7 @@ impl LaneScheduler {
             .map(|entry| entry.candidate.lane_id.clone())
     }
 
+    #[cfg_attr(not(any(test, feature = "multi-source")), allow(dead_code))]
     pub fn lane_ids(&self) -> Vec<FastStr> {
         self.lanes
             .iter()
@@ -271,6 +282,7 @@ impl LaneScheduler {
         }
     }
 
+    #[cfg_attr(not(any(test, feature = "multi-source")), allow(dead_code))]
     pub fn lane_health(&self, lane_id: impl AsRef<str>) -> Option<LaneHealth> {
         self.lanes
             .iter()
@@ -446,6 +458,21 @@ where
     let mut runtimes = Vec::new();
 
     for source in &config.sources {
+        #[cfg(not(feature = "proxy"))]
+        {
+            let client = client_builder().build()?;
+            runtimes.push(LaneRuntime {
+                lane_id: source.id.clone(),
+                source_id: source.id.clone(),
+                proxy_id: None,
+                url: source.url.clone(),
+                client,
+                probe_speed: 0.0,
+            });
+            continue;
+        }
+
+        #[cfg(feature = "proxy")]
         if source.proxies.is_empty() {
             let client = client_builder().build()?;
             runtimes.push(LaneRuntime {
@@ -459,6 +486,7 @@ where
             continue;
         }
 
+        #[cfg(feature = "proxy")]
         for proxy in &source.proxies {
             let client = client_builder()
                 .proxy(Proxy::all(proxy.url.as_str())?)

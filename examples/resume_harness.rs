@@ -34,8 +34,8 @@ async fn run_single(args: &[String]) -> Result<(), Box<dyn std::error::Error + S
     let workers = args[2].parse::<u64>()?;
     let update_interval = args[3].parse::<f64>()?;
 
-    let download = Downloader::new(url, output, workers, update_interval, ClientBuilder::new)
-        .run(|_, _| async {});
+    let download =
+        Downloader::new(url, output, workers, update_interval, ClientBuilder::new).download();
     tokio::pin!(download);
 
     tokio::select! {
@@ -66,7 +66,7 @@ async fn run_multi(args: &[String]) -> Result<(), Box<dyn std::error::Error + Se
         .collect::<Vec<_>>();
 
     let config = MultiSourceConfig::new(output, workers, update_interval).with_sources(sources);
-    let download = Downloader::new_multi(config, ClientBuilder::new).run(|_, _| async {});
+    let download = Downloader::new_multi(config, ClientBuilder::new).download();
     tokio::pin!(download);
 
     tokio::select! {

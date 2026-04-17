@@ -1,8 +1,12 @@
+#![cfg(feature = "multi-source")]
+
 use assert2::assert;
 use mockito::Server;
 use reqwest::ClientBuilder;
-use simple_downloader::lane::{LaneCandidate, LaneHealth, LaneModel, LaneScheduler};
-use simple_downloader::{Downloader, MultiSourceConfig, SourceConfig};
+use simple_downloader::{
+    Downloader, LaneCandidate, LaneHealth, LaneModel, LaneScheduler, MultiSourceConfig,
+    SourceConfig,
+};
 use tempfile::NamedTempFile;
 
 mod test_server_harness;
@@ -26,7 +30,7 @@ async fn run_multi_source_download(
     let config = MultiSourceConfig::new(path.to_string_lossy().to_string(), workers, 0.05)
         .with_sources(sources);
     let downloader = Downloader::new_multi(config, ClientBuilder::new);
-    downloader.run(|_, _| async {}).await?;
+    downloader.download().await?;
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     Ok(path)
 }
@@ -82,7 +86,7 @@ fn failing_lane_is_blacklisted_until_released() {
             LaneCandidate::new("lane-a", "source-a", None::<&str>, 100.0),
             LaneCandidate::new("lane-b", "source-b", None::<&str>, 90.0),
         ],
-        LaneModel::PerSourceProxy,
+        LaneModel::PerSource,
         2,
         1,
         None,
@@ -95,7 +99,25 @@ fn failing_lane_is_blacklisted_until_released() {
     scheduler.record_failure(&lane);
 
     assert!(scheduler.lane_health(&lane) == Some(LaneHealth::Blacklisted));
-    assert!(scheduler.best_lane().expect("fallback").as_str() == "lane-b");
+    assert!(scheduler.best_lane().expect("fallback").as_str() == "source-b");
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn per_source_proxy_lane_model_keeps_distinct_proxy_lanes() {
+    let scheduler = LaneScheduler::from_candidates(
+        vec![
+            LaneCandidate::new("lane-a", "source-a", None::<&str>, 120.0),
+            LaneCandidate::new("lane-b", "source-a", Some("proxy-b"), 90.0),
+            LaneCandidate::new("lane-c", "source-b", None::<&str>, 80.0),
+        ],
+        LaneModel::PerSourceProxy,
+        4,
+        2,
+        Some(2),
+    );
+
+    assert!(scheduler.lane_ids().len() == 3);
 }
 
 #[tokio::test]
@@ -136,19 +158,15 @@ async fn multi_source_downloader_skips_invalid_probe_source_and_downloads() {
     let temp = NamedTempFile::new().expect("temp file");
     let path = temp.path().to_path_buf();
 
-    let config = MultiSourceConfig::new(path.to_string_lossy().to_string(), 1, 0.05)
-        .with_lane_model(LaneModel::PerSourceProxy)
-        .with_sources(vec![
+    let config =
+        MultiSourceConfig::new(path.to_string_lossy().to_string(), 1, 0.05).with_sources(vec![
             SourceConfig::new(format!("{}/file", bad.url())).with_id("bad"),
             SourceConfig::new(format!("{}/file", good.url())).with_id("good"),
         ]);
 
     let downloader = Downloader::new_multi(config, ClientBuilder::new);
 
-    downloader
-        .run(|_, _| async {})
-        .await
-        .expect("download succeeds");
+    downloader.download().await.expect("download succeeds");
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     assert!(read_file(&path) == body);
@@ -214,10 +232,7 @@ async fn multi_source_downloader_uses_multiple_sources_for_initial_chunks() {
         ]);
 
     let downloader = Downloader::new_multi(config, ClientBuilder::new);
-    downloader
-        .run(|_, _| async {})
-        .await
-        .expect("download succeeds");
+    downloader.download().await.expect("download succeeds");
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     assert!(read_file(&path) == body);

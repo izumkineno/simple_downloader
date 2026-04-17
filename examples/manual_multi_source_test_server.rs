@@ -27,7 +27,7 @@ use tokio::sync::broadcast;
 /// 运行方式：
 ///
 /// ```bash
-/// cargo run --example manual_multi_source_test_server
+/// cargo run --features multi-source,progress --example manual_multi_source_test_server
 /// ```
 ///
 /// 这个示例验证的是：

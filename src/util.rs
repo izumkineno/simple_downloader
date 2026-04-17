@@ -1,5 +1,6 @@
 //! 提供工具函数，如获取文件信息和处理文件写入。
 
+#[cfg(feature = "resume")]
 use crate::resume::ResumeRecorder;
 use crate::types::DownloadCmd;
 use crate::types::{DownloadError, Result};
@@ -95,17 +96,36 @@ pub async fn file_writer_task(
     filepath: FastStr,
     size: u64,
 ) -> Result<(mpsc::Sender<DownloadCmd>, JoinHandle<()>)> {
-    file_writer_task_with_resume(filepath, size, true, None).await
+    file_writer_task_impl(
+        filepath,
+        size,
+        true,
+        #[cfg(feature = "resume")]
+        None,
+    )
+    .await
 }
 
+#[cfg(feature = "resume")]
 pub async fn file_writer_task_with_resume(
     filepath: FastStr,
     size: u64,
     truncate: bool,
-    mut resume_recorder: Option<ResumeRecorder>,
+    resume_recorder: Option<ResumeRecorder>,
+) -> Result<(mpsc::Sender<DownloadCmd>, JoinHandle<()>)> {
+    file_writer_task_impl(filepath, size, truncate, resume_recorder).await
+}
+
+async fn file_writer_task_impl(
+    filepath: FastStr,
+    size: u64,
+    truncate: bool,
+    #[cfg(feature = "resume")] resume_recorder: Option<ResumeRecorder>,
 ) -> Result<(mpsc::Sender<DownloadCmd>, JoinHandle<()>)> {
     const WRITER_QUEUE_CAP: usize = 128;
     let (tx, mut rx) = mpsc::channel::<DownloadCmd>(WRITER_QUEUE_CAP);
+    #[cfg(feature = "resume")]
+    let mut resume_recorder = resume_recorder;
 
     // 打开（或创建）文件
     let mut file = OpenOptions::new()
@@ -123,6 +143,7 @@ pub async fn file_writer_task_with_resume(
         while let Some(command) = rx.recv().await {
             match command {
                 DownloadCmd::WriteFile { offset, data } => {
+                    #[cfg(feature = "resume")]
                     let len = data.len() as u64;
                     // 移动到指定偏移量并写入数据
                     if file.seek(io::SeekFrom::Start(offset)).await.is_err()
@@ -131,6 +152,7 @@ pub async fn file_writer_task_with_resume(
                         eprintln!("[FileWriter] 写入文件失败！");
                         break; // 发生错误时退出
                     }
+                    #[cfg(feature = "resume")]
                     if let Some(recorder) = resume_recorder.as_mut() {
                         if let Err(error) = recorder.record_write(&mut file, offset, len).await {
                             eprintln!("[FileWriter] 更新断点续传元数据失败: {error}");

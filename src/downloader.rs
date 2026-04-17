@@ -1,22 +1,47 @@
 //! 包含核心的 `Downloader` 结构体，是整个库的入口和总协调器。
 
 use crate::chunk::chunk_run;
-use crate::lane::MultiRuntime;
-use crate::lane::MultiSourceConfig;
+use crate::lane::{MultiRuntime, MultiSourceConfig};
 use crate::monitor::DownloadMonitor;
+#[cfg(feature = "resume")]
 use crate::resume::ResumePlan;
+#[cfg(feature = "resume")]
+use crate::types::DownloadError;
 use crate::types::{DownloadCmd, DownloadInfo, Result};
-use crate::util::{file_writer_task_with_resume, get_file_info};
+#[cfg(not(feature = "resume"))]
+use crate::util::file_writer_task;
+#[cfg(feature = "resume")]
+use crate::util::file_writer_task_with_resume;
+use crate::util::get_file_info;
 use faststr::FastStr;
 use futures_util::stream::FuturesUnordered;
 use reqwest::{Client, ClientBuilder};
+use std::future::Future;
+#[cfg(feature = "resume")]
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use tokio::spawn;
 use tokio::sync::{broadcast, mpsc};
 
 const MIN_CHUNK_SIZE: u64 = 1024 * 1024; // 1 MB
 const CHANNEL_CAPACITY: usize = 1024;
+const DEFAULT_UPDATE_INTERVAL: f64 = 0.5;
+
+type BoxProgressFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+type ProgressHandler =
+    Box<dyn FnOnce(u64, broadcast::Receiver<DownloadInfo>) -> BoxProgressFuture + Send>;
+
+fn default_client_builder() -> ClientBuilder {
+    ClientBuilder::new()
+}
+
+fn default_workers() -> u64 {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get() as u64)
+        .unwrap_or(4)
+        .max(1)
+}
 
 /// 下载器的配置信息。
 #[derive(Clone)]
@@ -29,10 +54,99 @@ struct DownloaderConfig {
     workers: u64,
 }
 
+#[cfg_attr(not(any(test, feature = "multi-source")), allow(dead_code))]
 #[derive(Clone)]
 enum DownloadMode {
     Single(DownloaderConfig),
     Multi(MultiSourceConfig),
+}
+
+/// 面向调用方的简化构建器。
+pub struct DownloadBuilder<F = fn() -> ClientBuilder>
+where
+    F: Fn() -> ClientBuilder,
+{
+    url: FastStr,
+    output_path: FastStr,
+    workers: u64,
+    update_interval: f64,
+    client_builder: F,
+    resume_enabled: bool,
+}
+
+impl DownloadBuilder {
+    pub fn new(url: impl Into<FastStr>, output_path: impl Into<FastStr>) -> Self {
+        Self {
+            url: url.into(),
+            output_path: output_path.into(),
+            workers: default_workers(),
+            update_interval: DEFAULT_UPDATE_INTERVAL,
+            client_builder: default_client_builder,
+            resume_enabled: cfg!(feature = "resume"),
+        }
+    }
+}
+
+impl<F> DownloadBuilder<F>
+where
+    F: Fn() -> ClientBuilder + Send + Sync + 'static,
+{
+    pub fn workers(mut self, workers: u64) -> Self {
+        self.workers = workers.max(1);
+        self
+    }
+
+    pub fn update_interval(mut self, update_interval: f64) -> Self {
+        if update_interval > 0.0 {
+            self.update_interval = update_interval;
+        }
+        self
+    }
+
+    pub fn client_builder<G>(self, client_builder: G) -> DownloadBuilder<G>
+    where
+        G: Fn() -> ClientBuilder + Send + Sync + 'static,
+    {
+        DownloadBuilder {
+            url: self.url,
+            output_path: self.output_path,
+            workers: self.workers,
+            update_interval: self.update_interval,
+            client_builder,
+            resume_enabled: self.resume_enabled,
+        }
+    }
+
+    #[cfg(feature = "resume")]
+    pub fn resume(mut self, enabled: bool) -> Self {
+        self.resume_enabled = enabled;
+        self
+    }
+
+    pub fn build(self) -> Downloader<F> {
+        let mut downloader = Downloader::new(
+            self.url,
+            self.output_path,
+            self.workers,
+            self.update_interval,
+            self.client_builder,
+        );
+        downloader.resume_enabled = self.resume_enabled;
+        downloader
+    }
+
+    pub async fn download(self) -> Result<()> {
+        self.build().download().await
+    }
+
+    #[cfg(feature = "progress")]
+    pub async fn run<ProgF, Fut>(self, progress_handler: ProgF) -> Result<()>
+    where
+        ProgF: FnOnce(u64, broadcast::Receiver<DownloadInfo>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.build().run(progress_handler).await
+    }
 }
 
 /// 主要的下载管理器。
@@ -59,17 +173,9 @@ where
 
 impl<F> Downloader<F>
 where
-    // `F` 必须是 `Send + Sync + 'static` 的，因为它可能被移动到其他线程。
     F: Fn() -> ClientBuilder + Send + Sync + 'static,
 {
     /// 创建一个新的 `Downloader` 实例。
-    ///
-    /// # 参数
-    /// - `url`: 下载文件的 URL。
-    /// - `output_path`: 文件保存的路径。
-    /// - `workers`: 最大并发下载线程数。
-    /// - `update_interval`: 进度信息更新的频率（秒）。
-    /// - `client_builder`: 一个返回 `reqwest::ClientBuilder` 的闭包。
     pub fn new(
         url: impl Into<FastStr>,
         output_path: impl Into<FastStr>,
@@ -83,16 +189,17 @@ where
             mode: DownloadMode::Single(DownloaderConfig {
                 url: url.into(),
                 output_path: output_path.into(),
-                workers,
+                workers: workers.max(1),
             }),
             client_builder,
             cmd_tx,
             info_tx,
             update_interval,
-            resume_enabled: true,
+            resume_enabled: cfg!(feature = "resume"),
         }
     }
 
+    #[cfg(feature = "multi-source")]
     pub fn new_multi(config: MultiSourceConfig, client_builder: F) -> Self {
         let (cmd_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
         let (info_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
@@ -102,26 +209,35 @@ where
             client_builder,
             cmd_tx,
             info_tx,
-            resume_enabled: true,
+            resume_enabled: cfg!(feature = "resume"),
         }
     }
 
-    /// 显式启用或关闭自动断点续传。默认启用。
+    /// 显式启用或关闭自动断点续传。仅在 `resume` feature 开启时可用。
+    #[cfg(feature = "resume")]
     pub fn with_resume(mut self, enabled: bool) -> Self {
         self.resume_enabled = enabled;
         self
     }
 
-    /// 启动下载过程。
-    ///
-    /// # 参数
-    /// - `progress_handler`: 一个异步闭包，接收总文件大小和 `DownloadInfo` 的接收端，
-    ///   用于处理和显示下载进度。
+    /// 以最简单的默认路径启动下载，不暴露进度通道。
+    pub async fn download(self) -> Result<()> {
+        self.run_internal(None).await
+    }
+
+    /// 启动下载过程，并将进度流暴露给调用方。
+    #[cfg(feature = "progress")]
     pub async fn run<ProgF, Fut>(self, progress_handler: ProgF) -> Result<()>
     where
-        ProgF: FnOnce(u64, broadcast::Receiver<DownloadInfo>) -> Fut,
-        Fut: std::future::Future<Output = ()> + Send + 'static,
+        ProgF: FnOnce(u64, broadcast::Receiver<DownloadInfo>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
     {
+        let progress_handler: ProgressHandler =
+            Box::new(move |total_size, info_rx| Box::pin(progress_handler(total_size, info_rx)));
+        self.run_internal(Some(progress_handler)).await
+    }
+
+    async fn run_internal(self, progress_handler: Option<ProgressHandler>) -> Result<()> {
         let (file_size, support_ranges, writer_path, client, download_url, workers, multi_runtime) =
             match &self.mode {
                 DownloadMode::Single(config) => {
@@ -132,7 +248,7 @@ where
                         support_ranges,
                         config.output_path.clone(),
                         client,
-                        Some(config.url.clone()),
+                        config.url.clone(),
                         config.workers,
                         None,
                     )
@@ -149,45 +265,64 @@ where
                         true,
                         config.output_path.clone(),
                         client,
-                        Some(download_url),
+                        download_url,
                         config.workers,
                         Some(runtime),
                     )
                 }
             };
-        // 为进度处理器订阅信息通道
-        let info_rx_for_progress = self.info_tx.subscribe();
+
+        #[cfg(feature = "resume")]
         let writer_path_string = writer_path.to_string();
+        #[cfg(feature = "resume")]
         let resume_plan = ResumePlan::prepare(
             Path::new(&writer_path_string),
             file_size,
             self.resume_enabled,
         )?;
+        #[cfg(feature = "resume")]
         if resume_plan.completed_bytes > 0 && !support_ranges {
-            return Err(crate::types::DownloadError::ResumeMetadata(
+            return Err(DownloadError::ResumeMetadata(
                 "partial resume requires HTTP Range support".to_owned(),
             ));
         }
+        #[cfg(feature = "resume")]
         let truncate_output = resume_plan.truncate_output;
+        #[cfg(feature = "resume")]
         let initial_ranges = resume_plan.remaining_ranges.clone();
+        #[cfg(not(feature = "resume"))]
+        let initial_ranges = if file_size == 0 {
+            Vec::new()
+        } else {
+            vec![(0, file_size - 1)]
+        };
+        #[cfg(feature = "resume")]
         let completed_bytes = resume_plan.completed_bytes;
-        let resume_recorder = resume_plan.into_recorder();
-        // 启动文件写入任务，并获取其命令发送端
-        let (writer_tx, writer_handle) =
-            file_writer_task_with_resume(writer_path, file_size, truncate_output, resume_recorder)
-                .await?;
+        #[cfg(not(feature = "resume"))]
+        let completed_bytes = 0;
+
+        #[cfg(feature = "resume")]
+        let (writer_tx, writer_handle) = file_writer_task_with_resume(
+            writer_path,
+            file_size,
+            truncate_output,
+            resume_plan.into_recorder(),
+        )
+        .await?;
+        #[cfg(not(feature = "resume"))]
+        let (writer_tx, writer_handle) = file_writer_task(writer_path, file_size).await?;
         let writer_shutdown_tx = writer_tx.clone();
 
-        // 异步执行用户提供的进度处理逻辑
-        spawn(progress_handler(file_size, info_rx_for_progress));
+        if let Some(progress_handler) = progress_handler {
+            spawn(progress_handler(file_size, self.info_tx.subscribe()));
+        }
 
-        // 协调和管理所有下载任务
         self.orchestrate_downloads(
             file_size,
             support_ranges,
             writer_tx,
             client,
-            download_url.as_ref(),
+            &download_url,
             workers,
             multi_runtime,
             initial_ranges,
@@ -197,32 +332,26 @@ where
 
         let _ = writer_shutdown_tx.send(DownloadCmd::TerminateAll).await;
         let _ = writer_handle.await;
-        // 下载结束后，发送终止命令以清理所有任务
         let _ = self.cmd_tx.send(DownloadCmd::TerminateAll);
         Ok(())
     }
 
-    /// 内部函数，用于创建和管理所有下载任务。
     async fn orchestrate_downloads(
         &self,
         file_size: u64,
         support_ranges: bool,
         writer_tx: mpsc::Sender<DownloadCmd>,
         client: Client,
-        url: Option<&FastStr>,
+        download_url: &FastStr,
         workers: u64,
         mut multi_runtime: Option<MultiRuntime>,
         resume_ranges: Vec<(u64, u64)>,
         completed_bytes: u64,
     ) -> Result<()> {
-        // 使用 FuturesUnordered 来管理所有并发的下载任务
         let tasks = FuturesUnordered::new();
-        // 用于生成唯一的块 ID
         let next_chunk_id = AtomicU64::new(0);
 
-        // 决定实际的并发数
         let workers = if !support_ranges || workers == 1 || file_size < MIN_CHUNK_SIZE {
-            // 如果服务器不支持范围请求，或用户只设置了1个worker，或文件太小，则强制使用单线程
             1
         } else {
             workers
@@ -238,8 +367,7 @@ where
                     .map(|(lane_id, rb)| (Some(lane_id), rb))
                     .expect("validated runtime must provide an initial lane")
             } else {
-                let url = url.expect("single-source mode requires a URL");
-                (None, client.get(url.as_str()))
+                (None, client.get(download_url.as_str()))
             };
             if let Some(lane_id) = lane_id {
                 initial_lanes.push((id, lane_id));
@@ -255,21 +383,13 @@ where
             );
             tasks.push(spawn(task));
         }
-        println!(
-            "[Main] 启动初始下载任务数量: {}, 最大并发数设置为: {}",
-            tasks.len(),
-            workers
-        );
 
-        // 创建下载监控器
         let monitor = DownloadMonitor::new_with_completed(
             file_size,
             completed_bytes,
             self.update_interval,
             workers,
         );
-
-        // 运行监控器，它将接管下载过程的管理
         monitor
             .run(
                 self.info_tx.subscribe(),
@@ -279,12 +399,21 @@ where
                 &client,
                 writer_tx,
                 &self.cmd_tx,
-                url,
+                Some(download_url),
                 initial_lanes,
                 multi_runtime,
             )
             .await;
         Ok(())
+    }
+}
+
+impl Downloader<fn() -> ClientBuilder> {
+    pub fn builder(
+        url: impl Into<FastStr>,
+        output_path: impl Into<FastStr>,
+    ) -> DownloadBuilder<fn() -> ClientBuilder> {
+        DownloadBuilder::new(url, output_path)
     }
 }
 
@@ -324,7 +453,7 @@ fn split_resume_ranges(
 
 #[cfg(test)]
 mod tests {
-    use super::split_resume_ranges;
+    use super::{DownloadBuilder, split_resume_ranges};
 
     #[test]
     fn split_resume_ranges_caps_initial_ranges_to_worker_count() {
@@ -334,5 +463,13 @@ mod tests {
 
         assert_eq!(split.len(), 2);
         assert_eq!(split, vec![(0, 9), (20, 29)]);
+    }
+
+    #[test]
+    fn builder_defaults_are_sensible() {
+        let builder = DownloadBuilder::new("https://example.com/file.bin", "file.bin");
+
+        assert!(builder.workers >= 1);
+        assert_eq!(builder.update_interval, super::DEFAULT_UPDATE_INTERVAL);
     }
 }

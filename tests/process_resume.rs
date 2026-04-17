@@ -1,4 +1,6 @@
-use simple_downloader::resume::{ResumeMetadata, metadata_path_for};
+#![cfg(all(feature = "resume", feature = "multi-source"))]
+
+use simple_downloader::{DEFAULT_SEGMENT_SIZE, ResumeMetadata, hash_bytes, metadata_path_for};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -37,8 +39,8 @@ fn assert_file_eq(path: &Path, expected: &[u8]) {
         "downloaded file length mismatch"
     );
     assert_eq!(
-        simple_downloader::resume::hash_bytes(&actual),
-        simple_downloader::resume::hash_bytes(expected),
+        hash_bytes(&actual),
+        hash_bytes(expected),
         "downloaded file hash mismatch"
     );
 }
@@ -188,7 +190,13 @@ fn harness_path() -> PathBuf {
 fn build_resume_harness() {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let output = Command::new(cargo)
-        .args(["build", "--example", "resume_harness"])
+        .args([
+            "build",
+            "--example",
+            "resume_harness",
+            "--features",
+            "resume,multi-source",
+        ])
         .stdin(Stdio::null())
         .output()
         .expect("build resume_harness example");
@@ -221,7 +229,7 @@ fn example_binary_path(name: &str) -> PathBuf {
 }
 
 async fn wait_for_resume_progress(output: &Path) {
-    wait_for_resume_progress_bytes(output, simple_downloader::resume::DEFAULT_SEGMENT_SIZE).await;
+    wait_for_resume_progress_bytes(output, DEFAULT_SEGMENT_SIZE).await;
 }
 
 async fn wait_for_resume_progress_bytes(output: &Path, minimum_completed_bytes: u64) {

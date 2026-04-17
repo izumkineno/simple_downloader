@@ -13,10 +13,10 @@
 - **即时重试**: 下载块失败后会进入重试队列 (`retry_queue`)，在短暂延迟 (`RETRY_DELAY`) 后自动重试，以应对网络瞬时抖动。设有最大重试次数 (`MAX_RETRIES`)。
 - **长延迟重试**: 当达到最大重试次数后，失败块不会被抛弃，而是被移入**延迟重试队列 (`delayed_retry_queue`)**。在经历一个更长（`DELAYED_RETRY_DURATION`）的等待期后，它将被重新放回主重试队列，极大增强了从长时间网络中断或服务器临时故障中恢复的能力。
 
-#### 4. **精准的实时监控**
+#### 4. **精准的实时监控（`progress` feature）**
 - **中心化状态管理**: `DownloadMonitor` 持有 `DownloadState`，统一追踪每个下载块的进度、范围、实时速度等状态。
 - **平滑速度计算**: 采用 **指数移动平均（EMA）** 算法计算速度，避免瞬时波动，使速度展示更平滑、准确。
-- **详细状态广播**: 通过 `DownloadInfo` 枚举广播丰富的状态事件，如块进度、整体进度、块状态变更（如：重试中、已完成）等，为 UI 对接提供了详尽的数据源。
+- **详细状态广播**: 开启 `progress` feature 后，可通过 `DownloadInfo` 枚举接收丰富的状态事件，如块进度、整体进度、块状态变更（如：重试中、已完成）等。
 
 #### 5. **高效安全的文件 I/O**
 - **独立写入任务**: 文件写入在独立的 `file_writer_task` 异步任务中执行，避免了多线程写入的锁竞争。
@@ -26,15 +26,15 @@
 #### 6. **高兼容性的文件信息探测**
 - **智能回退 (Fallback)**: `get_file_info` 函数优先使用 `HEAD` 请求获取文件信息。若失败或响应头不完整，则自动回退至发送 `Range: bytes=0-0` 的 `GET` 请求，通过解析 `Content-Range` 头获取总大小，显著提高了对各类服务器的兼容性。
 
-#### 7. **断点续传 (Breakpoint Resume)**
-- **默认自动恢复**: 当目标文件与 sidecar 元数据同时存在时，下载器会默认尝试恢复；调用方也可通过 `with_resume(false)` 显式关闭恢复逻辑。
+#### 7. **断点续传 (Breakpoint Resume, `resume` feature)**
+- **默认自动恢复**: 开启 `resume` feature 后，当目标文件与 sidecar 元数据同时存在时，下载器会默认尝试恢复；调用方也可通过 `with_resume(false)` 显式关闭恢复逻辑。
 - **哈希校验驱动的恢复**: 续传不是简单信任文件长度，而是基于固定 segment ledger + 持久化哈希校验，仅复用已验证通过的本地字节范围。
 - **按覆盖恢复而非按旧拓扑恢复**: 恢复时不会依赖上一次的 chunk 拓扑，而是重建为“已验证完成范围 + 剩余待下载范围”。
 - **单源 / 多源统一恢复路径**: `Downloader::new(...)` 与 `Downloader::new_multi(...)` 都走同一套恢复模型。
 - **安全失败策略**: 如果元数据存在但目标文件缺失，会直接 fail-stop，而不是静默从零开始；如果某个已验证 segment 被篡改，只会使该 segment 失效并重新下载。
 - **进程级中断恢复已验证**: 当前测试已覆盖单源控制台中断后恢复，以及多源子进程被 kill / 崩溃式终止后恢复。
 
-#### 8. **多源 / 多代理下载基础能力**
+#### 8. **多源 / 多代理下载基础能力（`multi-source` / `proxy` features）**
 - **多源入口**: `MultiSourceConfig`、`SourceConfig` 与 `Downloader::new_multi(...)` 已支持为同一个输出文件配置多个镜像 URL。
 - **代理维度建模**: `SourceConfig::with_proxies(...)` 与 `LaneModel` 可把“源”或“源 + 代理”建模为调度 lane，并通过 `max_chunks_per_lane` / `max_chunks_per_source` 控制并发占用。
 - **源可用性筛选**: 多源启动阶段会探测候选源；不可用、文件大小不一致或不支持 Range 的源会被跳过，全部不可用时返回 `NoAvailableSources`。
@@ -43,6 +43,26 @@
 
 ---
 
+### Feature Flags
+
+当前库按“默认只保留基础能力，其他能力按需开启”的原则组织：
+
+| Feature | 默认开启 | 作用 |
+|---|---:|---|
+| _none_ | 是 | 基础单源多线程下载 + 更简洁的默认 API |
+| `resume` | 否 | 断点续传、sidecar 元数据、恢复相关 API |
+| `multi-source` | 否 | 多源下载入口、lane 调度建模 |
+| `proxy` | 否 | 代理配置能力，依赖 `multi-source` |
+| `progress` | 否 | 公开 `DownloadInfo` 进度事件与 `run(...)` 进度回调接口 |
+
+推荐理解方式：
+
+- **默认模式**：`Downloader::builder(...).download().await`
+- **需要恢复**：打开 `resume`
+- **需要多源**：打开 `multi-source`
+- **需要代理**：打开 `proxy`
+- **需要 UI / 进度事件**：打开 `progress`
+
 ### 待实现的功能 (TODO List)
 
 目标：实现一个开箱即用、自带断点续传、任务队列、对接入 UI 友好，能自适应下载的多源多线程下载库。下面按“已落地 / 待完善”同步当前状态。
@@ -50,7 +70,7 @@
 #### 1. **核心功能：断点续传 (Breakpoint Continuation)**
 -   [x] **二进制元数据 sidecar**: 已使用 `bitcode` 持久化恢复元数据，而不是仅依赖文件长度或内存状态。
 -   [x] **哈希校验恢复**: 已基于固定 segment ledger + 持久化哈希校验恢复已完成范围，不再要求保留旧 chunk 拓扑。
--   [x] **默认自动恢复 + 显式禁用**: 文件与 sidecar 同时存在时默认恢复；调用方可通过 `with_resume(false)` 强制走全新下载路径。
+-   [x] **默认自动恢复 + 显式禁用**: 开启 `resume` feature 后，文件与 sidecar 同时存在时默认恢复；调用方可通过 `with_resume(false)` 强制走全新下载路径。
 -   [x] **缺文件 fail-stop**: sidecar 存在但目标文件不存在时会直接报错停止，不会静默重下。
 -   [x] **单源 / 多源恢复**: 已覆盖 `Downloader::new(...)` 与 `Downloader::new_multi(...)` 的恢复路径。
 -   [x] **进程级恢复测试**: 已补充单源控制台中断恢复、多源 kill / 崩溃式终止恢复的集成测试。
@@ -63,7 +83,7 @@
 -   [x] **源可用性与一致性校验**: 启动时跳过不可用源、不支持 Range 的源，以及文件大小与首个有效源不一致的源。
 -   [x] **无效源跳过与基础失败隔离**: 已有测试覆盖无效源跳过；lane 连续失败后可被黑名单隔离。
 -   [x] **repo-native `test_server` 集成测试**: 已用多个不同限速的本地服务器覆盖 fast/slow、三源异构、invalid + valid 等真实 Range 下载场景。
--   [x] **手工观察示例**: `cargo run --example manual_multi_source_test_server` 会生成 500 MiB 测试文件，启动 fast=16m / slow=2m 两个本地源，并实时刷新总进度、速度和源侧 stats 摘要。
+-   [x] **手工观察示例**: `cargo run --features multi-source,progress --example manual_multi_source_test_server` 会生成 500 MiB 测试文件，启动 fast=16m / slow=2m 两个本地源，并实时刷新总进度、速度和源侧 stats 摘要。
 -   [ ] **更智能的源调度评分**: 当前调度仍是基础 lane 选择与失败隔离；后续应引入响应时间、历史吞吐、失败率等动态评分，为每个块选择更优源。
 -   [ ] **更完整的多代理真实集成验证**: 当前代理维度已有配置与调度模型，后续应补充真实代理链路的端到端测试矩阵。
 
@@ -72,6 +92,8 @@
 -   [ ] **分源 / 分代理限速策略**: 当前 `test_server` 可用于模拟不同源限速；库本身后续还应支持调用方配置全局、单源或单 lane 的下载限速策略。
 
 #### 4. **其他改进**
+-   [x] **默认 API 易用性重构（第一阶段）**: 已新增 `Downloader::builder(...).download().await` 的简化入口，不再强制默认调用方接入 progress receiver。
+-   [x] **Feature 能力裁剪（第一阶段）**: 默认模式仅保留基础多线程下载；`resume` / `multi-source` / `proxy` / `progress` 已拆为按需启用的 Cargo features。
 -   [ ] **配置灵活性**: 允许用户在运行时动态调整配置，如并发数、重试策略（次数、延迟算法）等。虽然已通过 `ClientBuilder` 提供了网络层面的高度自定义能力（如代理、超时），但应用层的策略也应更灵活。
 -   [ ] **任务队列 API**: 在单个下载任务之外，提供可暂停、恢复、取消、查询状态的任务队列抽象。
 -   [ ] **更稳定的 UI 对接层**: 将 `DownloadInfo` 事件语义整理成面向 UI 的稳定契约，并补充字段兼容性说明。
@@ -85,8 +107,8 @@
 当前仓库已经内置下列恢复测试：
 
 ```bash
-cargo test --test resume -- --nocapture --test-threads=1
-cargo test --test process_resume -- --nocapture --test-threads=1
+cargo test --features resume,multi-source --test resume -- --nocapture --test-threads=1
+cargo test --features resume,multi-source --test process_resume -- --nocapture --test-threads=1
 ```
 
 其中：
@@ -101,7 +123,7 @@ cargo test --test process_resume -- --nocapture --test-threads=1
 如果想观察多源下载、不同源限速以及实时进度刷新，可运行：
 
 ```bash
-cargo run --example manual_multi_source_test_server
+cargo run --features multi-source,progress --example manual_multi_source_test_server
 ```
 
 该示例会：
@@ -118,44 +140,27 @@ cargo run --example manual_multi_source_test_server
 ##### 基础单源用法
 
 ```rust
-use simple_downloader::{Downloader, DownloadInfo, reqwest::ClientBuilder};
-use tokio::sync::broadcast;
+use simple_downloader::Downloader;
 
 #[tokio::main]
 async fn main() {
-    let downloader = Downloader::new(
+    match Downloader::builder(
         "https://dldir1.qq.com/qqfile/qq/PCQQ9.7.17/QQ9.7.17.29225.exe", // 下载链接
         "QQ9.7.17.29225.exe",                             // 保存路径
-        16,                                       // 最大并发线程数
-        1.0,                                      // 进度更新间隔(秒)
-        || ClientBuilder::new(),                  // 提供网络客户端构建器
     )
-    .with_resume(true); // 默认就是 true，这里显式写出仅用于示例说明
-
-    // 定义一个处理下载进度的闭包
-    let progress_handler = |total_size: u64, mut info_rx: broadcast::Receiver<DownloadInfo>| async move {
-        println!("文件总大小: {:.2} MB", total_size as f64 / 1024.0 / 1024.0);
-
-        // 循环接收并打印进度信息
-        while let Ok(info) = info_rx.recv().await {
-            if let DownloadInfo::MonitorUpdate { total_downloaded, total_speed, .. } = info {
-                let progress = (total_downloaded as f64 / total_size as f64) * 100.0;
-                println!(
-                    "进度: {:.2}% | 已下载: {:.2} MB | 速度: {:.2} MB/s",
-                    progress,
-                    total_downloaded as f64 / 1024.0 / 1024.0,
-                    total_speed / 1024.0 / 1024.0
-                );
-            }
-        }
-    };
-
-    // 启动下载！
-    match downloader.run(progress_handler).await {
+    .workers(16)
+    .download()
+    .await {
         Ok(_) => println!("下载成功！"),
         Err(e) => eprintln!("下载失败: {}", e),
     }
 }
+```
+
+##### 开启进度事件（`progress` feature）
+
+```bash
+cargo run --features progress --example with_custom_ui
 ```
 
 #### 架构概览

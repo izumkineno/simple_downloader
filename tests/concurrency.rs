@@ -1,6 +1,7 @@
+use simple_downloader::ChunkId;
 use simple_downloader::concurrency::ConcurrencyManager;
+use simple_downloader::internal::DownloadCmd;
 use simple_downloader::state::{ChunkState, DownloadState};
-use simple_downloader::types::{ChunkId, DownloadCmd};
 use std::time::Duration;
 use tokio::sync::broadcast;
 
