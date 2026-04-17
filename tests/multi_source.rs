@@ -187,7 +187,7 @@ async fn multi_source_downloader_uses_multiple_sources_for_initial_chunks() {
             "Content-Range",
             format!("bytes 0-{}/{}", split - 1, body.len()).as_str(),
         )
-        .with_body(body[..split].to_vec())
+        .with_body(body[..split].as_ref())
         .create_async()
         .await;
     let second_get = second
@@ -201,7 +201,7 @@ async fn multi_source_downloader_uses_multiple_sources_for_initial_chunks() {
             "Content-Range",
             format!("bytes {}-{}/{}", split, body.len() - 1, body.len()).as_str(),
         )
-        .with_body(body[split..].to_vec())
+        .with_body(body[split..].as_ref())
         .create_async()
         .await;
 
