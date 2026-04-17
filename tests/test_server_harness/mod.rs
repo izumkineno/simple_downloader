@@ -49,8 +49,8 @@ impl RunningTestServer {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let port = free_port()?;
         let script = test_server_script();
-        let python = std::env::var("SIMPLE_DOWNLOADER_TEST_PYTHON")
-            .unwrap_or_else(|_| "python".to_owned());
+        let python =
+            std::env::var("SIMPLE_DOWNLOADER_TEST_PYTHON").unwrap_or_else(|_| "python".to_owned());
 
         let child = Command::new(python)
             .arg(script)
@@ -108,9 +108,7 @@ impl RunningTestServer {
         Ok(stats)
     }
 
-    async fn wait_until_ready(
-        &mut self,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn wait_until_ready(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let client = reqwest::Client::new();
         let url = format!("{}/__files__", self.base_url());
         let deadline = Instant::now() + READINESS_TIMEOUT;
