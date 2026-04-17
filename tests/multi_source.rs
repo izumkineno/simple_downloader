@@ -5,8 +5,35 @@ use simple_downloader::lane::{LaneCandidate, LaneHealth, LaneModel, LaneSchedule
 use simple_downloader::{Downloader, MultiSourceConfig, SourceConfig};
 use tempfile::NamedTempFile;
 
+mod test_server_harness;
+
+use test_server_harness::{ServerSpec, TestServerCluster};
+
 fn read_file(path: &std::path::Path) -> Vec<u8> {
     std::fs::read(path).expect("read downloaded file")
+}
+
+fn deterministic_payload(size: usize) -> Vec<u8> {
+    (0..size)
+        .map(|index| ((index.wrapping_mul(31).wrapping_add(17)) % 251) as u8)
+        .collect()
+}
+
+async fn download_from_sources(
+    output_path: &std::path::Path,
+    workers: u64,
+    sources: Vec<SourceConfig>,
+) {
+    let config = MultiSourceConfig::new(output_path.to_string_lossy().to_string(), workers, 0.05)
+        .with_max_chunks_per_lane(1)
+        .with_sources(sources);
+
+    let downloader = Downloader::new_multi(config, ClientBuilder::new);
+    downloader
+        .run(|_, _| async {})
+        .await
+        .expect("download succeeds");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 }
 
 #[test]
@@ -190,4 +217,133 @@ async fn multi_source_downloader_uses_multiple_sources_for_initial_chunks() {
     second_head.assert_async().await;
     first_get.assert_async().await;
     second_get.assert_async().await;
+}
+
+#[tokio::test]
+async fn test_server_multi_source_downloads_byte_correct_file_from_fast_and_slow_sources() {
+    let file_name = "fast-slow.bin";
+    let body = deterministic_payload(2 * 1024 * 1024);
+    let cluster = TestServerCluster::start(
+        file_name,
+        &body,
+        &[
+            ServerSpec {
+                id: "fast",
+                total_max_speed: "16m",
+                per_thread_max_speed: "16m",
+            },
+            ServerSpec {
+                id: "slow",
+                total_max_speed: "512k",
+                per_thread_max_speed: "512k",
+            },
+        ],
+    )
+    .await
+    .expect("test servers start");
+
+    let temp = NamedTempFile::new().expect("temp file");
+    let path = temp.path().to_path_buf();
+    download_from_sources(
+        &path,
+        2,
+        vec![
+            SourceConfig::new(cluster.source_url(0, file_name)).with_id("fast"),
+            SourceConfig::new(cluster.source_url(1, file_name)).with_id("slow"),
+        ],
+    )
+    .await;
+
+    assert!(read_file(&path) == body);
+    assert!(cluster.get_count(0, file_name).await.expect("fast stats") > 0);
+    assert!(cluster.get_count(1, file_name).await.expect("slow stats") > 0);
+}
+
+#[tokio::test]
+async fn test_server_multi_source_downloads_byte_correct_file_from_three_heterogeneous_sources() {
+    let file_name = "three-sources.bin";
+    let body = deterministic_payload(3 * 1024 * 1024);
+    let cluster = TestServerCluster::start(
+        file_name,
+        &body,
+        &[
+            ServerSpec {
+                id: "fast",
+                total_max_speed: "16m",
+                per_thread_max_speed: "16m",
+            },
+            ServerSpec {
+                id: "medium",
+                total_max_speed: "4m",
+                per_thread_max_speed: "4m",
+            },
+            ServerSpec {
+                id: "slow",
+                total_max_speed: "768k",
+                per_thread_max_speed: "768k",
+            },
+        ],
+    )
+    .await
+    .expect("test servers start");
+
+    let temp = NamedTempFile::new().expect("temp file");
+    let path = temp.path().to_path_buf();
+    download_from_sources(
+        &path,
+        3,
+        vec![
+            SourceConfig::new(cluster.source_url(0, file_name)).with_id("fast"),
+            SourceConfig::new(cluster.source_url(1, file_name)).with_id("medium"),
+            SourceConfig::new(cluster.source_url(2, file_name)).with_id("slow"),
+        ],
+    )
+    .await;
+
+    assert!(read_file(&path) == body);
+    assert!(cluster.get_count(0, file_name).await.expect("fast stats") > 0);
+    assert!(cluster.get_count(1, file_name).await.expect("medium stats") > 0);
+    assert!(cluster.get_count(2, file_name).await.expect("slow stats") > 0);
+}
+
+#[tokio::test]
+async fn test_server_multi_source_skips_invalid_source_and_uses_remaining_throttled_sources() {
+    let file_name = "valid-sources.bin";
+    let body = deterministic_payload(2 * 1024 * 1024);
+    let cluster = TestServerCluster::start(
+        file_name,
+        &body,
+        &[
+            ServerSpec {
+                id: "valid-a",
+                total_max_speed: "4m",
+                per_thread_max_speed: "4m",
+            },
+            ServerSpec {
+                id: "valid-b",
+                total_max_speed: "1m",
+                per_thread_max_speed: "1m",
+            },
+        ],
+    )
+    .await
+    .expect("test servers start");
+
+    let temp = NamedTempFile::new().expect("temp file");
+    let path = temp.path().to_path_buf();
+    download_from_sources(
+        &path,
+        2,
+        vec![
+            SourceConfig::new(cluster.missing_url(0)).with_id("invalid"),
+            SourceConfig::new(cluster.source_url(0, file_name)).with_id("valid-a"),
+            SourceConfig::new(cluster.source_url(1, file_name)).with_id("valid-b"),
+        ],
+    )
+    .await;
+
+    assert!(read_file(&path) == body);
+    assert!(cluster.get_count(0, "missing.bin").await.expect("missing stats") > 0);
+    assert!(cluster.get_count(0, file_name).await.expect("valid-a stats") > 0);
+    assert!(cluster.get_count(1, file_name).await.expect("valid-b stats") > 0);
 }
