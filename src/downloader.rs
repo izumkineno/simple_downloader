@@ -61,7 +61,22 @@ enum DownloadMode {
     Multi(MultiSourceConfig),
 }
 
-/// 面向调用方的简化构建器。
+/// 下载器构建器，使用流畅的 Builder 模式配置下载参数。
+///
+/// # 示例
+///
+/// ```no_run
+/// use simple_downloader::Downloader;
+///
+/// # #[tokio::main]
+/// # async fn main() {
+/// let downloader = Downloader::builder("https://example.com/file.bin", "output.bin")
+///     .workers(8) // 设置 8 个并发线程
+///     .update_interval(1.0) // 每秒更新一次进度
+///     .resume(true) // 启用断点续传
+///     .build();
+/// # }
+/// ```
 pub struct DownloadBuilder<F = fn() -> ClientBuilder>
 where
     F: Fn() -> ClientBuilder,
@@ -75,6 +90,19 @@ where
 }
 
 impl DownloadBuilder {
+    /// 创建一个新的下载构建器。
+    ///
+    /// # 参数
+    ///
+    /// - `url`: 要下载的文件的 URL
+    /// - `output_path`: 下载后文件的保存路径
+    ///
+    /// # 默认配置
+    ///
+    /// - `workers`: 自动检测 CPU 核心数，默认值为核心数，最少为 1
+    /// - `update_interval`: 0.5 秒（进度更新间隔）
+    /// - `resume_enabled`: 根据 `resume` feature 是否启用自动决定
+    /// - `client_builder`: 使用默认的 reqwest 客户端配置
     pub fn new(url: impl Into<FastStr>, output_path: impl Into<FastStr>) -> Self {
         Self {
             url: url.into(),
@@ -91,11 +119,27 @@ impl<F> DownloadBuilder<F>
 where
     F: Fn() -> ClientBuilder + Send + Sync + 'static,
 {
+    /// 设置并发下载的工作线程数。
+    ///
+    /// # 参数
+    ///
+    /// - `workers`: 工作线程数，最小值为 1
+    ///
+    /// # 注意
+    ///
+    /// 如果服务器不支持 Range 请求，或者文件大小小于 1MB，会自动降级为单线程下载。
     pub fn workers(mut self, workers: u64) -> Self {
         self.workers = workers.max(1);
         self
     }
 
+    /// 设置进度更新的时间间隔（秒）。
+    ///
+    /// # 参数
+    ///
+    /// - `update_interval`: 进度更新间隔，必须大于 0
+    ///
+    /// 默认值为 0.5 秒。
     pub fn update_interval(mut self, update_interval: f64) -> Self {
         if update_interval > 0.0 {
             self.update_interval = update_interval;
@@ -103,6 +147,28 @@ where
         self
     }
 
+    /// 设置自定义的 reqwest 客户端构建器。
+    ///
+    /// 使用此方法可以自定义 HTTP 客户端的配置，例如超时、代理、证书等。
+    ///
+    /// # 示例
+    ///
+    /// ```no_run
+    /// use simple_downloader::Downloader;
+    /// use reqwest::ClientBuilder;
+    /// use std::time::Duration;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let downloader = Downloader::builder("https://example.com/file.bin", "output.bin")
+    ///     .client_builder(|| {
+    ///         ClientBuilder::new()
+    ///             .timeout(Duration::from_secs(30))
+    ///             .connect_timeout(Duration::from_secs(10))
+    ///     })
+    ///     .build();
+    /// # }
+    /// ```
     pub fn client_builder<G>(self, client_builder: G) -> DownloadBuilder<G>
     where
         G: Fn() -> ClientBuilder + Send + Sync + 'static,
@@ -117,12 +183,22 @@ where
         }
     }
 
+    /// 启用或禁用断点续传功能。
+    ///
+    /// 仅在 `resume` feature 启用时可用。
+    ///
+    /// # 参数
+    ///
+    /// - `enabled`: 是否启用断点续传
+    ///
+    /// 启用后，下载中断后再次启动时会自动从断点处恢复，无需重新下载已完成的部分。
     #[cfg(feature = "resume")]
     pub fn resume(mut self, enabled: bool) -> Self {
         self.resume_enabled = enabled;
         self
     }
 
+    /// 构建 Downloader 实例。
     pub fn build(self) -> Downloader<F> {
         let mut downloader = Downloader::new(
             self.url,
@@ -135,10 +211,21 @@ where
         downloader
     }
 
+    /// 直接启动下载（便捷方法）。
+    ///
+    /// 相当于先调用 `build()` 再调用 `download().await`。
     pub async fn download(self) -> Result<()> {
         self.build().download().await
     }
 
+    /// 启动下载并提供进度监控（便捷方法）。
+    ///
+    /// 相当于先调用 `build()` 再调用 `run(progress_handler).await`。
+    /// 仅在 `progress` feature 启用时可用。
+    ///
+    /// # 参数
+    ///
+    /// - `progress_handler`: 进度处理闭包，接收文件总大小和进度信息接收器
     #[cfg(feature = "progress")]
     pub async fn run<ProgF, Fut>(self, progress_handler: ProgF) -> Result<()>
     where
@@ -149,21 +236,29 @@ where
     }
 }
 
-/// 主要的下载管理器。
+/// 主要的下载管理器，是整个库的核心协调者。
+///
+/// Downloader 负责协调整个下载过程，包括：
+/// - 初始化下载配置和组件
+/// - 获取文件信息和检测服务器 Range 支持
+/// - 处理断点续传逻辑
+/// - 分配下载任务给工作线程
+/// - 监控下载进度和处理错误
+/// - 合并下载的文件块并完成下载
 ///
 /// 泛型 `F` 允许用户传入一个闭包，用于创建 `reqwest::ClientBuilder`，
-/// 从而可以自定义客户端配置（如代理、超时等）。
+/// 从而可以自定义客户端配置（如代理、超时、证书等）。
 pub struct Downloader<F>
 where
     F: Fn() -> ClientBuilder,
 {
-    /// 下载配置。
+    /// 下载模式（单源或多源）。
     mode: DownloadMode,
     /// 用于创建 reqwest 客户端的构建器闭包。
     client_builder: F,
-    /// 用于广播控制命令（如 `BisectDownload`, `TerminateAll`）的发送端。
+    /// 用于广播控制命令（如暂停、终止）的发送端。
     cmd_tx: broadcast::Sender<DownloadCmd>,
-    /// 用于广播下载信息（如进度、状态）的发送端。
+    /// 用于广播下载信息（如进度、速度）的发送端。
     info_tx: broadcast::Sender<DownloadInfo>,
     /// 进度更新的间隔时间（秒）。
     update_interval: f64,
@@ -175,7 +270,17 @@ impl<F> Downloader<F>
 where
     F: Fn() -> ClientBuilder + Send + Sync + 'static,
 {
-    /// 创建一个新的 `Downloader` 实例。
+    /// 创建一个新的单源下载器实例。
+    ///
+    /// 推荐使用 `Downloader::builder()` 来创建下载器，它提供了更友好的配置接口。
+    ///
+    /// # 参数
+    ///
+    /// - `url`: 要下载的文件 URL
+    /// - `output_path`: 文件保存路径
+    /// - `workers`: 并发工作线程数（最小值为 1）
+    /// - `update_interval`: 进度更新间隔（秒，必须大于 0）
+    /// - `client_builder`: reqwest 客户端构建器闭包
     pub fn new(
         url: impl Into<FastStr>,
         output_path: impl Into<FastStr>,
@@ -199,6 +304,14 @@ where
         }
     }
 
+    /// 创建一个新的多源下载器实例。
+    ///
+    /// 仅在 `multi-source` feature 启用时可用。
+    ///
+    /// # 参数
+    ///
+    /// - `config`: 多源下载配置
+    /// - `client_builder`: reqwest 客户端构建器闭包
     #[cfg(feature = "multi-source")]
     pub fn new_multi(config: MultiSourceConfig, client_builder: F) -> Self {
         let (cmd_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
@@ -213,19 +326,58 @@ where
         }
     }
 
-    /// 显式启用或关闭自动断点续传。仅在 `resume` feature 开启时可用。
+    /// 显式启用或关闭自动断点续传。
+    ///
+    /// 仅在 `resume` feature 开启时可用。
+    ///
+    /// # 参数
+    ///
+    /// - `enabled`: 是否启用断点续传
     #[cfg(feature = "resume")]
     pub fn with_resume(mut self, enabled: bool) -> Self {
         self.resume_enabled = enabled;
         self
     }
 
-    /// 以最简单的默认路径启动下载，不暴露进度通道。
+    /// 启动下载，不返回进度信息。
+    ///
+    /// 这是最简单的下载方法，适合不需要监控进度的场景。
+    ///
+    /// # 返回值
+    ///
+    /// - `Ok(())`: 下载成功完成
+    /// - `Err(DownloadError)`: 下载过程中发生错误
     pub async fn download(self) -> Result<()> {
         self.run_internal(None).await
     }
 
-    /// 启动下载过程，并将进度流暴露给调用方。
+    /// 启动下载，并提供进度监控。
+    ///
+    /// 仅在 `progress` feature 启用时可用。
+    ///
+    /// # 参数
+    ///
+    /// - `progress_handler`: 进度处理闭包，接收两个参数：
+    ///   - `total_size`: 文件总大小（字节）
+    ///   - `info_rx`: 进度信息接收器，可以接收 `DownloadInfo` 结构体获取实时进度
+    ///
+    /// # 示例
+    ///
+    /// ```no_run
+    /// # use simple_downloader::{Downloader, DownloadInfo};
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// Downloader::builder("https://example.com/file.bin", "output.bin")
+    ///     .workers(8)
+    ///     .run(|total_size, mut info_rx| async move {
+    ///         while let Ok(info) = info_rx.recv().await {
+    ///             println!("进度: {:.1}%", info.progress_percent());
+    ///         }
+    ///     })
+    ///     .await
+    ///     .unwrap();
+    /// # }
+    /// ```
     #[cfg(feature = "progress")]
     pub async fn run<ProgF, Fut>(self, progress_handler: ProgF) -> Result<()>
     where

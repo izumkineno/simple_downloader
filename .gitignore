@@ -2,6 +2,7 @@
 /test_server/files
 .venv
 .omx
+.omc
 __pycache__
 .claude
 .agents
