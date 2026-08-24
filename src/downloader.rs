@@ -25,7 +25,7 @@ use tokio::spawn;
 use tokio::sync::{broadcast, mpsc};
 
 const MIN_PARALLEL_FILE_SIZE: u64 = 1024 * 1024; // 1 MiB：小于此值自动单线程，避免切片开销
-const CHANNEL_CAPACITY: usize = 1024;
+const CHANNEL_CAPACITY: usize = 4096; // 增大以容纳节流后 ~1.5k 进度 + 控制事件，避免 Lagged 丢 Failed/Complete
 const DEFAULT_UPDATE_INTERVAL: f64 = 0.5;
 
 type BoxProgressFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
