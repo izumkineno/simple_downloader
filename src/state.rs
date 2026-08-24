@@ -133,6 +133,13 @@ impl DownloadState {
         }
     }
 
+    /// 失败时保留已下载的前缀，避免 total_downloaded 回落导致剩余时间误判。
+    pub(crate) fn preserve_partial(&mut self, id: &ChunkId) {
+        if let Some(chunk) = self.chunks.get(id) {
+            self.completed_bytes += chunk.downloaded_bytes;
+        }
+    }
+
     /// 计算当前已下载的总字节数。
     /// 这是已完成块的字节数和所有活跃块当前已下载字节数的总和。
     pub fn total_downloaded(&self) -> u64 {

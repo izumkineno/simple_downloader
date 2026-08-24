@@ -76,6 +76,8 @@ impl RetryHandler {
     ) {
         eprintln!("[RetryHandler] 收到块 {id} 的失败报告: {error}");
 
+        // 保留已下载前缀，避免 total_downloaded 瞬时回落
+        state.preserve_partial(&id);
         // 从活跃的块列表中移除该块
         state.chunks.remove(&id);
 
