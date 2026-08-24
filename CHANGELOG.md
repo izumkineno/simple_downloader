@@ -30,6 +30,7 @@
 - **断点续传**：新建 sidecar 立即落盘（`<64KiB` 中断可恢复）；`record_write` 改 `tokio::fs` 异步落盘；成功后自动清理 `*.download.bitcode`
 - **异步阻塞**：`ResumePlan::prepare` 增 `prepare_async` 经 `spawn_blocking` 卸载，避免阻塞 Tokio 运行时
 - **阈值一致性**：统一 `MIN_CHUNK_SIZE=10KiB` 复用 `chunk` 常量，`downloader` 降级阈值重命名 `MIN_PARALLEL_FILE_SIZE=1MiB`；`split_resume_ranges` 加最小块守卫防碎片
+- **重试熔断**：`RetryHandler` 新增 `MAX_TOTAL_ATTEMPTS=30` 与 `permanent_failures` 熔断，`on_chunk_failed` 超阈直接 `PermanentFailure(5)` 并终止重试循环；`monitor::run` 改 `Result` 三处熔断检查并 `TerminateAll` 熔断，避免 30×10 重试永挂死；`DownloadError::PermanentFailure` 新增
 
 ### ⚡ 性能
 
@@ -168,6 +169,7 @@
 
 - 新增 `ResumePlan::prepare_async`（内部使用），原 `prepare` 保留兼容
 - `ResumeRecorder` 增 `pending_segments/last_save` 与 `flush()`，对外不暴露破坏
+- 新增 `DownloadError::PermanentFailure(String)` 变体（重试熔断），仅作为新增错误分支，现有 `match` 需补 `_` 或显式处理该分支
 - 性能行为变更：`ChunkProgress` 节流（64KiB/50ms）、`save_atomic` 16段/1s 批量、`FileWriter` 128KiB 合并、`MultiRuntime` 并行探测、`Client` 连接池注入；下载结果不变，仅更少系统调用与广播
 - 文档 `configuration.md/installation.md/best-practices.md` 修正为真实 API，无需代码迁移
 
