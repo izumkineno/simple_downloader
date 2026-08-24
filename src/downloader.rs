@@ -5,7 +5,6 @@ use crate::lane::{MultiRuntime, MultiSourceConfig};
 use crate::monitor::DownloadMonitor;
 #[cfg(feature = "resume")]
 use crate::resume::ResumePlan;
-#[cfg(feature = "resume")]
 use crate::types::DownloadError;
 use crate::types::{DownloadCmd, DownloadInfo, Result};
 #[cfg(not(feature = "resume"))]
