@@ -5,7 +5,11 @@
 ## 一、文档入口
 
 - [`../README.md`](../README.md)：项目功能概览、公开用法、概念级 Mermaid 图。
+- [`usage.md`](./usage.md)：**调用指南（权威）**，覆盖所有公开 API 的最小可运行调用形态、Feature 选型、6 大场景与错误模板。
 - [`architecture.md`](./architecture.md)：当前实现的**权威运行时说明**，覆盖启动链路、控制面、消息协议、动态分片与重试行为。
+- [`configuration.md`](./configuration.md)：可配置项全表与调优建议（参数含义，`usage.md` 提供调用形态）。
+- [`errors.md`](./errors.md)：错误变体全表与重试策略。
+- [`best-practices.md`](./best-practices.md)：生产级最佳实践与反模式。
 - `tests/concurrency.rs`：并发策略回归测试，覆盖“无吞吐证据不分片”“空闲槽位不盲目补位”“接近完成不继续切分”“按剩余工作量而非原始尺寸选目标”等行为。
 - `tests/chunk.rs`：分片下载成功/失败路径，以及保留中的 bisect 行为测试骨架。
 - `tests/util.rs`：文件信息探测回退链路、写入任务和基础工具行为。

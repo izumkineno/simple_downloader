@@ -8,49 +8,108 @@ use std::collections::HashMap;
 
 const BLACKLIST_THRESHOLD: u32 = 3;
 
+/// 多源调度中 lane 的建模维度。
+///
+/// - `PerSource`: 每个源一个 lane（默认），同一源的所有 chunk 共享该源的 `Client`。
+/// - `PerSourceProxy`: 每个 `源×代理` 组合一个 lane，需启用 `proxy` feature。
+///
+/// 配合 `MultiSourceConfig::with_lane_model()` 使用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaneModel {
+    /// 按源维度调度（默认）。
     PerSource,
+    /// 按源×代理维度调度，需 `proxy` feature。
     #[cfg(feature = "proxy")]
     PerSourceProxy,
 }
 
+/// lane 健康状态（内部调度使用，导出供调试/观测）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaneHealth {
+    /// 健康，可继续分配 chunk。
     Healthy,
+    /// 已黑名单（连续失败 `>= BLACKLIST_THRESHOLD=3`），调度器将跳过。
     Blacklisted,
 }
 
+/// 代理配置（需 `proxy` feature）。
+///
+/// # 示例
+///
+/// ```no_run
+/// # #[cfg(feature = "proxy")]
+/// # {
+/// use simple_downloader::ProxyConfig;
+/// let p = ProxyConfig::http("http://proxy.example.com:8080").unwrap()
+///     .with_id("proxy-1");
+/// # }
+/// ```
 #[cfg(feature = "proxy")]
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
+    /// 代理唯一标识
     pub id: FastStr,
+    /// 代理 URL，如 `http://host:port` / `socks5://host:port`
     pub url: FastStr,
 }
 
+
 #[cfg(feature = "proxy")]
 impl ProxyConfig {
+    /// 创建代理配置，`id` 默认为 `proxy-{url}`。
     pub fn new(url: impl Into<FastStr>) -> Self {
         let url = url.into();
         let id = FastStr::from_string(format!("proxy-{}", url));
         Self { id, url }
     }
 
+    /// 覆盖代理 `id`。
     pub fn with_id(mut self, id: impl Into<FastStr>) -> Self {
         self.id = id.into();
         self
     }
+
+    /// 快捷构造 HTTP 代理（等价 `new`）。
+    pub fn http(url: impl Into<FastStr>) -> Result<Self> { Ok(Self::new(url)) }
+    /// 快捷构造 HTTPS 代理。
+    pub fn https(url: impl Into<FastStr>) -> Result<Self> { Ok(Self::new(url)) }
+    /// 快捷构造 SOCKS5 代理。
+    pub fn socks5(url: impl Into<FastStr>) -> Result<Self> { Ok(Self::new(url)) }
 }
 
+/// 单个下载源配置。
+///
+/// 最小调用：
+///
+/// ```no_run
+/// use simple_downloader::SourceConfig;
+/// let s = SourceConfig::new("https://mirror.example.com/file.bin")
+///     .with_id("mirror-1");
+/// ```
+///
+/// 代理（需 `proxy` feature）：
+///
+/// ```no_run
+/// # #[cfg(feature = "proxy")]
+/// # {
+/// use simple_downloader::{SourceConfig, ProxyConfig};
+/// let s = SourceConfig::new("https://example.com/file.bin")
+///     .with_proxies(vec![ProxyConfig::http("http://proxy:8080").unwrap()]);
+/// # }
+/// ```
 #[derive(Debug, Clone)]
 pub struct SourceConfig {
+    /// 源唯一标识，默认 `source-{url}`
     pub id: FastStr,
+    /// 源 URL
     pub url: FastStr,
+    /// 该源绑定的代理列表（需 `proxy` feature）
     #[cfg(feature = "proxy")]
     pub proxies: Vec<ProxyConfig>,
 }
 
 impl SourceConfig {
+    /// 创建源配置。
     pub fn new(url: impl Into<FastStr>) -> Self {
         let url = url.into();
         let id = FastStr::from_string(format!("source-{}", url));
@@ -62,11 +121,13 @@ impl SourceConfig {
         }
     }
 
+    /// 覆盖源 `id`（用于日志/统计辨识）。
     pub fn with_id(mut self, id: impl Into<FastStr>) -> Self {
         self.id = id.into();
         self
     }
 
+    /// 为该源绑定代理列表（需 `proxy` feature）。
     #[cfg(feature = "proxy")]
     pub fn with_proxies(mut self, proxies: Vec<ProxyConfig>) -> Self {
         self.proxies = proxies;
@@ -74,18 +135,41 @@ impl SourceConfig {
     }
 }
 
+/// 多源下载配置聚合。
+///
+/// # 示例
+///
+/// ```no_run
+/// use simple_downloader::{MultiSourceConfig, SourceConfig, LaneModel};
+/// let cfg = MultiSourceConfig::new("output.bin", 32, 0.5)
+///     .with_sources(vec![
+///         SourceConfig::new("https://mirror1.example.com/file.bin").with_id("m1"),
+///         SourceConfig::new("https://mirror2.example.com/file.bin"),
+///     ])
+///     .with_lane_model(LaneModel::PerSource)
+///     .with_max_chunks_per_lane(2)
+///     .with_max_chunks_per_source(Some(8));
+/// ```
 #[derive(Debug, Clone)]
 pub struct MultiSourceConfig {
+    /// 输出文件路径
     pub output_path: FastStr,
+    /// 总并发上限，受 §11 自动降级约束
     pub workers: u64,
+    /// `MonitorUpdate` 广播间隔（秒）
     pub update_interval: f64,
+    /// 源列表
     pub sources: Vec<SourceConfig>,
+    /// lane 建模维度
     pub lane_model: LaneModel,
+    /// 每个 lane 最大并发 chunk 数
     pub max_chunks_per_lane: usize,
+    /// 每个源最大并发 chunk 数（`None` 不限）
     pub max_chunks_per_source: Option<usize>,
 }
 
 impl MultiSourceConfig {
+    /// 创建多源配置，`workers` 会在内部 `max(1, workers)`，`lane_model` 默认 `PerSource`。
     pub fn new(output_path: impl Into<FastStr>, workers: u64, update_interval: f64) -> Self {
         Self {
             output_path: output_path.into(),
@@ -98,21 +182,25 @@ impl MultiSourceConfig {
         }
     }
 
+    /// 注入源列表。
     pub fn with_sources(mut self, sources: Vec<SourceConfig>) -> Self {
         self.sources = sources;
         self
     }
 
+    /// 设置 lane 建模维度。
     pub fn with_lane_model(mut self, lane_model: LaneModel) -> Self {
         self.lane_model = lane_model;
         self
     }
 
+    /// 设置每个 lane 最大并发 chunk 数（`max(1, n)`）。
     pub fn with_max_chunks_per_lane(mut self, max_chunks_per_lane: usize) -> Self {
         self.max_chunks_per_lane = max_chunks_per_lane.max(1);
         self
     }
 
+    /// 设置每个源最大并发 chunk 数，`None` 表示不限。
     pub fn with_max_chunks_per_source(mut self, max_chunks_per_source: Option<usize>) -> Self {
         self.max_chunks_per_source = max_chunks_per_source;
         self

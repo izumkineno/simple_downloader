@@ -63,6 +63,8 @@
 - **需要代理**：打开 `proxy`
 - **需要 UI / 进度事件**：打开 `progress`
 
+> 完整调用形态见 [`docs/usage.md`](docs/usage.md)，`cargo doc` 见 `src/lib.rs`  crate 文档。
+
 ### 待实现的功能 (TODO List)
 
 目标：实现一个开箱即用、自带断点续传、任务队列、对接入 UI 友好，能自适应下载的多源多线程下载库。下面按“已落地 / 待完善”同步当前状态。

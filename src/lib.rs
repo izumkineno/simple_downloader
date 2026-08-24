@@ -11,85 +11,135 @@
 //! - ✅ **两级重试机制**：针对网络错误和 chunk 下载失败自动重试
 //! - ✅ **灵活配置**：通过 Builder 模式自定义各种下载参数
 //!
-//! ## 功能模块
+//! ## 功能模块（以 `Cargo.toml:6-11` 为准）
 //!
-//! 本库通过 feature flags 来启用可选功能，默认启用所有功能：
+//! | Feature | 默认 | 描述 | 启用后新增 API |
+//! |---|:---:|---|---|
+//! | _(none)_ | ✅ | 基础单源多线程下载 | `Downloader::builder().download()` |
+//! | `resume` | ❌ | 断点续传、sidecar `*.download.bitcode` | `DownloadBuilder::resume()`, `Downloader::with_resume()`, `ResumeMetadata` 等 |
+//! | `progress` | ❌ | 进度事件与回调 | `DownloadInfo`, `Downloader::run()`, `DownloadBuilder::run()` |
+//! | `multi-source` | ❌ | 多源调度建模 | `MultiSourceConfig`, `SourceConfig`, `LaneModel`, `Downloader::new_multi()` |
+//! | `proxy` | ❌ | 代理 lane 建模（隐含 `multi-source`） | `ProxyConfig`, `SourceConfig::with_proxies()` |
 //!
-//! | Feature | 默认启用 | 描述 |
-//! |---------|---------|------|
-//! | `resume` | ✅ | 断点续传功能 |
-//! | `progress` | ✅ | 下载进度监控功能 |
-//! | `proxy` | ✅ | 代理支持功能 |
-//! | `multi-source` | ✅ | 多源下载功能 |
+//! 完整调用形态见 [`docs/usage.md`](https://github.com/simple_downloader/docs/usage.md)（仓库内 `docs/usage.md`），
+//! 配置项见 `docs/configuration.md`，错误全表见 `docs/errors.md`。
 //!
-//! # 快速开始
+//! ## 安装
 //!
-//! ## 基础下载
+//! ```toml
+//! # 最轻量：仅基础下载
+//! simple_downloader = { version = "0.1", default-features = false }
+//! # 常用：基础 + 断点续传 + 进度
+//! simple_downloader = { version = "0.1", default-features = false, features = ["resume", "progress"] }
+//! # 全功能
+//! simple_downloader = { version = "0.1", default-features = false, features = ["resume", "progress", "multi-source", "proxy"] }
+//! ```
+//!
+//! ## 快速开始
+//!
+//! ### 基础下载（无需任何 feature）
 //!
 //! ```no_run
 //! use simple_downloader::Downloader;
 //!
 //! #[tokio::main]
-//! async fn main() {
-//!     match Downloader::builder(
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     Downloader::builder(
 //!         "https://proof.ovh.net/files/100Mio.dat", // 下载链接
 //!         "100Mio.dat",                             // 保存路径
 //!     )
-//!     .workers(16) // 设置并发线程数
+//!     .workers(16) // 并发上限，受服务器 Range/文件大小自动降级约束
 //!     .download()
-//!     .await
-//!     {
-//!         Ok(_) => println!("下载成功！"),
-//!         Err(e) => eprintln!("下载失败: {}", e),
-//!     }
+//!     .await?;
+//!     Ok(())
 //! }
 //! ```
 //!
-//! ## 带进度监控的下载
+//! ### 带进度监控的下载（需 `progress`）
 //!
 //! ```no_run
 //! use simple_downloader::{Downloader, DownloadInfo};
-//! use tokio::runtime::Runtime;
 //!
 //! #[tokio::main]
-//! async fn main() {
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     Downloader::builder("https://proof.ovh.net/files/100Mio.dat", "100Mio.dat")
 //!         .workers(16)
 //!         .run(|total_size, mut info_rx| async move {
 //!             println!("文件总大小: {} bytes", total_size);
 //!             while let Ok(info) = info_rx.recv().await {
-//!                 println!(
-//!                     "已下载: {}/{} bytes, 速度: {:.2} MB/s, 进度: {:.1}%",
-//!                     info.downloaded_bytes(),
-//!                     total_size,
-//!                     info.speed_mbps(),
-//!                     info.progress_percent()
-//!                 );
+//!                 // 仅 MonitorUpdate 携带可聚合进度，见 DownloadInfo 文档
+//!                 if let DownloadInfo::MonitorUpdate { .. } = &info {
+//!                     println!(
+//!                         "已下载: {}/{} bytes, 速度: {:.2} MB/s, 进度: {:.1}%",
+//!                         info.downloaded_bytes(),
+//!                         total_size,
+//!                         info.speed_mbps(),
+//!                         info.progress_percent()
+//!                     );
+//!                 }
 //!             }
 //!         })
-//!         .await
-//!         .unwrap();
+//!         .await?;
+//!     Ok(())
 //! }
 //! ```
 //!
-//! ## 多源下载
+//! ### 多源下载（需 `multi-source`）
 //!
 //! ```no_run
 //! use simple_downloader::{Downloader, MultiSourceConfig, SourceConfig};
 //!
 //! #[tokio::main]
-//! async fn main() {
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let config = MultiSourceConfig::new("output.bin", 32, 0.5)
 //!         .with_sources(vec![
-//!             SourceConfig::new("https://mirror1.example.com/file.bin"),
-//!             SourceConfig::new("https://mirror2.example.com/file.bin"),
-//!             SourceConfig::new("https://mirror3.example.com/file.bin"),
+//!             SourceConfig::new("https://mirror1.example.com/file.bin").with_id("m1"),
+//!             SourceConfig::new("https://mirror2.example.com/file.bin").with_id("m2"),
 //!         ]);
+//!     Downloader::new_multi(config, Default::default).download().await?;
+//!     Ok(())
+//! }
+//! ```
 //!
-//!     Downloader::new_multi(config, Default::default)
+//! ### 断点续传（需 `resume`）
+//!
+//! ```no_run
+//! use simple_downloader::Downloader;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     // 默认启用：同目录下 output.bin + output.bin.download.bitcode 自动恢复
+//!     Downloader::builder("https://example.com/large.bin", "large.bin")
+//!         .workers(16)
 //!         .download()
-//!         .await
-//!         .unwrap();
+//!         .await?;
+//!     // 显式禁用
+//!     Downloader::builder("https://example.com/large.bin", "large.bin")
+//!         .resume(false)
+//!         .download()
+//!         .await?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ### 自定义 HTTP 客户端
+//!
+//! ```no_run
+//! use simple_downloader::Downloader;
+//! use reqwest::ClientBuilder;
+//! use std::time::Duration;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     Downloader::builder("https://example.com/file.bin", "output.bin")
+//!         .client_builder(|| {
+//!             ClientBuilder::new()
+//!                 .timeout(Duration::from_secs(120))
+//!                 .connect_timeout(Duration::from_secs(10))
+//!         })
+//!         .download()
+//!         .await?;
+//!     Ok(())
 //! }
 //! ```
 
