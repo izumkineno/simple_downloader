@@ -415,13 +415,14 @@ where
                 DownloadMode::Multi(config) => {
                     let (file_size, runtime) =
                         MultiRuntime::from_config(config, &self.client_builder).await?;
+                    let support_ranges = runtime.supports_ranges;
                     let (client, download_url) = runtime
                         .best_lane_runtime()
                         .map(|lane| (lane.client.clone(), lane.url.clone()))
                         .expect("validated multi-source runtime must contain a lane");
                     (
                         file_size,
-                        true,
+                        support_ranges,
                         config.output_path.clone(),
                         client,
                         download_url,

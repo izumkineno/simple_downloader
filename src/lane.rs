@@ -435,6 +435,7 @@ pub struct MultiRuntime {
     scheduler: LaneScheduler,
     runtimes: HashMap<FastStr, Vec<LaneRuntime>>,
     next_runtime_index: HashMap<FastStr, usize>,
+    pub supports_ranges: bool,
 }
 
 impl MultiRuntime {
@@ -446,7 +447,6 @@ impl MultiRuntime {
         F: Fn() -> ClientBuilder,
     {
         let expanded = expand_lanes(config, client_builder)?;
-        // 并行探测各源，显著降低多源冷启动延迟（3 源串行 300ms → 并行 ~120ms）
         let mut probe_futs = FuturesUnordered::new();
         for runtime in expanded {
             let url = runtime.url.clone();
@@ -456,42 +456,89 @@ impl MultiRuntime {
                 (runtime, res)
             });
         }
-        let mut detected_file_size = None;
-        let mut runtimes: HashMap<FastStr, Vec<LaneRuntime>> = HashMap::new();
-        let mut candidates = Vec::new();
+        let mut range_file_size = None;
+        let mut fallback_file_size = None;
+        let mut range_runtimes: HashMap<FastStr, Vec<LaneRuntime>> = HashMap::new();
+        let mut fallback_runtimes: HashMap<FastStr, Vec<LaneRuntime>> = HashMap::new();
+        let mut range_candidates = Vec::new();
+        let mut fallback_candidates = Vec::new();
 
         while let Some((mut runtime, res)) = probe_futs.next().await {
             match res {
-                Ok((file_size, support_ranges)) if support_ranges => {
-                    if let Some(expected) = detected_file_size {
-                        if expected != file_size {
+                Ok((file_size, support_ranges)) => {
+                    if support_ranges {
+                        if let Some(expected) = range_file_size {
+                            if expected != file_size {
+                                continue;
+                            }
+                        } else {
+                            range_file_size = Some(file_size);
+                            // 若此前已收集 fallback 但文件大小不一致，清空 fallback 以避免混用
+                            if let Some(fb) = fallback_file_size {
+                                if fb != file_size {
+                                    fallback_candidates.clear();
+                                    fallback_runtimes.clear();
+                                    fallback_file_size = None;
+                                }
+                            }
+                        }
+                        runtime.probe_speed = 1.0;
+                        range_candidates.push(LaneCandidate {
+                            lane_id: runtime.lane_id.clone(),
+                            source_id: runtime.source_id.clone(),
+                            proxy_id: runtime.proxy_id.clone(),
+                            probe_speed: runtime.probe_speed,
+                        });
+                        range_runtimes
+                            .entry(runtime.lane_id.clone())
+                            .or_default()
+                            .push(runtime);
+                    } else {
+                        // 非 Range 仅作为 fallback：仅在无 Range 可用时启用
+                        if range_file_size.is_some() {
                             continue;
                         }
-                    } else {
-                        detected_file_size = Some(file_size);
+                        if let Some(expected) = fallback_file_size {
+                            if expected != file_size {
+                                continue;
+                            }
+                        } else {
+                            fallback_file_size = Some(file_size);
+                        }
+                        runtime.probe_speed = 1.0;
+                        fallback_candidates.push(LaneCandidate {
+                            lane_id: runtime.lane_id.clone(),
+                            source_id: runtime.source_id.clone(),
+                            proxy_id: runtime.proxy_id.clone(),
+                            probe_speed: runtime.probe_speed,
+                        });
+                        fallback_runtimes
+                            .entry(runtime.lane_id.clone())
+                            .or_default()
+                            .push(runtime);
                     }
-                    // NOTE: 当前探测阶段仅校验可用性，未做真实带宽采样；
-                    // 统一置为 1.0，调度退化为按配置顺序 + 健康度/容量选择，
-                    // 后续可在此处加入 Range 采样或历史吞吐评分
-                    runtime.probe_speed = 1.0;
-                    candidates.push(LaneCandidate {
-                        lane_id: runtime.lane_id.clone(),
-                        source_id: runtime.source_id.clone(),
-                        proxy_id: runtime.proxy_id.clone(),
-                        probe_speed: runtime.probe_speed,
-                    });
-                    runtimes
-                        .entry(runtime.lane_id.clone())
-                        .or_default()
-                        .push(runtime);
                 }
                 _ => {}
             }
         }
-        let file_size = detected_file_size.ok_or(DownloadError::NoAvailableSources)?;
-        if candidates.is_empty() {
-            return Err(DownloadError::NoAvailableSources);
-        }
+        let (file_size, supports_ranges, runtimes, candidates) =
+            if !range_candidates.is_empty() {
+                (
+                    range_file_size.ok_or(DownloadError::NoAvailableSources)?,
+                    true,
+                    range_runtimes,
+                    range_candidates,
+                )
+            } else if !fallback_candidates.is_empty() {
+                (
+                    fallback_file_size.ok_or(DownloadError::NoAvailableSources)?,
+                    false,
+                    fallback_runtimes,
+                    fallback_candidates,
+                )
+            } else {
+                return Err(DownloadError::NoAvailableSources);
+            };
 
         let scheduler = LaneScheduler::from_candidates(
             candidates,
@@ -507,6 +554,7 @@ impl MultiRuntime {
                 scheduler,
                 runtimes,
                 next_runtime_index: HashMap::new(),
+                supports_ranges,
             },
         ))
     }
