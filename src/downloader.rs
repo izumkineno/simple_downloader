@@ -34,6 +34,9 @@ type ProgressHandler =
 
 fn default_client_builder() -> ClientBuilder {
     ClientBuilder::new()
+        .pool_max_idle_per_host(32)
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .tcp_keepalive(std::time::Duration::from_secs(60))
 }
 
 fn default_workers() -> u64 {
@@ -393,7 +396,11 @@ where
         let (file_size, support_ranges, writer_path, client, download_url, workers, multi_runtime) =
             match &self.mode {
                 DownloadMode::Single(config) => {
-                    let client = (self.client_builder)().build()?;
+                    let client = (self.client_builder)()
+                        .pool_max_idle_per_host(32)
+                        .pool_idle_timeout(std::time::Duration::from_secs(90))
+                        .tcp_keepalive(std::time::Duration::from_secs(60))
+                        .build()?;
                     let (file_size, support_ranges) = get_file_info(&client, &config.url).await?;
                     (
                         file_size,

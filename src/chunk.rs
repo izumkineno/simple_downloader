@@ -4,6 +4,7 @@ use crate::types::{ChunkId, DownloadCmd, DownloadInfo};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::RequestBuilder;
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 
 /// 定义一个块（chunk）的最小尺寸。
@@ -46,6 +47,11 @@ pub async fn chunk_run(
     let mut end = end_byte;
     let mut offset = start_byte;
     let mut failed = false;
+    // 节流：64KiB 或 50ms 聚合一次，避免高频 broadcast 导致 Lagged
+    const PROGRESS_THROTTLE_BYTES: u64 = 64 * 1024;
+    const PROGRESS_THROTTLE_INTERVAL: Duration = Duration::from_millis(50);
+    let mut last_progress = Instant::now();
+    let mut last_reported = 0u64; // 已上报的 downloaded
 
     // 构建 Range 请求头
     let range_header = format!("bytes={start_byte}-{end_byte}");
@@ -134,17 +140,26 @@ pub async fn chunk_run(
                         failed = true;
                         break;
                     }
-
                     // 更新当前下载偏移量
                     offset = offset.saturating_add(write_len);
 
-                    // 广播进度更新
-                    let _ = bd_tx.send(DownloadInfo::ChunkProgress {
-                        id,
-                        start_byte,
-                        end_byte: end,
-                        downloaded: offset.saturating_sub(start_byte),
-                    });
+                    // 节流广播：仅当累积足够或超时或到达边界时发送，避免高频 Lagged
+                    let downloaded = offset.saturating_sub(start_byte);
+                    let should_send = downloaded.saturating_sub(last_reported)
+                        >= PROGRESS_THROTTLE_BYTES
+                        || last_progress.elapsed() >= PROGRESS_THROTTLE_INTERVAL
+                        || offset >= end
+                        || write_len < remaining_chunk_len;
+                    if should_send {
+                        let _ = bd_tx.send(DownloadInfo::ChunkProgress {
+                            id,
+                            start_byte,
+                            end_byte: end,
+                            downloaded,
+                        });
+                        last_reported = downloaded;
+                        last_progress = Instant::now();
+                    }
 
                     // 如果写入的数据小于接收到的数据块，说明已到达当前块的边界，终止下载
                     if write_len < remaining_chunk_len {
@@ -165,8 +180,17 @@ pub async fn chunk_run(
             else => break,
         }
     }
-
+    // 收尾：若最后一段被节流未发送，补一次最终进度，避免 Monitor 统计低估
     if !failed {
+        let final_downloaded = offset.saturating_sub(start_byte);
+        if final_downloaded != last_reported {
+            let _ = bd_tx.send(DownloadInfo::ChunkProgress {
+                id,
+                start_byte,
+                end_byte: end,
+                downloaded: final_downloaded,
+            });
+        }
         // 如果没有发生失败，则广播下载完成消息
         let _ = bd_tx.send(DownloadInfo::DownloadComplete(id));
     }

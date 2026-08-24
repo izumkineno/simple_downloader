@@ -10,9 +10,9 @@ use bitcode::{Decode, Encode};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-
 pub const DEFAULT_SEGMENT_SIZE: u64 = 64 * 1024;
 const METADATA_VERSION: u32 = 1;
 const RESUME_EXTENSION: &str = "download.bitcode";
@@ -245,6 +245,8 @@ pub struct ResumeRecorder {
     metadata_path: PathBuf,
     metadata: ResumeMetadata,
     covered_ranges: Vec<Vec<(u64, u64)>>,
+    pending_segments: usize,
+    last_save: Instant,
 }
 
 impl ResumeRecorder {
@@ -264,6 +266,8 @@ impl ResumeRecorder {
             metadata_path,
             metadata,
             covered_ranges,
+            pending_segments: 0,
+            last_save: Instant::now(),
         }
     }
 
@@ -273,7 +277,7 @@ impl ResumeRecorder {
         }
         let write_start = offset;
         let write_end = offset.saturating_add(len).saturating_sub(1);
-        let mut changed = false;
+        let mut newly_completed = 0usize;
 
         for index in self.segment_indexes_for_range(write_start, write_end) {
             if self.metadata.segments[index].hash.is_some() {
@@ -287,12 +291,29 @@ impl ResumeRecorder {
             if covers_segment(&self.covered_ranges[index], segment.start, segment.end) {
                 let bytes = read_segment(file, segment.start, segment.len()).await?;
                 self.metadata.segments[index].hash = Some(hash_bytes(&bytes));
-                changed = true;
+                newly_completed += 1;
             }
         }
 
-        if changed {
+        if newly_completed > 0 {
+            self.pending_segments += newly_completed;
+            let should_flush =
+                self.pending_segments >= 16 || self.last_save.elapsed() >= Duration::from_secs(1);
+            if should_flush {
+                self.metadata.save_atomic_async(&self.metadata_path).await?;
+                self.pending_segments = 0;
+                self.last_save = Instant::now();
+            }
+        }
+        Ok(())
+    }
+
+    /// 强制落盘，供 writer 退出前调用以避免最后 1MiB 窗口丢失（当前 downloader 成功后会删除 sidecar，失败/中断场景下保证最多丢 16 段）
+    pub async fn flush(&mut self) -> Result<()> {
+        if self.pending_segments > 0 {
             self.metadata.save_atomic_async(&self.metadata_path).await?;
+            self.pending_segments = 0;
+            self.last_save = Instant::now();
         }
         Ok(())
     }

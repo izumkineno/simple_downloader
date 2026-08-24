@@ -136,33 +136,84 @@ async fn file_writer_task_impl(
     // 预分配文件大小，防止磁盘空间不足，并可能提高写入性能
     file.set_len(size).await?;
 
-    // 异步执行文件写入循环
+    // 异步执行文件写入循环（带相邻段合并，128KiB 限）
     let writer_handle = tokio::spawn(async move {
+        let mut pending: Option<(u64, Vec<u8>)> = None;
+        const COALESCE_LIMIT: usize = 128 * 1024;
+
         while let Some(command) = rx.recv().await {
             match command {
                 DownloadCmd::WriteFile { offset, data } => {
-                    #[cfg(feature = "resume")]
-                    let len = data.len() as u64;
-                    // 移动到指定偏移量并写入数据
-                    if file.seek(io::SeekFrom::Start(offset)).await.is_err()
-                        || file.write_all(&data).await.is_err()
-                    {
-                        eprintln!("[FileWriter] 写入文件失败！");
-                        break; // 发生错误时退出
+                    let data_len = data.len();
+                    let can_coalesce = if let Some((p_off, p_buf)) = pending.as_ref() {
+                        p_off + p_buf.len() as u64 == offset
+                            && p_buf.len() + data_len <= COALESCE_LIMIT
+                    } else {
+                        false
+                    };
+                    if can_coalesce {
+                        if let Some((_, p_buf)) = pending.as_mut() {
+                            p_buf.extend_from_slice(&data);
+                        }
+                        continue;
                     }
-                    #[cfg(feature = "resume")]
-                    if let Some(recorder) = resume_recorder.as_mut()
-                        && let Err(error) = recorder.record_write(&mut file, offset, len).await
-                    {
-                        eprintln!("[FileWriter] 更新断点续传元数据失败: {error}");
-                        break;
+                    // 先落盘之前的 pending
+                    if let Some((p_off, p_buf)) = pending.take() {
+                        if file.seek(io::SeekFrom::Start(p_off)).await.is_err()
+                            || file.write_all(&p_buf).await.is_err()
+                        {
+                            eprintln!("[FileWriter] 写入文件失败！");
+                            break;
+                        }
+                        #[cfg(feature = "resume")]
+                        if let Some(recorder) = resume_recorder.as_mut()
+                            && let Err(e) = recorder
+                                .record_write(&mut file, p_off, p_buf.len() as u64)
+                                .await
+                        {
+                            eprintln!("[FileWriter] 更新断点续传元数据失败: {e}");
+                            break;
+                        }
                     }
+                    pending = Some((offset, data.to_vec()));
                 }
-                DownloadCmd::TerminateAll => break, // 收到终止命令时退出
+                DownloadCmd::TerminateAll => {
+                    if let Some((p_off, p_buf)) = pending.take() {
+                        if file.seek(io::SeekFrom::Start(p_off)).await.is_err()
+                            || file.write_all(&p_buf).await.is_err()
+                        {
+                            eprintln!("[FileWriter] 写入文件失败！");
+                        } else {
+                            #[cfg(feature = "resume")]
+                            if let Some(recorder) = resume_recorder.as_mut() {
+                                let _ = recorder
+                                    .record_write(&mut file, p_off, p_buf.len() as u64)
+                                    .await;
+                            }
+                        }
+                    }
+                    break;
+                }
                 _ => {}
             }
         }
-        // 任务结束前确保所有缓冲数据都已写入磁盘
+        // 通道关闭：落盘剩余 pending
+        if let Some((p_off, p_buf)) = pending.take() {
+            if file.seek(io::SeekFrom::Start(p_off)).await.is_ok()
+                && file.write_all(&p_buf).await.is_ok()
+            {
+                #[cfg(feature = "resume")]
+                if let Some(recorder) = resume_recorder.as_mut() {
+                    let _ = recorder
+                        .record_write(&mut file, p_off, p_buf.len() as u64)
+                        .await;
+                }
+            }
+        }
+        #[cfg(feature = "resume")]
+        if let Some(recorder) = resume_recorder.as_mut() {
+            let _ = recorder.flush().await;
+        }
         let _ = file.flush().await;
     });
 
