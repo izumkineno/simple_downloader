@@ -51,7 +51,7 @@ async fn assert_all_servers_served_ranges(
 
 #[test]
 fn per_source_lane_model_shares_capacity_across_proxies() {
-    let scheduler = LaneScheduler::from_candidates(
+    let mut scheduler = LaneScheduler::from_candidates(
         vec![
             LaneCandidate::new("lane-a", "source-a", None::<&str>, 120.0),
             LaneCandidate::new("lane-b", "source-a", Some("proxy-b"), 90.0),
@@ -71,7 +71,6 @@ fn per_source_lane_model_shares_capacity_across_proxies() {
     assert!(first.as_str() == "source-a");
     assert!(second.as_str() == "source-a");
 
-    let mut scheduler = scheduler;
     scheduler.assign_chunk(first.clone());
     scheduler.assign_chunk(second.clone());
 

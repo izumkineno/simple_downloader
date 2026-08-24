@@ -253,7 +253,7 @@ impl DownloadInfo {
                 total_downloaded,
                 ..
             } => *total_downloaded >= *total_size,
-        _ => false,
+            _ => false,
         }
     }
 }

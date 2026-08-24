@@ -494,81 +494,78 @@ impl MultiRuntime {
         let mut fallback_candidates = Vec::new();
 
         while let Some((mut runtime, res)) = probe_futs.next().await {
-            match res {
-                Ok((file_size, support_ranges)) => {
-                    if support_ranges {
-                        if let Some(expected) = range_file_size {
-                            if expected != file_size {
-                                continue;
-                            }
-                        } else {
-                            range_file_size = Some(file_size);
-                            // 若此前已收集 fallback 但文件大小不一致，清空 fallback 以避免混用
-                            if let Some(fb) = fallback_file_size {
-                                if fb != file_size {
-                                    fallback_candidates.clear();
-                                    fallback_runtimes.clear();
-                                    fallback_file_size = None;
-                                }
-                            }
+            let Ok((file_size, support_ranges)) = res else {
+                continue;
+            };
+            if support_ranges {
+                if let Some(expected) = range_file_size {
+                    if expected != file_size {
+                        continue;
+                    }
+                } else {
+                    range_file_size = Some(file_size);
+                    // 若此前已收集 fallback 但文件大小不一致，清空 fallback 以避免混用
+                    if let Some(fb) = fallback_file_size {
+                        if fb != file_size {
+                            fallback_candidates.clear();
+                            fallback_runtimes.clear();
+                            fallback_file_size = None;
                         }
-                        runtime.probe_speed = 1.0;
-                        range_candidates.push(LaneCandidate {
-                            lane_id: runtime.lane_id.clone(),
-                            source_id: runtime.source_id.clone(),
-                            proxy_id: runtime.proxy_id.clone(),
-                            probe_speed: runtime.probe_speed,
-                        });
-                        range_runtimes
-                            .entry(runtime.lane_id.clone())
-                            .or_default()
-                            .push(runtime);
-                    } else {
-                        // 非 Range 仅作为 fallback：仅在无 Range 可用时启用
-                        if range_file_size.is_some() {
-                            continue;
-                        }
-                        if let Some(expected) = fallback_file_size {
-                            if expected != file_size {
-                                continue;
-                            }
-                        } else {
-                            fallback_file_size = Some(file_size);
-                        }
-                        runtime.probe_speed = 1.0;
-                        fallback_candidates.push(LaneCandidate {
-                            lane_id: runtime.lane_id.clone(),
-                            source_id: runtime.source_id.clone(),
-                            proxy_id: runtime.proxy_id.clone(),
-                            probe_speed: runtime.probe_speed,
-                        });
-                        fallback_runtimes
-                            .entry(runtime.lane_id.clone())
-                            .or_default()
-                            .push(runtime);
                     }
                 }
-                _ => {}
+                runtime.probe_speed = 1.0;
+                range_candidates.push(LaneCandidate {
+                    lane_id: runtime.lane_id.clone(),
+                    source_id: runtime.source_id.clone(),
+                    proxy_id: runtime.proxy_id.clone(),
+                    probe_speed: runtime.probe_speed,
+                });
+                range_runtimes
+                    .entry(runtime.lane_id.clone())
+                    .or_default()
+                    .push(runtime);
+            } else {
+                // 非 Range 仅作为 fallback：仅在无 Range 可用时启用
+                if range_file_size.is_some() {
+                    continue;
+                }
+                if let Some(expected) = fallback_file_size {
+                    if expected != file_size {
+                        continue;
+                    }
+                } else {
+                    fallback_file_size = Some(file_size);
+                }
+                runtime.probe_speed = 1.0;
+                fallback_candidates.push(LaneCandidate {
+                    lane_id: runtime.lane_id.clone(),
+                    source_id: runtime.source_id.clone(),
+                    proxy_id: runtime.proxy_id.clone(),
+                    probe_speed: runtime.probe_speed,
+                });
+                fallback_runtimes
+                    .entry(runtime.lane_id.clone())
+                    .or_default()
+                    .push(runtime);
             }
         }
-        let (file_size, supports_ranges, runtimes, candidates) =
-            if !range_candidates.is_empty() {
-                (
-                    range_file_size.ok_or(DownloadError::NoAvailableSources)?,
-                    true,
-                    range_runtimes,
-                    range_candidates,
-                )
-            } else if !fallback_candidates.is_empty() {
-                (
-                    fallback_file_size.ok_or(DownloadError::NoAvailableSources)?,
-                    false,
-                    fallback_runtimes,
-                    fallback_candidates,
-                )
-            } else {
-                return Err(DownloadError::NoAvailableSources);
-            };
+        let (file_size, supports_ranges, runtimes, candidates) = if !range_candidates.is_empty() {
+            (
+                range_file_size.ok_or(DownloadError::NoAvailableSources)?,
+                true,
+                range_runtimes,
+                range_candidates,
+            )
+        } else if !fallback_candidates.is_empty() {
+            (
+                fallback_file_size.ok_or(DownloadError::NoAvailableSources)?,
+                false,
+                fallback_runtimes,
+                fallback_candidates,
+            )
+        } else {
+            return Err(DownloadError::NoAvailableSources);
+        };
 
         let scheduler = LaneScheduler::from_candidates(
             candidates,
@@ -712,7 +709,6 @@ where
                 probe_speed: 0.0,
             });
         }
-
     }
 
     Ok(runtimes)

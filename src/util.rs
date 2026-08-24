@@ -23,8 +23,8 @@ use tokio::task::JoinHandle;
 /// # 返回
 /// 一个元组 `(u64, bool)`，分别代表文件总大小和服务器是否支持范围请求。
 pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
-    use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE};
     use reqwest::StatusCode;
+    use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE};
 
     // 记录 HEAD 探测结果，但不直接作为 Range 判定依据；Accept-Ranges 缺失时仍可能支持 Range
     let mut head_size: Option<u64> = None;
@@ -47,16 +47,37 @@ pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
         }
     }
 
-    // 2. 范围 GET 探测：以 206/ Content-Range 为金标准
-    let range_resp = client
+    // 2. 范围 GET 探测：以 206/ Content-Range 为金标准，失败则回退 HEAD 避免 501 误判
+    let range_resp = match client
         .get(url)
         .header("Range", "bytes=0-0")
         .send()
-        .await?
-        .error_for_status()?;
+        .await
+    {
+        Ok(resp) => resp,
+        Err(_) => {
+            if let Some(size) = head_size {
+                return Ok((size, head_support));
+            }
+            return Err(DownloadError::MissingContentLength);
+        }
+    };
 
     let status = range_resp.status();
     let headers = range_resp.headers();
+    if !status.is_success() && status != StatusCode::PARTIAL_CONTENT {
+        if let Some(size) = head_size {
+            return Ok((size, head_support));
+        }
+        // 无 HEAD 回退则尝试从 Range 响应的 Content-Length 兜底
+        if let Some(len_val) = headers.get(CONTENT_LENGTH)
+            && let Ok(len_str) = len_val.to_str()
+            && let Ok(content_length) = len_str.parse::<u64>()
+        {
+            return Ok((content_length, false));
+        }
+        return Err(DownloadError::MissingContentLength);
+    }
     if status == StatusCode::PARTIAL_CONTENT {
         if let Some(cr) = headers.get(CONTENT_RANGE)
             && let Ok(crs) = cr.to_str()
