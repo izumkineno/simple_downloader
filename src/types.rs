@@ -252,7 +252,14 @@ impl DownloadInfo {
                 total_size,
                 total_downloaded,
                 ..
-            } => *total_downloaded >= *total_size,
+            } => {
+                if *total_size == 0 {
+                    // 0 字节文件：0/0 完成；未知大小流式：0/N 未完成（由 DownloadComplete 判定）
+                    *total_downloaded == 0
+                } else {
+                    *total_downloaded >= *total_size
+                }
+            }
             _ => false,
         }
     }

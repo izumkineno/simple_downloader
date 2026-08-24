@@ -15,14 +15,16 @@ use crate::util::file_writer_task_with_resume;
 use crate::util::get_file_info;
 use faststr::FastStr;
 use futures_util::stream::FuturesUnordered;
+use futures_util::StreamExt;
 use reqwest::{Client, ClientBuilder};
-use std::future::Future;
 #[cfg(feature = "resume")]
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
+use std::time::{Duration, Instant};
 use tokio::spawn;
 use tokio::sync::{broadcast, mpsc};
+use tokio::time::interval;
 
 const MIN_PARALLEL_FILE_SIZE: u64 = 1024 * 1024; // 1 MiB：小于此值自动单线程，避免切片开销
 const CHANNEL_CAPACITY: usize = 4096; // 增大以容纳节流后 ~1.5k 进度 + 控制事件，避免 Lagged 丢 Failed/Complete
@@ -398,10 +400,20 @@ where
                 DownloadMode::Single(config) => {
                     let client = (self.client_builder)()
                         .pool_max_idle_per_host(32)
-                        .pool_idle_timeout(std::time::Duration::from_secs(90))
-                        .tcp_keepalive(std::time::Duration::from_secs(60))
+                        .pool_idle_timeout(Duration::from_secs(90))
+                        .tcp_keepalive(Duration::from_secs(60))
                         .build()?;
-                    let (file_size, support_ranges) = get_file_info(&client, &config.url).await?;
+                    let (file_size, support_ranges) = match get_file_info(&client, &config.url).await {
+                        Ok(v) => v,
+                        Err(DownloadError::MissingContentLength) => {
+                            let writer_path = config.output_path.clone();
+                            let download_url = config.url.clone();
+                            return self
+                                .streaming_download(client, download_url, writer_path, progress_handler)
+                                .await;
+                        }
+                        Err(e) => return Err(e),
+                    };
                     (
                         file_size,
                         support_ranges,
@@ -413,8 +425,29 @@ where
                     )
                 }
                 DownloadMode::Multi(config) => {
-                    let (file_size, mut runtime) =
-                        MultiRuntime::from_config(config, &self.client_builder).await?;
+                    let runtime_res = MultiRuntime::from_config(config, &self.client_builder).await;
+                    let (file_size, mut runtime) = match runtime_res {
+                        Ok(v) => v,
+                        Err(DownloadError::NoAvailableSources)
+                        | Err(DownloadError::MissingContentLength) => {
+                            // 多源探测失败，回退为单流流式下载（首源）
+                            if let Some(first) = config.sources.first() {
+                                let client = (self.client_builder)()
+                                    .pool_max_idle_per_host(32)
+                                    .pool_idle_timeout(Duration::from_secs(90))
+                                    .tcp_keepalive(Duration::from_secs(60))
+                                    .build()?;
+                                let writer_path = config.output_path.clone();
+                                let download_url = first.url.clone();
+                                return self
+                                    .streaming_download(client, download_url, writer_path, progress_handler)
+                                    .await;
+                            } else {
+                                return Err(DownloadError::NoAvailableSources);
+                            }
+                        }
+                        Err(e) => return Err(e),
+                    };
                     let support_ranges = runtime.supports_ranges;
                     let (client, download_url) = runtime
                         .best_lane_runtime()
@@ -503,6 +536,96 @@ where
         }
         Ok(())
     }
+    async fn streaming_download(
+        self,
+        client: Client,
+        url: FastStr,
+        writer_path: FastStr,
+        progress_handler: Option<ProgressHandler>,
+    ) -> Result<()> {
+        // 未知 Content-Length 时的流式回退：单流顺序写入，不预分配，不支持 Range/多源
+        let (writer_tx, writer_handle) = {
+            #[cfg(feature = "resume")]
+            {
+                crate::util::file_writer_task(writer_path.clone(), 0).await?
+            }
+            #[cfg(not(feature = "resume"))]
+            {
+                crate::util::file_writer_task(writer_path.clone(), 0).await?
+            }
+        };
+        let writer_shutdown_tx = writer_tx.clone();
+        if let Some(handler) = progress_handler {
+            spawn(handler(0, self.info_tx.subscribe()));
+        }
+        let resp = client.get(url.as_str()).send().await?.error_for_status()?;
+        let mut stream = resp.bytes_stream();
+        let mut offset = 0u64;
+        let mut total_downloaded = 0u64;
+        let mut ticker = interval(Duration::from_secs_f64(self.update_interval));
+        let mut last_tick = Instant::now();
+        let mut last_downloaded = 0u64;
+        loop {
+            tokio::select! {
+                biased;
+                chunk = stream.next() => match chunk {
+                    Some(Ok(bytes)) => {
+                        let len = bytes.len() as u64;
+                        if len == 0 {
+                            continue;
+                        }
+                        writer_tx
+                            .send(DownloadCmd::WriteFile { offset, data: bytes })
+                            .await
+                            .map_err(|_| {
+                                DownloadError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::BrokenPipe,
+                                    "writer closed",
+                                ))
+                            })?;
+                        offset += len;
+                        total_downloaded += len;
+                        let _ = self.info_tx.send(DownloadInfo::ChunkProgress {
+                            id: 0,
+                            start_byte: 0,
+                            end_byte: 0,
+                            downloaded: total_downloaded,
+                        });
+                    }
+                    Some(Err(e)) => return Err(DownloadError::Request(e)),
+                    None => break,
+                },
+                _ = ticker.tick() => {
+                    let elapsed = last_tick.elapsed().as_secs_f64();
+                    let speed = if elapsed > 0.0 {
+                        (total_downloaded - last_downloaded) as f64 / elapsed
+                    } else {
+                        0.0
+                    };
+                    last_tick = Instant::now();
+                    last_downloaded = total_downloaded;
+                    let _ = self.info_tx.send(DownloadInfo::MonitorUpdate {
+                        total_size: 0,
+                        total_downloaded,
+                        total_speed: speed,
+                        chunk_details: vec![(0, 0, total_downloaded, speed, 0)],
+                    });
+                }
+            }
+        }
+        let _ = writer_shutdown_tx.send(DownloadCmd::TerminateAll).await;
+        let _ = writer_handle.await;
+        let _ = self.cmd_tx.send(DownloadCmd::TerminateAll);
+        let _ = self.info_tx.send(DownloadInfo::MonitorUpdate {
+            total_size: total_downloaded,
+            total_downloaded,
+            total_speed: 0.0,
+            chunk_details: vec![],
+        });
+        let _ = self.info_tx.send(DownloadInfo::DownloadComplete(0));
+        Ok(())
+    }
+
 
     #[allow(clippy::too_many_arguments)]
     async fn orchestrate_downloads(

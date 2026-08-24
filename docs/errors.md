@@ -9,7 +9,7 @@
 | 网络请求错误 | `DownloadError::Request(reqwest::Error)` | HTTP 请求过程中发生的错误 | ✅ 大部分情况可重试 |
 | 文件 I/O 错误 | `DownloadError::Io(io::Error)` | 本地文件读写操作发生的错误 | ❌ 一般不可重试 |
 | 并发任务错误 | `DownloadError::Join(JoinError)` | 异步任务执行过程中发生的错误 | ✅ 可重试 |
-| 缺少长度错误 | `DownloadError::MissingContentLength` | 服务器未返回 Content-Length | ✅ 部分情况可重试 |
+| 缺少长度错误 | `DownloadError::MissingContentLength` | 服务器未返回 Content-Length（自动回退流式下载） | ✅ 自动回退，无需重试 |
 | 多源下载错误 | `DownloadError::NoAvailableSources` | 多源模式下无可用源 | ✅ 可重试 |
 | 断点续传错误 | `DownloadError::ResumeTargetMissing` / `ResumeMetadata(String)` | 断点续传相关错误 | ❌ 需清理后重试 |
 ## 详细错误说明
@@ -147,6 +147,8 @@ match result {
 
 **错误信息**：`无法从服务器响应头中获取文件大小 (Content-Length)`
 
+**行为变更（0.3.0+）**：`Downloader` 在 `HEAD` 与 `Range 0-0` 均无法获取大小时，不再直接返回 `Err(MissingContentLength)`，而是自动回退为 **单流流式下载**（`Transfer-Encoding: chunked` 场景），顺序写入、不预分配、不支持 Range/多源/断点续传，下载成功即视为完成。仅当流式 `GET` 亦失败时才透出该错误。
+
 **可能原因**：
 - 服务器不返回 Content-Length 响应头
 - 文件是动态生成的流，没有固定大小
@@ -154,20 +156,18 @@ match result {
 - 服务器配置错误或使用了反向代理丢失了头信息
 
 **处理建议**：
-1. 检查下载链接是否正确
-2. 尝试使用单线程下载：
+自 0.3.0 起无需特殊处理，`Downloader::builder(url, path).download().await` 会自动流式回退；如需禁用回退或自定义，可捕获该错误后自行处理：
 ```rust
-// 对于不支持 Content-Length 的服务器，使用单线程下载
-let downloader = Downloader::builder("https://example.com/stream.bin", "output.bin")
-    .workers(1) // 强制单线程
-    .download()
-    .await;
+match Downloader::builder("https://example.com/stream", "out.bin").download().await {
+    Err(simple_downloader::DownloadError::MissingContentLength) => {
+        eprintln!("服务器未返回大小且流式下载失败");
+    }
+    other => other.unwrap(),
+}
 ```
-3. 如果服务器支持 Range 请求，可以手动指定文件大小（如果已知）
 
 **重试策略**：
-- ✅ 可以尝试重试，但大概率仍然会出现相同错误
-- 需要调整下载策略，使用单线程下载
+- ✅ 0.3.0+ 自动流式回退，无需重试；若仍返回该错误，说明 HEAD、Range 探测与流式 GET 均失败，需检查网络/链接
 
 ---
 
