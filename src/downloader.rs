@@ -24,7 +24,7 @@ use std::sync::atomic::AtomicU64;
 use tokio::spawn;
 use tokio::sync::{broadcast, mpsc};
 
-const MIN_CHUNK_SIZE: u64 = 1024 * 1024; // 1 MB
+const MIN_PARALLEL_FILE_SIZE: u64 = 1024 * 1024; // 1 MiB：小于此值自动单线程，避免切片开销
 const CHANNEL_CAPACITY: usize = 1024;
 const DEFAULT_UPDATE_INTERVAL: f64 = 0.5;
 
@@ -481,13 +481,19 @@ where
             completed_bytes,
         )
         .await?;
-
         let _ = writer_shutdown_tx.send(DownloadCmd::TerminateAll).await;
         let _ = writer_handle.await;
         let _ = self.cmd_tx.send(DownloadCmd::TerminateAll);
+        #[cfg(feature = "resume")]
+        {
+            // 下载成功后清理 sidecar，避免下次启动做全量哈希校验
+            let meta_path = crate::resume::metadata_path_for(Path::new(&writer_path_string));
+            let _ = tokio::fs::remove_file(meta_path).await;
+        }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn orchestrate_downloads(
         &self,
         file_size: u64,
@@ -503,7 +509,7 @@ where
         let tasks = FuturesUnordered::new();
         let next_chunk_id = AtomicU64::new(0);
 
-        let workers = if !support_ranges || workers == 1 || file_size < MIN_CHUNK_SIZE {
+        let workers = if !support_ranges || workers == 1 || file_size < MIN_PARALLEL_FILE_SIZE {
             1
         } else {
             workers
@@ -591,10 +597,10 @@ fn split_resume_ranges(
         };
 
         let len = end.saturating_sub(start).saturating_add(1);
-        if len <= 1 {
+        // 避免产生过小碎片：小于 2×最小块阈值则不再分裂
+        if len < crate::chunk::MIN_CHUNK_SIZE * 2 {
             break;
         }
-
         let left_len = len / 2;
         let mid = start + left_len - 1;
         ranges.splice(index..=index, [(start, mid), (mid + 1, end)]);

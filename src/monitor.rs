@@ -86,23 +86,36 @@ impl DownloadMonitor {
                 // 一个下载任务已完成（或 panic）
                 Some(result) = tasks.next() => {
                     if let Err(e) = result { eprintln!("[Monitor] 一个下载任务 panicked: {e}"); }
-                    // 如果所有任务都已结束，则退出循环
-                    if tasks.is_empty() && self.are_all_tasks_done() { break 'main_loop; }
+                    // 任务结束不直接判定下载完成，避免与 DownloadComplete 竞态丢事件；
+                    // 真正的完成判定由定时 tick 的 handle_tick 统一处理。
+                    // 仅在空任务且已完成时可提前退出，避免 0.5s tick 延迟。
+                    if tasks.is_empty()
+                        && self.are_all_tasks_done()
+                        && self.state.is_download_finished()
+                    {
+                        break 'main_loop;
+                    }
                 },
 
-                // 收到来自下载块的信息
-                Ok(info) = info_rx.recv() => {
-                    self.handle_download_info(
-                        info,
-                        &mut tasks,
-                        next_chunk_id,
-                        client,
-                        &writer_tx,
-                        cmd_tx,
-                        &info_tx,
-                        url,
-                        multi_runtime.as_mut(),
-                    );
+                // 收到来自下载块的信息；区分 Lagged/Closed，避免因广播积压误退出
+                result = info_rx.recv() => match result {
+                    Ok(info) => {
+                        self.handle_download_info(
+                            info,
+                            &mut tasks,
+                            next_chunk_id,
+                            client,
+                            &writer_tx,
+                            cmd_tx,
+                            &info_tx,
+                            url,
+                            multi_runtime.as_mut(),
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        eprintln!("[Monitor] 广播滞后，跳过 {skipped} 条事件，继续运行");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break 'main_loop,
                 },
 
                 // 定时器触发
@@ -126,15 +139,13 @@ impl DownloadMonitor {
                         break 'main_loop;
                     }
                 },
-
-                // 通道关闭或发生其他错误，退出循环
-                else => break,
             }
         }
         println!("[Monitor] 所有下载任务已完成。监控器正在关闭。");
     }
 
     /// 处理从下载块接收到的各种 `DownloadInfo` 消息。
+    #[allow(clippy::too_many_arguments)]
     fn handle_download_info(
         &mut self,
         info: DownloadInfo,
@@ -175,11 +186,11 @@ impl DownloadMonitor {
             DownloadInfo::DownloadComplete(id) => {
                 // 标记一个块为已完成
                 self.state.complete_chunk(&id);
-                if let Some(lane_id) = self.lane_bindings.remove(&id) {
-                    if let Some(runtime) = multi_runtime {
-                        runtime.record_success(&lane_id);
-                        runtime.release_chunk(&lane_id);
-                    }
+                if let Some(lane_id) = self.lane_bindings.remove(&id)
+                    && let Some(runtime) = multi_runtime
+                {
+                    runtime.record_success(&lane_id);
+                    runtime.release_chunk(&lane_id);
                 }
                 self.retry_handler.on_download_complete(&id);
                 let _ = info_tx.send(DownloadInfo::ChunkStatusChanged {
@@ -194,11 +205,11 @@ impl DownloadMonitor {
                 end,
                 error,
             } => {
-                if let Some(lane_id) = self.lane_bindings.remove(&id) {
-                    if let Some(runtime) = multi_runtime {
-                        runtime.record_failure(&lane_id);
-                        runtime.release_chunk(&lane_id);
-                    }
+                if let Some(lane_id) = self.lane_bindings.remove(&id)
+                    && let Some(runtime) = multi_runtime
+                {
+                    runtime.record_failure(&lane_id);
+                    runtime.release_chunk(&lane_id);
                 }
                 // 将失败的块交给重试处理器
                 self.retry_handler
@@ -229,9 +240,9 @@ impl DownloadMonitor {
             _ => {}
         }
     }
-
     /// 处理定时器触发的事件。
     /// 返回 `true` 表示下载已完成。
+    #[allow(clippy::too_many_arguments)]
     fn handle_tick(
         &mut self,
         elapsed_secs: f64,

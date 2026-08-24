@@ -78,30 +78,35 @@ pub async fn chunk_run(
             // `biased` 确保优先处理控制命令，使得系统能快速响应如“分割”或“终止”等操作。
             biased;
 
-            // 接收广播命令
-            Ok(cmd) = bd_rx.recv() => match cmd {
-                // 如果收到分割命令且目标是当前块
-                DownloadCmd::BisectDownload { id: id_ } if id == id_ => {
-                    let Some((midpoint, new_chunk_start)) = split_range(offset, end) else {
-                        continue;
-                    };
+            // 接收广播命令；单独处理 Lagged，避免因背压误终止下载
+            result = bd_rx.recv() => match result {
+                Ok(cmd) => match cmd {
+                    // 如果收到分割命令且目标是当前块
+                    DownloadCmd::BisectDownload { id: id_ } if id == id_ => {
+                        let Some((midpoint, new_chunk_start)) = split_range(offset, end) else {
+                            continue;
+                        };
 
-                    // 广播“块已分割”事件，通知监控器创建新任务
-                    if bd_tx.send(DownloadInfo::ChunkBisected {
-                        original_id: id,
-                        new_start: new_chunk_start,
-                        new_end: end,
-                    }).is_ok() {
-                        println!("[Chunk {id}] 已分割。新范围: {offset}-{midpoint}");
-                        // 更新当前块的结束位置
-                        end = midpoint;
+                        // 广播“块已分割”事件，通知监控器创建新任务
+                        if bd_tx.send(DownloadInfo::ChunkBisected {
+                            original_id: id,
+                            new_start: new_chunk_start,
+                            new_end: end,
+                        }).is_ok() {
+                            println!("[Chunk {id}] 已分割。新范围: {offset}-{midpoint}");
+                            // 更新当前块的结束位置
+                            end = midpoint;
+                        }
                     }
+                    // 收到终止命令，退出循环
+                    DownloadCmd::TerminateAll => break,
+                    _ => {}
+                },
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    eprintln!("[Chunk {id}] 广播滞后跳过 {skipped} 条控制命令，继续运行");
                 }
-                // 收到终止命令，退出循环
-                DownloadCmd::TerminateAll => break,
-                _ => {}
+                Err(broadcast::error::RecvError::Closed) => break,
             },
-
             // 从网络流中获取下一个数据块
             chunk_result = stream.next() => match chunk_result {
                 Some(Ok(mut chunk)) => {

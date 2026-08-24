@@ -75,6 +75,16 @@ impl ResumeMetadata {
         Ok(())
     }
 
+    async fn save_atomic_async(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let temp_path = path.with_extension(format!("{RESUME_EXTENSION}.tmp"));
+        tokio::fs::write(&temp_path, bitcode::encode(self)).await?;
+        tokio::fs::rename(temp_path, path).await?;
+        Ok(())
+    }
+
     pub fn set_segment_hash(&mut self, segment_index: usize, hash: u64) {
         if let Some(segment) = self.segments.get_mut(segment_index) {
             segment.hash = Some(hash);
@@ -196,8 +206,11 @@ impl ResumePlan {
                 completed_bytes,
             });
         }
-
         let metadata = ResumeMetadata::new(file_size, DEFAULT_SEGMENT_SIZE);
+        // 立即落盘，确保 <64KiB 内中断也能恢复；失败不阻断下载，仅记录错误
+        if let Err(error) = metadata.save_atomic(&metadata_path) {
+            eprintln!("[Resume] 初始元数据落盘失败: {error}");
+        }
         Ok(Self {
             metadata_path,
             metadata: Some(metadata),
@@ -264,7 +277,7 @@ impl ResumeRecorder {
         }
 
         if changed {
-            self.metadata.save_atomic(&self.metadata_path)?;
+            self.metadata.save_atomic_async(&self.metadata_path).await?;
         }
         Ok(())
     }
@@ -316,11 +329,11 @@ fn add_covered_range(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64) {
 
     let mut merged: Vec<(u64, u64)> = Vec::new();
     for (start, end) in ranges.drain(..) {
-        if let Some((_, last_end)) = merged.last_mut() {
-            if start <= last_end.saturating_add(1) {
-                *last_end = (*last_end).max(end);
-                continue;
-            }
+        if let Some((_, last_end)) = merged.last_mut()
+            && start <= last_end.saturating_add(1)
+        {
+            *last_end = (*last_end).max(end);
+            continue;
         }
         merged.push((start, end));
     }
@@ -336,11 +349,11 @@ fn covers_segment(ranges: &[(u64, u64)], start: u64, end: u64) -> bool {
 fn collect_contiguous_ranges(ranges: impl Iterator<Item = (u64, u64)>) -> Vec<(u64, u64)> {
     let mut merged: Vec<(u64, u64)> = Vec::new();
     for (start, end) in ranges {
-        if let Some((_, previous_end)) = merged.last_mut() {
-            if start <= previous_end.saturating_add(1) {
-                *previous_end = (*previous_end).max(end);
-                continue;
-            }
+        if let Some((_, previous_end)) = merged.last_mut()
+            && start <= previous_end.saturating_add(1)
+        {
+            *previous_end = (*previous_end).max(end);
+            continue;
         }
         merged.push((start, end));
     }

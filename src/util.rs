@@ -33,15 +33,14 @@ pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
         .and_then(|r| r.error_for_status())
     {
         let headers = resp.headers();
-        if let Some(len_val) = headers.get(CONTENT_LENGTH) {
-            if let Ok(len_str) = len_val.to_str() {
-                if let Ok(content_length) = len_str.parse::<u64>() {
-                    let accept_ranges = headers
-                        .get(ACCEPT_RANGES)
-                        .map_or(false, |v| v.as_bytes().eq_ignore_ascii_case(b"bytes"));
-                    return Ok((content_length, accept_ranges));
-                }
-            }
+        if let Some(len_val) = headers.get(CONTENT_LENGTH)
+            && let Ok(len_str) = len_val.to_str()
+            && let Ok(content_length) = len_str.parse::<u64>()
+        {
+            let accept_ranges = headers
+                .get(ACCEPT_RANGES)
+                .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"bytes"));
+            return Ok((content_length, accept_ranges));
         }
     }
 
@@ -54,28 +53,27 @@ pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
         .error_for_status()?;
 
     let headers = range_resp.headers();
-    if let Some(cr) = headers.get(CONTENT_RANGE) {
-        if let Ok(crs) = cr.to_str() {
-            // Content-Range 格式通常是 "bytes 0-0/12345"
-            if let Some(pos) = crs.rfind('/') {
-                let total = &crs[pos + 1..].trim();
-                if *total != "*" {
-                    if let Ok(content_length) = total.parse::<u64>() {
-                        return Ok((content_length, true)); // 如果有 Content-Range，说明支持范围请求
-                    }
-                }
+    if let Some(cr) = headers.get(CONTENT_RANGE)
+        && let Ok(crs) = cr.to_str()
+    {
+        // Content-Range 格式通常是 "bytes 0-0/12345"
+        if let Some(pos) = crs.rfind('/') {
+            let total = &crs[pos + 1..].trim();
+            if *total != "*"
+                && let Ok(content_length) = total.parse::<u64>()
+            {
+                return Ok((content_length, true)); // 如果有 Content-Range，说明支持范围请求
             }
         }
     }
 
     // 3. 最终回退到 GET 响应的 Content-Length
-    if let Some(len_val) = headers.get(CONTENT_LENGTH) {
-        if let Ok(len_str) = len_val.to_str() {
-            if let Ok(content_length) = len_str.parse::<u64>() {
-                // 此时无法确定是否支持范围请求，保守地返回 false
-                return Ok((content_length, false));
-            }
-        }
+    if let Some(len_val) = headers.get(CONTENT_LENGTH)
+        && let Ok(len_str) = len_val.to_str()
+        && let Ok(content_length) = len_str.parse::<u64>()
+    {
+        // 此时无法确定是否支持范围请求，保守地返回 false
+        return Ok((content_length, false));
     }
 
     Err(DownloadError::MissingContentLength)
@@ -153,11 +151,11 @@ async fn file_writer_task_impl(
                         break; // 发生错误时退出
                     }
                     #[cfg(feature = "resume")]
-                    if let Some(recorder) = resume_recorder.as_mut() {
-                        if let Err(error) = recorder.record_write(&mut file, offset, len).await {
-                            eprintln!("[FileWriter] 更新断点续传元数据失败: {error}");
-                            break;
-                        }
+                    if let Some(recorder) = resume_recorder.as_mut()
+                        && let Err(error) = recorder.record_write(&mut file, offset, len).await
+                    {
+                        eprintln!("[FileWriter] 更新断点续传元数据失败: {error}");
+                        break;
                     }
                 }
                 DownloadCmd::TerminateAll => break, // 收到终止命令时退出

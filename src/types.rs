@@ -192,7 +192,11 @@ impl DownloadInfo {
     /// 仅对 `MonitorUpdate` 变体有效，其他变体返回 0.0。
     pub fn progress_percent(&self) -> f64 {
         match self {
-            DownloadInfo::MonitorUpdate { total_size, total_downloaded, .. } => {
+            DownloadInfo::MonitorUpdate {
+                total_size,
+                total_downloaded,
+                ..
+            } => {
                 if *total_size == 0 {
                     0.0
                 } else {
@@ -208,9 +212,7 @@ impl DownloadInfo {
     /// 仅对 `MonitorUpdate` 变体有效，其他变体返回 0.0。
     pub fn speed_mbps(&self) -> f64 {
         match self {
-            DownloadInfo::MonitorUpdate { total_speed, .. } => {
-                *total_speed / (1024.0 * 1024.0)
-            }
+            DownloadInfo::MonitorUpdate { total_speed, .. } => *total_speed / (1024.0 * 1024.0),
             _ => 0.0,
         }
     }
@@ -220,7 +222,9 @@ impl DownloadInfo {
     /// 仅对 `MonitorUpdate` 变体有效，其他变体返回 0。
     pub fn downloaded_bytes(&self) -> u64 {
         match self {
-            DownloadInfo::MonitorUpdate { total_downloaded, .. } => *total_downloaded,
+            DownloadInfo::MonitorUpdate {
+                total_downloaded, ..
+            } => *total_downloaded,
             _ => 0,
         }
     }
@@ -240,9 +244,11 @@ impl DownloadInfo {
     /// 仅对 `MonitorUpdate` 变体有效，其他变体返回 false。
     pub fn is_complete(&self) -> bool {
         match self {
-            DownloadInfo::MonitorUpdate { total_size, total_downloaded, .. } => {
-                *total_size > 0 && *total_downloaded >= *total_size
-            }
+            DownloadInfo::MonitorUpdate {
+                total_size,
+                total_downloaded,
+                ..
+            } => *total_size > 0 && *total_downloaded >= *total_size,
             _ => false,
         }
     }

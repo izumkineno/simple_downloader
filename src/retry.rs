@@ -43,6 +43,12 @@ pub struct RetryHandler {
     retry_attempts: HashMap<ChunkId, u32>,
 }
 
+impl Default for RetryHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RetryHandler {
     pub fn new() -> Self {
         Self {
@@ -154,17 +160,17 @@ impl RetryHandler {
 
     /// 从即时重试队列中弹出一个已达到重试延迟时间的块。
     pub fn pop_ready_chunk(&mut self) -> Option<FailedChunkInfo> {
-        if let Some(failed_chunk) = self.retry_queue.front() {
-            if failed_chunk.failure_time.elapsed() >= RETRY_DELAY {
-                return self.retry_queue.pop_front();
-            }
+        if let Some(failed_chunk) = self.retry_queue.front()
+            && failed_chunk.failure_time.elapsed() >= RETRY_DELAY
+        {
+            return self.retry_queue.pop_front();
         }
         None
     }
 
     /// 当一个块最终下载成功时，清除其重试记录。
     pub fn on_download_complete(&mut self, id: &ChunkId) {
-        self.retry_attempts.remove(&id);
+        self.retry_attempts.remove(id);
     }
 
     /// 检查所有重试队列是否都为空。

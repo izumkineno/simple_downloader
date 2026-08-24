@@ -146,9 +146,10 @@ use simple_downloader::Downloader;
 
 #[tokio::main]
 async fn main() {
+    // 示例使用公开测试文件；生产环境替换为实际 URL 即可
     match Downloader::builder(
-        "https://dldir1.qq.com/qqfile/qq/PCQQ9.7.17/QQ9.7.17.29225.exe", // 下载链接
-        "QQ9.7.17.29225.exe",                             // 保存路径
+        "https://proof.ovh.net/files/10Mio.dat",
+        "10Mio.dat",
     )
     .workers(16)
     .download()

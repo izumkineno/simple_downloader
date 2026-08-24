@@ -14,9 +14,8 @@ const STABLE_SPLIT_THRESHOLD: f64 = 0.8;
 const MIN_SPLIT_INTERVAL: Duration = Duration::from_millis(300);
 /// 触发分割所需的最小预估剩余时间，避免在下载即将完成时进行不必要的分割。
 const MIN_REMAINING_TIME_FOR_SPLIT: f64 = 5.0;
-/// 块的最小尺寸，与 `chunk.rs` 中定义的值保持一致。
-pub(crate) const MIN_CHUNK_SIZE: u64 = 1024 * 10;
-
+/// 块的最小尺寸，统一复用 `chunk::MIN_CHUNK_SIZE` 的 10 KiB 阈值（可安全二分的最小剩余量 ×2）。
+pub(crate) use crate::chunk::MIN_CHUNK_SIZE;
 /// 下载过程所处的阶段。
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum DownloadPhase {
@@ -140,15 +139,14 @@ impl ConcurrencyManager {
         // 如果处于观察状态，处理样本收集
         if self.phase == DownloadPhase::Stable
             && self.observation_state == ObservationState::Observing
+            && let Some(ref mut observation) = self.current_observation
         {
-            if let Some(ref mut observation) = self.current_observation {
-                observation.collected_samples += 1;
-                observation.best_speed_seen = observation.best_speed_seen.max(current_speed);
+            observation.collected_samples += 1;
+            observation.best_speed_seen = observation.best_speed_seen.max(current_speed);
 
-                // 如果收集到足够样本，进入评估状态
-                if observation.collected_samples >= observation.required_samples {
-                    self.observation_state = ObservationState::Evaluating;
-                }
+            // 如果收集到足够样本，进入评估状态
+            if observation.collected_samples >= observation.required_samples {
+                self.observation_state = ObservationState::Evaluating;
             }
         }
 
@@ -224,7 +222,6 @@ impl ConcurrencyManager {
             }
             ObservationState::Observing => {
                 // 观察期不做任何决策，等待样本收集完成
-                return;
             }
             ObservationState::Evaluating => {
                 self.handle_stable_evaluate(state, avg_speed, estimated_time, cmd_tx);

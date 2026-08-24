@@ -53,7 +53,6 @@ pub struct ProxyConfig {
     pub url: FastStr,
 }
 
-
 #[cfg(feature = "proxy")]
 impl ProxyConfig {
     /// 创建代理配置，`id` 默认为 `proxy-{url}`。
@@ -70,11 +69,17 @@ impl ProxyConfig {
     }
 
     /// 快捷构造 HTTP 代理（等价 `new`）。
-    pub fn http(url: impl Into<FastStr>) -> Result<Self> { Ok(Self::new(url)) }
+    pub fn http(url: impl Into<FastStr>) -> Result<Self> {
+        Ok(Self::new(url))
+    }
     /// 快捷构造 HTTPS 代理。
-    pub fn https(url: impl Into<FastStr>) -> Result<Self> { Ok(Self::new(url)) }
+    pub fn https(url: impl Into<FastStr>) -> Result<Self> {
+        Ok(Self::new(url))
+    }
     /// 快捷构造 SOCKS5 代理。
-    pub fn socks5(url: impl Into<FastStr>) -> Result<Self> { Ok(Self::new(url)) }
+    pub fn socks5(url: impl Into<FastStr>) -> Result<Self> {
+        Ok(Self::new(url))
+    }
 }
 
 /// 单个下载源配置。
@@ -397,14 +402,12 @@ impl LaneScheduler {
         if entry.active_chunks >= self.max_chunks_per_lane {
             return false;
         }
-        if matches!(self.lane_model, LaneModel::PerSource) {
-            if let Some(max_chunks_per_source) = self.max_chunks_per_source {
-                if self.source_active_chunks(entry.candidate.source_id.as_str())
-                    >= max_chunks_per_source
-                {
-                    return false;
-                }
-            }
+        if matches!(self.lane_model, LaneModel::PerSource)
+            && let Some(max_chunks_per_source) = self.max_chunks_per_source
+            && self.source_active_chunks(entry.candidate.source_id.as_str())
+                >= max_chunks_per_source
+        {
+            return false;
         }
         true
     }
@@ -457,6 +460,9 @@ impl MultiRuntime {
                     } else {
                         detected_file_size = Some(file_size);
                     }
+                    // NOTE: 当前探测阶段仅校验可用性，未做真实带宽采样；
+                    // 统一置为 1.0，调度退化为按配置顺序 + 健康度/容量选择，
+                    // 后续可在此处加入 Range 采样或历史吞吐评分
                     runtime.probe_speed = 1.0;
                     candidates.push(LaneCandidate {
                         lane_id: runtime.lane_id.clone(),

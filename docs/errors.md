@@ -2,16 +2,16 @@
 
 本文档详细介绍 simple_downloader 中可能出现的所有错误类型，以及对应的原因和处理方案。
 
-## 错误类型总览
+## 错误类型总览（以 `src/types.rs:DownloadError` 为准，当前无数字错误码）
 
-| 错误类型 | 错误码范围 | 说明 | 可重试 |
-|----------|-----------|------|--------|
-| 网络请求错误 | 1xxx | HTTP 请求过程中发生的错误 | ✅ 大部分情况可重试 |
-| 文件 I/O 错误 | 2xxx | 本地文件读写操作发生的错误 | ❌ 一般不可重试 |
-| 并发任务错误 | 3xxx | 异步任务执行过程中发生的错误 | ✅ 可重试 |
-| 元数据错误 | 4xxx | 服务器响应或文件元数据相关错误 | ✅ 部分情况可重试 |
-| 多源下载错误 | 5xxx | 多源下载模式下的特有错误 | ✅ 可重试 |
-
+| 错误类型 | 变体 | 说明 | 可重试 |
+|----------|------|------|--------|
+| 网络请求错误 | `DownloadError::Request(reqwest::Error)` | HTTP 请求过程中发生的错误 | ✅ 大部分情况可重试 |
+| 文件 I/O 错误 | `DownloadError::Io(io::Error)` | 本地文件读写操作发生的错误 | ❌ 一般不可重试 |
+| 并发任务错误 | `DownloadError::Join(JoinError)` | 异步任务执行过程中发生的错误 | ✅ 可重试 |
+| 缺少长度错误 | `DownloadError::MissingContentLength` | 服务器未返回 Content-Length | ✅ 部分情况可重试 |
+| 多源下载错误 | `DownloadError::NoAvailableSources` | 多源模式下无可用源 | ✅ 可重试 |
+| 断点续传错误 | `DownloadError::ResumeTargetMissing` / `ResumeMetadata(String)` | 断点续传相关错误 | ❌ 需清理后重试 |
 ## 详细错误说明
 
 ### 1. 网络请求错误 (Request)
