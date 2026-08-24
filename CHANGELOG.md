@@ -22,6 +22,34 @@
 
 ---
 
+## [0.3.0] - 2026-08-24
+
+### 🔧 修复（Correctness - P0 挂死/丢数据）
+
+- **永重试挂死** `retry.rs` `MAX_TOTAL_ATTEMPTS=30` + `permanent_failures` 熔断，`monitor::run→Result` 三处检查 `TerminateAll+PermanentFailure`，`downloader` 保活 `writer_handle`
+- **丢范围空洞** `monitor.rs` 新增 `pending_bisects:VecDeque`，`ChunkBisected` 容量不足入队；`handle_tick` 按 `&mut Option<MultiRuntime>` 增量调度 pending；`are_all_tasks_done` 纳入 pending；`downloader` 初始 `claim` 失败入队；`retry` 容量不足 `push_front_retry`
+- **完成计数少算 64KiB** `state.rs` `complete_chunk += size()` 而非 `downloaded`，容忍节流/`Lagged` 丢失
+- **广播 Lagged 丢控制** `downloader.rs` `CHANNEL_CAPACITY 1024→4096`，`64KiB/50ms` 节流后 `1.5k≪4096`
+
+### 🛠️ 修复（Correctness - P1 正确性）
+
+- **单代理非法拖垮全源** `lane::expand_lanes` `Proxy::all`/`Client::build` 改 per-lane `match+continue` 仅跳过该 lane
+- **多源非 Range 一刀切** `lane::MultiRuntime` 双桶 `range/fallback`，`from_config` 优先 Range，无 Range 回退非 Range 并 `supports_ranges` 标记；`downloader` 据此 `workers=1` 降级
+- **哈希前未 flush** `util::file_writer` 3 处 `write_all→flush→record_write`，`通道关闭` 同理
+- **HEAD 误判 Range** `util::get_file_info` `HEAD` 仅记录 `head_size/head_support`，`Range 0-0` 以 `206/Content-Range` 金标准，`501` 回退 `HEAD`
+- **失败时 total 回落** `state::preserve_partial` + `retry::on_chunk_failed` 先保留 `downloaded` 再移除
+
+### 🧹 修复（契约 - P2）
+
+- **黑名单永久** `lane::LaneScheduler` `blacklisted_at:Option<Instant>` + `BLACKLIST_DURATION 30s`，`best_lane &mut decay`，`lane_health` 有效判定，`primary/best_lane_runtime &mut`
+- **0 字节永不完成** `types::DownloadInfo::is_complete` 改 `downloaded>=total_size`（`0>=0 true`）
+- **测试适配** `tests/multi_source` `best_lane &mut` 适配
+
+### ✅ 测试（test_server 集成）
+
+- 新增 `tests/test_server_comprehensive.rs` 9 用例（`--all-features 1.95s`）复用 `test_server_harness::{TestServerFile,RunningTestServer}`：`zero_byte`/`large 3MiB 8workers`/`per_lane pending`/`proxy invalid`/`resume preserve`/`head fallback`/`retry/blacklist/state` 单元
+- 暴露 `LaneScheduler::set_blacklisted_at_for_test/integration_test` 与 `RetryHandler::total_attempts_for_test` 供集成测试
+- 修复 `mockito` `Range 0-0` 探测与 `501` 降级 mock，`cargo test --all-features 11 套全绿 30s`
 ## [0.2.0] - 2026-08-24
 
 ### 🔧 修复（Correctness）
@@ -159,9 +187,19 @@
 - **Beta**：功能基本完整，正在进行测试，API 可能有少量变更
 - **Stable**：稳定版本，API 保持向后兼容，可用于生产环境
 
-当前版本 0.2.0 已达到 Beta 尾声、接近 Stable：默认档异步正确性、断点续传可靠性、文档契约与性能基线已对齐；预计 0.3.0 进入 Stable。
+当前版本 0.3.0 已进入 Stable：P0 挂死/丢数据、P1 正确性、P2 契约与 `test_server` 9 用例集成已对齐；`0.2.x` 保持兼容。
 
 ## 升级指南
+
+### 从 0.2.0 升级到 0.3.0
+
+向后兼容，无破坏 API（新增 `supports_ranges`/`PermanentFailure`/`pending_bisects` 均为内部或新增分支）：`cargo update -p simple_downloader` 即可
+
+- `LaneScheduler::best_lane` 改 `&mut self`（`MultiRuntime` 已同步），`lane_health` 语义不变；外部直接调用需 `mut`
+- `MultiRuntime` 新增 `supports_ranges:bool` 公开字段，`from_config` 仍 `(u64,Self)` 不破
+- `DownloadInfo::is_complete` 修正 `0>=0 true`，`0 字节` 进度回调首次即完成
+- `get_file_info` 对 `501`/`4xx` 探测自动回退 `HEAD`，无需变更调用方
+- 其它：`pending_bisects`/`preserve_partial`/`blacklist 30s`/`CHANNEL 4096`/`flush` 均为内部行为优化
 
 ### 从 0.1.0 升级到 0.2.0
 

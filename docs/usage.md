@@ -35,14 +35,14 @@
 ```toml
 # 仅基础能力（最轻量，1.5 MiB rlib）
 [dependencies]
-simple_downloader = { version = "0.2", default-features = false }
+simple_downloader = { version = "0.3", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 # 常用组合：基础 + 断点续传 + 进度
-simple_downloader = { version = "0.2", default-features = false, features = ["resume", "progress"] }
+simple_downloader = { version = "0.3", default-features = false, features = ["resume", "progress"] }
 
 # 全功能
-simple_downloader = { version = "0.2", default-features = false, features = ["resume", "progress", "multi-source", "proxy"] }
+simple_downloader = { version = "0.3", default-features = false, features = ["resume", "progress", "multi-source", "proxy"] }
 ```
 
 > 历史文档中 `default = [resume, progress, ...]` 已过时，以 `Cargo.toml` 为准。
@@ -122,7 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```toml
 [dependencies]
-simple_downloader = { version = "0.2", features = ["resume"] }
+simple_downloader = { version = "0.3", features = ["resume"] }
 ```
 
 ```rust
@@ -176,7 +176,7 @@ let meta = ResumeMetadata::new(file_size, DEFAULT_SEGMENT_SIZE);
 
 ```toml
 [dependencies]
-simple_downloader = { version = "0.2", features = ["progress"] }
+simple_downloader = { version = "0.3", features = ["progress"] }
 ```
 
 `run(handler)` 将 `total_size: u64` 与 `broadcast::Receiver<DownloadInfo>` 交给调用方，调用方在独立 task 中消费事件。`DownloadInfo` 变体见 `src/types.rs:99-187`。
@@ -237,7 +237,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```toml
 [dependencies]
-simple_downloader = { version = "0.2", features = ["multi-source", "progress"] }
+simple_downloader = { version = "0.3", features = ["multi-source", "progress"] }
 ```
 
 ```rust
@@ -298,7 +298,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```toml
 [dependencies]
-simple_downloader = { version = "0.2", features = ["proxy", "progress"] }
+simple_downloader = { version = "0.3", features = ["proxy", "progress"] }
 ```
 
 ```rust
@@ -351,7 +351,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // 自定义 Header
                 .default_headers({
                     let mut h = reqwest::header::HeaderMap::new();
-                    h.insert("User-Agent", "simple_downloader/0.2".parse().unwrap());
+                    h.insert("User-Agent", "simple_downloader/0.3".parse().unwrap());
                     h
                 })
                 // 危险：仅测试环境

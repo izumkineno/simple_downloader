@@ -48,12 +48,7 @@ pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
     }
 
     // 2. 范围 GET 探测：以 206/ Content-Range 为金标准，失败则回退 HEAD 避免 501 误判
-    let range_resp = match client
-        .get(url)
-        .header("Range", "bytes=0-0")
-        .send()
-        .await
-    {
+    let range_resp = match client.get(url).header("Range", "bytes=0-0").send().await {
         Ok(resp) => resp,
         Err(_) => {
             if let Some(size) = head_size {

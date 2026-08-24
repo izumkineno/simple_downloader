@@ -171,7 +171,9 @@ async fn proxy_invalid_is_skipped() {
     let out = NamedTempFile::new().unwrap();
     let out_path = out.path().to_path_buf();
     // 一个源带非法代理，一个源直连
-    let bad_proxy = ProxyConfig::http("http://127.0.0.1:1").unwrap().with_id("bad");
+    let bad_proxy = ProxyConfig::http("http://127.0.0.1:1")
+        .unwrap()
+        .with_id("bad");
     // 故意构造非法 URL 的代理：ProxyConfig 接受任意字符串，但 expand 时会尝试 Proxy::all 并跳过
     // 使用明显非法的代理 URL 触发 per-lane 跳过
     let invalid_proxy = ProxyConfig::http("http://%%invalid%%").unwrap_or_else(|_| {
@@ -205,7 +207,9 @@ async fn resume_preserve_partial_via_test_server() {
     }
     let bytes = test_server_harness::deterministic_bytes(1024 * 1024);
     let file = TestServerFile::new("resume.bin", bytes.clone()).unwrap();
-    let server = RunningTestServer::spawn(file.directory(), "2m", "1m").await.unwrap();
+    let server = RunningTestServer::spawn(file.directory(), "2m", "1m")
+        .await
+        .unwrap();
     let out = NamedTempFile::new().unwrap();
     let out_path = out.path().to_path_buf();
     // 使用 resume 能力：先做一次限速下载，超时取消以制造部分文件
@@ -277,7 +281,8 @@ fn lane_blacklist_decay_unit() {
     let fallback = sched.best_lane().unwrap();
     assert_eq!(fallback.as_str(), "src-b");
     // 强制将黑名单时间设为 31 秒前，触发衰减
-    sched.set_blacklisted_at_for_integration_test("src-a", Instant::now() - Duration::from_secs(31));
+    sched
+        .set_blacklisted_at_for_integration_test("src-a", Instant::now() - Duration::from_secs(31));
     assert_eq!(sched.lane_health("src-a"), Some(LaneHealth::Healthy));
     let recovered = sched.best_lane().unwrap();
     // a 恢复后因 probe 更高，重新成为最佳
