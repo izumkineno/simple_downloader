@@ -413,6 +413,24 @@ impl LaneScheduler {
             })
     }
 
+    #[allow(dead_code)]
+    pub fn set_blacklisted_at_for_test(&mut self, lane_id: &str, at: Instant) {
+        if let Some(entry) = self
+            .lanes
+            .iter_mut()
+            .find(|entry| entry.candidate.lane_id.as_str() == lane_id)
+        {
+            entry.health = LaneHealth::Blacklisted;
+            entry.consecutive_failures = BLACKLIST_THRESHOLD;
+            entry.blacklisted_at = Some(at);
+        }
+    }
+
+    // 供集成测试使用：与 #[cfg(test)] 的单元测试不同，integration test 编译时 library 的 cfg(test) 为 false，需额外暴露
+    #[allow(dead_code)]
+    pub fn set_blacklisted_at_for_integration_test(&mut self, lane_id: &str, at: Instant) {
+        self.set_blacklisted_at_for_test(lane_id, at);
+    }
     fn total_active_chunks(&self) -> usize {
         self.lanes.iter().map(|entry| entry.active_chunks).sum()
     }

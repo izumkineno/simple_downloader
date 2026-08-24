@@ -227,4 +227,9 @@ impl RetryHandler {
             )
         })
     }
+
+    #[cfg(test)]
+    pub fn total_attempts_for_test(&self, id: ChunkId) -> u32 {
+        *self.total_attempts.get(&id).unwrap_or(&0)
+    }
 }
