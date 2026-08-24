@@ -29,6 +29,8 @@ pub struct DownloadMonitor {
     concurrency_manager: ConcurrencyManager,
     /// 多源模式下的 chunk -> lane 绑定。
     lane_bindings: HashMap<ChunkId, FastStr>,
+    /// 因 lane 容量不足暂未调度的分割新区间的缓冲，避免丢范围空洞。
+    pub(crate) pending_bisects: std::collections::VecDeque<(u64, u64)>,
     /// 状态更新的间隔时间（秒）。
     update_interval: f64,
 }
@@ -50,6 +52,7 @@ impl DownloadMonitor {
             retry_handler: RetryHandler::new(),
             concurrency_manager: ConcurrencyManager::new(max_workers),
             lane_bindings: HashMap::new(),
+            pending_bisects: std::collections::VecDeque::new(),
             update_interval,
         }
     }
@@ -151,7 +154,8 @@ impl DownloadMonitor {
                         client,
                         &writer_tx,
                         url,
-                        multi_runtime.as_mut(),
+                        &mut multi_runtime,
+                        next_chunk_id,
                     ) {
                         // 如果 tick 处理器返回 true，表示下载已完成
                         break 'main_loop;
@@ -244,11 +248,15 @@ impl DownloadMonitor {
             DownloadInfo::ChunkBisected {
                 new_start, new_end, ..
             } => {
-                // 当一个块被分割时，为新的部分创建一个新的下载任务
-                let new_id = next_chunk_id.fetch_add(1, Ordering::SeqCst);
+                // 尝试为新区间分配 lane；若容量不足则缓冲至 pending_bisects，避免丢范围
                 let Some((lane_id, rb)) = build_request(client, url, multi_runtime) else {
+                    eprintln!(
+                        "[Monitor] lane 容量不足，缓冲分割区间 {new_start}-{new_end} 待下次 tick 调度"
+                    );
+                    self.pending_bisects.push_back((new_start, new_end));
                     return;
                 };
+                let new_id = next_chunk_id.fetch_add(1, Ordering::SeqCst);
                 if let Some(lane_id) = lane_id {
                     self.lane_bindings.insert(new_id, lane_id);
                 }
@@ -278,7 +286,8 @@ impl DownloadMonitor {
         client: &Client,
         writer_tx: &mpsc::Sender<DownloadCmd>,
         url: Option<&FastStr>,
-        mut multi_runtime: Option<&mut MultiRuntime>,
+        multi_runtime: &mut Option<MultiRuntime>,
+        next_chunk_id: &AtomicU64,
     ) -> bool {
         if elapsed_secs <= 0.0 {
             return false;
@@ -294,19 +303,41 @@ impl DownloadMonitor {
         // 委托并发控制：让并发管理器决定是否需要分割块
         self.concurrency_manager.decide_and_act(&self.state, cmd_tx);
 
+        // 调度之前因 lane 容量不足而缓冲的分割区间
+        while let Some((start, end)) = self.pending_bisects.front().copied() {
+            let Some((lane_id, rb)) = build_request(client, url, multi_runtime.as_mut()) else {
+                break;
+            };
+            self.pending_bisects.pop_front();
+            let new_id = next_chunk_id.fetch_add(1, Ordering::SeqCst);
+            if let Some(lane_id) = lane_id {
+                self.lane_bindings.insert(new_id, lane_id);
+            }
+            let task = chunk_run(
+                new_id,
+                writer_tx.clone(),
+                cmd_tx.subscribe(),
+                info_tx.clone(),
+                rb,
+                start,
+                end,
+            );
+            tasks.push(tokio::spawn(task));
+        }
+
         // 委托重试处理：处理重试队列
         self.retry_handler.process_queues();
+        let mut deferred_retries = Vec::new();
         while let Some(chunk_to_retry) = self.retry_handler.pop_ready_chunk() {
-            // 如果有块准备好重试，则为其创建新任务
+            let Some((lane_id, rb)) = build_request(client, url, multi_runtime.as_mut()) else {
+                deferred_retries.push(chunk_to_retry);
+                continue;
+            };
             let _ = info_tx.send(DownloadInfo::ChunkStatusChanged {
                 id: chunk_to_retry.id,
                 status: 1, // 状态：重试中
                 message: Some(format!("正在进行第 {} 次重试", chunk_to_retry.attempts)),
             });
-            let Some((lane_id, rb)) = build_request(client, url, multi_runtime.as_deref_mut())
-            else {
-                continue;
-            };
             if let Some(lane_id) = lane_id {
                 self.lane_bindings.insert(chunk_to_retry.id, lane_id);
             }
@@ -320,6 +351,9 @@ impl DownloadMonitor {
                 chunk_to_retry.end,
             );
             tasks.push(tokio::spawn(task));
+        }
+        for chunk in deferred_retries.into_iter().rev() {
+            self.retry_handler.push_front_retry(chunk);
         }
 
         // 检查下载是否已全部完成
@@ -344,7 +378,9 @@ impl DownloadMonitor {
 
     /// 检查是否所有任务（包括活跃的下载和重试队列中的）都已处理完毕。
     fn are_all_tasks_done(&self) -> bool {
-        self.state.chunks.is_empty() && self.retry_handler.are_all_tasks_done()
+        self.pending_bisects.is_empty()
+            && self.state.chunks.is_empty()
+            && self.retry_handler.are_all_tasks_done()
     }
 }
 

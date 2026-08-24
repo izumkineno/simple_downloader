@@ -198,6 +198,10 @@ impl RetryHandler {
         None
     }
 
+    pub(crate) fn push_front_retry(&mut self, chunk: FailedChunkInfo) {
+        self.retry_queue.push_front(chunk);
+    }
+
     /// 当一个块最终下载成功时，清除其重试记录。
     pub fn on_download_complete(&mut self, id: &ChunkId) {
         self.retry_attempts.remove(id);

@@ -525,18 +525,32 @@ where
             workers
         };
 
-        let mut initial_lanes = Vec::new();
         let initial_ranges = split_resume_ranges(resume_ranges, workers, multi_runtime.is_some());
+        let mut pending_initial = Vec::new();
+        let mut initial_lanes = Vec::new();
+        // 预先创建 monitor 以便缓冲因 lane 容量不足而暂缓的初始区间
+        let mut monitor = DownloadMonitor::new_with_completed(
+            file_size,
+            completed_bytes,
+            self.update_interval,
+            workers,
+        );
         for (start_byte, end_byte) in initial_ranges {
-            let id = next_chunk_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let (lane_id, rb) = if let Some(runtime) = multi_runtime.as_mut() {
-                runtime
-                    .claim_request_builder()
-                    .map(|(lane_id, rb)| (Some(lane_id), rb))
-                    .expect("validated runtime must provide an initial lane")
+                match runtime.claim_request_builder() {
+                    Some((lane_id, rb)) => (Some(lane_id), rb),
+                    None => {
+                        eprintln!(
+                            "[Downloader] lane 容量不足，缓冲初始区间 {start_byte}-{end_byte}"
+                        );
+                        pending_initial.push((start_byte, end_byte));
+                        continue;
+                    }
+                }
             } else {
                 (None, client.get(download_url.as_str()))
             };
+            let id = next_chunk_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if let Some(lane_id) = lane_id {
                 initial_lanes.push((id, lane_id));
             }
@@ -551,13 +565,9 @@ where
             );
             tasks.push(spawn(task));
         }
+        // 将缓冲的初始区间移入 monitor 的 pending 队列，待 tick 时按容量逐步调度
+        monitor.pending_bisects.extend(pending_initial);
 
-        let monitor = DownloadMonitor::new_with_completed(
-            file_size,
-            completed_bytes,
-            self.update_interval,
-            workers,
-        );
         monitor
             .run(
                 self.info_tx.subscribe(),
