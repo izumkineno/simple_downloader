@@ -165,6 +165,8 @@ async fn file_writer_task_impl(
                             eprintln!("[FileWriter] 写入文件失败！");
                             break;
                         }
+                        // 确保数据落盘可见后再做哈希校验，避免同一 fd 读到旧数据
+                        let _ = file.flush().await;
                         #[cfg(feature = "resume")]
                         if let Some(recorder) = resume_recorder.as_mut()
                             && let Err(e) = recorder
@@ -184,6 +186,7 @@ async fn file_writer_task_impl(
                         {
                             eprintln!("[FileWriter] 写入文件失败！");
                         } else {
+                            let _ = file.flush().await;
                             #[cfg(feature = "resume")]
                             if let Some(recorder) = resume_recorder.as_mut() {
                                 let _ = recorder
@@ -202,6 +205,7 @@ async fn file_writer_task_impl(
             if file.seek(io::SeekFrom::Start(p_off)).await.is_ok()
                 && file.write_all(&p_buf).await.is_ok()
             {
+                let _ = file.flush().await;
                 #[cfg(feature = "resume")]
                 if let Some(recorder) = resume_recorder.as_mut() {
                     let _ = recorder
