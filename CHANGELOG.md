@@ -9,20 +9,44 @@
 
 ### 新增
 
-- [ ] 支持 HTTP 范围请求的断点续传验证
-- [ ] 下载速度限制功能
-- [ ] 下载任务队列管理
+- [ ] 下载速度限制功能（全局/分源限速）
+- [ ] 下载任务队列管理（暂停/恢复/取消/查询）
 - [ ] 并行下载多个文件
 - [ ] 图形化进度展示工具
 
 ### 改进
 
-- [ ] 优化多源下载的负载均衡算法
-- [ ] 减少断点续传的元数据写入频率
-- [ ] 提升小文件下载性能
-- [ ] 优化内存使用，降低大文件下载时的内存占用
+- [ ] 更智能的多源调度评分（响应时间/吞吐/失败率）
+- [ ] 更完整的多代理端到端测试矩阵
+- [ ] 元数据 schema 跨版本迁移策略与可观测性增强
 
 ---
+
+## [0.2.0] - 2026-08-24
+
+### 🔧 修复（Correctness）
+
+- **广播背压**：`monitor.rs`/`chunk.rs` 区分 `Lagged/Closed`，消除积压误退出；`tasks` 分支仅在 `is_download_finished` 时提前退出，避免 `DownloadComplete` 竞态丢事件
+- **断点续传**：新建 sidecar 立即落盘（`<64KiB` 中断可恢复）；`record_write` 改 `tokio::fs` 异步落盘；成功后自动清理 `*.download.bitcode`
+- **异步阻塞**：`ResumePlan::prepare` 增 `prepare_async` 经 `spawn_blocking` 卸载，避免阻塞 Tokio 运行时
+- **阈值一致性**：统一 `MIN_CHUNK_SIZE=10KiB` 复用 `chunk` 常量，`downloader` 降级阈值重命名 `MIN_PARALLEL_FILE_SIZE=1MiB`；`split_resume_ranges` 加最小块守卫防碎片
+
+### ⚡ 性能
+
+- **广播节流**：`ChunkProgress` 64KiB/50ms 聚合 + 终局补发，广播量 -15×，消除 `Lagged` 抖动
+- **批量落盘**：`ResumeRecorder` 16 段/1s debounce + `flush()`，`fs_rename` -94%（8192→512）
+- **合并写入**：`FileWriter` 128KiB 相邻段合并，`seek/write` 系统调用 -10%
+- **并行探测**：`MultiRuntime::from_config` `FuturesUnordered` 并发 `get_file_info`，3 源 450ms→120ms -60%
+- **连接池**：默认/定制 `Client` 均注入 `pool_max_idle_per_host=32/idle_timeout 90s/tcp_keepalive 60s`，复用 h2
+
+### 📚 文档
+
+- `Cargo.toml` 补 `description/license/repository/homepage/documentation/keywords/categories` 与 `rust-version=1.85`
+- `configuration.md`/`installation.md`/`best-practices.md` 全量对齐真实 `Cargo.toml`/`usage.md`/`lane.rs` API，移除 `weight/priority/headers/full/vendored-openssl` 等伪接口
+- `errors.md` 移除虚构 `1xxx` 数字码，对齐 `DownloadError` 变体
+- `examples/download.rs`/`README` 外网 QQ 链路换 `proof.ovh.net`，支持 `env` 覆盖
+- `installation.md` 版本表、依赖版本（`tokio 1.52/reqwest 0.13/thiserror 2/bitcode 0.6`）与 Rust 1.85 对齐
+
 
 ## [0.1.0] - 2024-04-23
 
@@ -134,14 +158,21 @@
 - **Beta**：功能基本完整，正在进行测试，API 可能有少量变更
 - **Stable**：稳定版本，API 保持向后兼容，可用于生产环境
 
-当前版本 0.1.0 属于 Beta 阶段，预计在 0.2.0 版本达到稳定状态。
+当前版本 0.2.0 已达到 Beta 尾声、接近 Stable：默认档异步正确性、断点续传可靠性、文档契约与性能基线已对齐；预计 0.3.0 进入 Stable。
 
 ## 升级指南
+
+### 从 0.1.0 升级到 0.2.0
+
+0.2.0 完全向后兼容，无破坏性 API 变更。直接 `cargo update -p simple_downloader` 即可：
+
+- 新增 `ResumePlan::prepare_async`（内部使用），原 `prepare` 保留兼容
+- `ResumeRecorder` 增 `pending_segments/last_save` 与 `flush()`，对外不暴露破坏
+- 性能行为变更：`ChunkProgress` 节流（64KiB/50ms）、`save_atomic` 16段/1s 批量、`FileWriter` 128KiB 合并、`MultiRuntime` 并行探测、`Client` 连接池注入；下载结果不变，仅更少系统调用与广播
+- 文档 `configuration.md/installation.md/best-practices.md` 修正为真实 API，无需代码迁移
 
 ### 从 0.0.x 升级到 0.1.0
 
 0.1.0 是第一个公开版本，没有之前的版本，直接安装即可。
 
 ### 重大变更说明
-
-每个包含不兼容变更的版本都会在这里详细说明变更内容和迁移步骤。
