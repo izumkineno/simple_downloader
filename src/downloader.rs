@@ -413,7 +413,7 @@ where
                     )
                 }
                 DownloadMode::Multi(config) => {
-                    let (file_size, runtime) =
+                    let (file_size, mut runtime) =
                         MultiRuntime::from_config(config, &self.client_builder).await?;
                     let support_ranges = runtime.supports_ranges;
                     let (client, download_url) = runtime

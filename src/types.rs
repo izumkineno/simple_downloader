@@ -252,8 +252,8 @@ impl DownloadInfo {
                 total_size,
                 total_downloaded,
                 ..
-            } => *total_size > 0 && *total_downloaded >= *total_size,
-            _ => false,
+            } => *total_downloaded >= *total_size,
+        _ => false,
         }
     }
 }

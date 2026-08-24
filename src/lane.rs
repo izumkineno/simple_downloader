@@ -6,8 +6,9 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::Proxy;
 use reqwest::{Client, ClientBuilder};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 const BLACKLIST_THRESHOLD: u32 = 3;
-
+const BLACKLIST_DURATION: Duration = Duration::from_secs(30);
 /// 多源调度中 lane 的建模维度。
 ///
 /// - `PerSource`: 每个源一个 lane（默认），同一源的所有 chunk 共享该源的 `Client`。
@@ -236,13 +237,13 @@ impl LaneCandidate {
         }
     }
 }
-
 #[derive(Debug, Clone)]
 struct LaneEntry {
     candidate: LaneCandidate,
     active_chunks: usize,
     consecutive_failures: u32,
     health: LaneHealth,
+    blacklisted_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -301,6 +302,7 @@ impl LaneScheduler {
                 active_chunks: 0,
                 consecutive_failures: 0,
                 health: LaneHealth::Healthy,
+                blacklisted_at: None,
             })
             .collect();
         lanes.sort_by(|a, b| b.candidate.probe_speed.total_cmp(&a.candidate.probe_speed));
@@ -317,10 +319,28 @@ impl LaneScheduler {
         self.max_workers.saturating_sub(self.total_active_chunks())
     }
 
-    pub fn best_lane(&self) -> Option<FastStr> {
-        self.select_lane(false)
-            .or_else(|| self.select_lane(true))
+    pub fn best_lane(&mut self) -> Option<FastStr> {
+        self.decay_expired_blacklists();
+        // 先尝试健康 lane，容量不足或全黑时再退化到黑名单
+        if let Some(entry) = self.select_lane(false) {
+            return Some(entry.candidate.lane_id.clone());
+        }
+        self.select_lane(true)
             .map(|entry| entry.candidate.lane_id.clone())
+    }
+
+    fn decay_expired_blacklists(&mut self) {
+        for entry in &mut self.lanes {
+            if entry.health == LaneHealth::Blacklisted {
+                if let Some(at) = entry.blacklisted_at {
+                    if at.elapsed() >= BLACKLIST_DURATION {
+                        entry.health = LaneHealth::Healthy;
+                        entry.consecutive_failures = 0;
+                        entry.blacklisted_at = None;
+                    }
+                }
+            }
+        }
     }
 
     #[cfg_attr(not(any(test, feature = "multi-source")), allow(dead_code))]
@@ -330,7 +350,6 @@ impl LaneScheduler {
             .map(|entry| entry.candidate.lane_id.clone())
             .collect()
     }
-
     pub fn assign_chunk(&mut self, lane_id: impl AsRef<str>) {
         if let Some(entry) = self
             .lanes
@@ -360,6 +379,7 @@ impl LaneScheduler {
             entry.consecutive_failures += 1;
             if entry.consecutive_failures >= BLACKLIST_THRESHOLD {
                 entry.health = LaneHealth::Blacklisted;
+                entry.blacklisted_at = Some(Instant::now());
             }
         }
     }
@@ -372,6 +392,7 @@ impl LaneScheduler {
         {
             entry.consecutive_failures = 0;
             entry.health = LaneHealth::Healthy;
+            entry.blacklisted_at = None;
         }
     }
 
@@ -380,7 +401,16 @@ impl LaneScheduler {
         self.lanes
             .iter()
             .find(|entry| entry.candidate.lane_id.as_str() == lane_id.as_ref())
-            .map(|entry| entry.health)
+            .map(|entry| {
+                if entry.health == LaneHealth::Blacklisted {
+                    if let Some(at) = entry.blacklisted_at {
+                        if at.elapsed() >= BLACKLIST_DURATION {
+                            return LaneHealth::Healthy;
+                        }
+                    }
+                }
+                entry.health
+            })
     }
 
     fn total_active_chunks(&self) -> usize {
@@ -566,7 +596,7 @@ impl MultiRuntime {
         Some((lane_id, runtime.client.get(runtime.url.as_str())))
     }
 
-    pub fn primary_lane(&self) -> Option<(Client, FastStr)> {
+    pub fn primary_lane(&mut self) -> Option<(Client, FastStr)> {
         let lane_id = self.scheduler.best_lane()?;
         let runtime = self.runtimes.get(&lane_id)?.first()?;
         Some((runtime.client.clone(), runtime.url.clone()))
@@ -576,7 +606,7 @@ impl MultiRuntime {
         self.runtimes.get(lane_id)?.first()
     }
 
-    pub fn best_lane_runtime(&self) -> Option<&LaneRuntime> {
+    pub fn best_lane_runtime(&mut self) -> Option<&LaneRuntime> {
         let lane_id = self.scheduler.best_lane()?;
         self.lane_runtime(&lane_id)
     }
