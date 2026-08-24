@@ -12,7 +12,8 @@ const MAX_RETRIES: u32 = 10;
 const RETRY_DELAY: Duration = Duration::from_secs(2);
 /// 当达到最大即时重试次数后，进入延迟重试队列的等待时间。
 const DELAYED_RETRY_DURATION: Duration = Duration::from_secs(10);
-
+/// 单块跨延迟周期的最大总尝试次数，超过则判永久失败避免永重试挂死。
+const MAX_TOTAL_ATTEMPTS: u32 = 30;
 /// 存储失败块的信息，用于重试。
 #[derive(Debug)]
 pub struct FailedChunkInfo {
@@ -32,7 +33,6 @@ struct DelayedChunkInfo {
     /// 应该在何时进行下一次重试。
     retry_at: Instant,
 }
-
 /// 管理所有失败块重试逻辑的结构体。
 pub struct RetryHandler {
     /// 即时重试队列：失败的块会先进入这里。
@@ -41,6 +41,10 @@ pub struct RetryHandler {
     delayed_retry_queue: VecDeque<DelayedChunkInfo>,
     /// 记录每个块的重试次数。
     retry_attempts: HashMap<ChunkId, u32>,
+    /// 跨周期的总尝试次数，超过阈值判永久失败。
+    total_attempts: HashMap<ChunkId, u32>,
+    /// 永久失败的块，触发下载整体失败。
+    permanent_failures: Vec<FailedChunkInfo>,
 }
 
 impl Default for RetryHandler {
@@ -55,6 +59,8 @@ impl RetryHandler {
             retry_queue: VecDeque::new(),
             delayed_retry_queue: VecDeque::new(),
             retry_attempts: HashMap::new(),
+            total_attempts: HashMap::new(),
+            permanent_failures: Vec::new(),
         }
     }
 
@@ -73,15 +79,36 @@ impl RetryHandler {
         // 从活跃的块列表中移除该块
         state.chunks.remove(&id);
 
-        // 增加该块的重试次数
+        // 跨周期总计数，超过阈值判永久失败
+        let total = self.total_attempts.entry(id).or_insert(0);
+        *total += 1;
+        if *total > MAX_TOTAL_ATTEMPTS {
+            eprintln!("[RetryHandler] 块 {id} 已达总重试上限 {MAX_TOTAL_ATTEMPTS}，标记永久失败");
+            let _ = info_tx.send(DownloadInfo::ChunkStatusChanged {
+                id,
+                status: 5,
+                message: Some(format!("永久失败，已重试 {MAX_TOTAL_ATTEMPTS} 次: {error}")),
+            });
+            self.permanent_failures.push(FailedChunkInfo {
+                id,
+                start,
+                end,
+                failure_time: Instant::now(),
+                attempts: *total,
+            });
+            self.retry_attempts.remove(&id);
+            return;
+        }
+
+        // 增加该块的周期内重试次数
         let attempts = self.retry_attempts.entry(id).or_insert(0);
         *attempts += 1;
 
         if *attempts <= MAX_RETRIES {
             // 如果未达到最大重试次数，放入即时重试队列
             println!(
-                "[Monitor] 块 {id} 将进行第 {} 次重试 (共 {} 次).",
-                *attempts, MAX_RETRIES
+                "[Monitor] 块 {id} 将进行第 {} 次重试 (共 {} 次, 总 {}/{MAX_TOTAL_ATTEMPTS}).",
+                *attempts, MAX_RETRIES, *total
             );
 
             // 发送状态变更为“等待重试”
@@ -105,8 +132,8 @@ impl RetryHandler {
             // 如果已达到最大重试次数，放入延迟队列，等待一段时间后再次尝试。
             let retry_at = Instant::now() + DELAYED_RETRY_DURATION;
             println!(
-                "[Monitor] 块 {id} 已达到最大重试次数，将延迟到 {:?} 后再次尝试。",
-                DELAYED_RETRY_DURATION
+                "[Monitor] 块 {id} 已达到最大重试次数，将延迟到 {:?} 后再次尝试 (总 {}/{MAX_TOTAL_ATTEMPTS})。",
+                DELAYED_RETRY_DURATION, *total
             );
 
             // 发送状态变更为“延迟重试中”
@@ -174,10 +201,24 @@ impl RetryHandler {
     /// 当一个块最终下载成功时，清除其重试记录。
     pub fn on_download_complete(&mut self, id: &ChunkId) {
         self.retry_attempts.remove(id);
+        self.total_attempts.remove(id);
     }
 
     /// 检查所有重试队列是否都为空。
     pub fn are_all_tasks_done(&self) -> bool {
         self.retry_queue.is_empty() && self.delayed_retry_queue.is_empty()
+    }
+
+    pub fn has_permanent_failure(&self) -> bool {
+        !self.permanent_failures.is_empty()
+    }
+
+    pub fn permanent_failure_message(&self) -> Option<String> {
+        self.permanent_failures.first().map(|f| {
+            format!(
+                "块 {} 区间 {}-{} 永久失败，已重试 {} 次",
+                f.id, f.start, f.end, f.attempts
+            )
+        })
     }
 }

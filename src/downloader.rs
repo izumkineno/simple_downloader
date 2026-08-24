@@ -477,21 +477,23 @@ where
             spawn(progress_handler(file_size, self.info_tx.subscribe()));
         }
 
-        self.orchestrate_downloads(
-            file_size,
-            support_ranges,
-            writer_tx,
-            client,
-            &download_url,
-            workers,
-            multi_runtime,
-            initial_ranges,
-            completed_bytes,
-        )
-        .await?;
+        let orchestrate_result = self
+            .orchestrate_downloads(
+                file_size,
+                support_ranges,
+                writer_tx,
+                client,
+                &download_url,
+                workers,
+                multi_runtime,
+                initial_ranges,
+                completed_bytes,
+            )
+            .await;
         let _ = writer_shutdown_tx.send(DownloadCmd::TerminateAll).await;
         let _ = writer_handle.await;
         let _ = self.cmd_tx.send(DownloadCmd::TerminateAll);
+        orchestrate_result?;
         #[cfg(feature = "resume")]
         {
             // 下载成功后清理 sidecar，避免下次启动做全量哈希校验
@@ -569,7 +571,7 @@ where
                 initial_lanes,
                 multi_runtime,
             )
-            .await;
+            .await?;
         Ok(())
     }
 }

@@ -70,7 +70,7 @@ impl DownloadMonitor {
         url: Option<&FastStr>,
         initial_lanes: Vec<(ChunkId, FastStr)>,
         mut multi_runtime: Option<MultiRuntime>,
-    ) {
+    ) -> Result<(), crate::types::DownloadError> {
         for (chunk_id, lane_id) in initial_lanes {
             self.lane_bindings.insert(chunk_id, lane_id);
         }
@@ -79,6 +79,16 @@ impl DownloadMonitor {
         let mut last_tick_time = Instant::now();
 
         'main_loop: loop {
+            // 永久失败快速退出，避免无限挂死
+            if self.retry_handler.has_permanent_failure() {
+                let msg = self
+                    .retry_handler
+                    .permanent_failure_message()
+                    .unwrap_or_else(|| "unknown permanent failure".to_owned());
+                let _ = cmd_tx.send(DownloadCmd::TerminateAll);
+                eprintln!("[Monitor] 永久失败，终止下载: {msg}");
+                return Err(crate::types::DownloadError::PermanentFailure(msg));
+            }
             tokio::select! {
                 // `biased` 确保优先处理已完成的任务和信息，而不是等待定时器。
                 biased;
@@ -111,6 +121,14 @@ impl DownloadMonitor {
                             url,
                             multi_runtime.as_mut(),
                         );
+                        if self.retry_handler.has_permanent_failure() {
+                            let msg = self
+                                .retry_handler
+                                .permanent_failure_message()
+                                .unwrap_or_else(|| "unknown permanent failure".to_owned());
+                            let _ = cmd_tx.send(DownloadCmd::TerminateAll);
+                            return Err(crate::types::DownloadError::PermanentFailure(msg));
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         eprintln!("[Monitor] 广播滞后，跳过 {skipped} 条事件，继续运行");
@@ -138,12 +156,20 @@ impl DownloadMonitor {
                         // 如果 tick 处理器返回 true，表示下载已完成
                         break 'main_loop;
                     }
+                    if self.retry_handler.has_permanent_failure() {
+                        let msg = self
+                            .retry_handler
+                            .permanent_failure_message()
+                            .unwrap_or_else(|| "unknown permanent failure".to_owned());
+                        let _ = cmd_tx.send(DownloadCmd::TerminateAll);
+                        return Err(crate::types::DownloadError::PermanentFailure(msg));
+                    }
                 },
             }
         }
         println!("[Monitor] 所有下载任务已完成。监控器正在关闭。");
+        Ok(())
     }
-
     /// 处理从下载块接收到的各种 `DownloadInfo` 消息。
     #[allow(clippy::too_many_arguments)]
     fn handle_download_info(

@@ -79,6 +79,10 @@ pub enum DownloadError {
     /// - 元数据被手动修改
     #[error("断点续传元数据无效: {0}")]
     ResumeMetadata(String),
+
+    /// 块下载永久失败，已达重试上限。
+    #[error("下载失败，已达重试上限: {0}")]
+    PermanentFailure(String),
 }
 
 /// 发送给下载器组件的控制命令。
