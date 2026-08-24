@@ -137,8 +137,11 @@ impl RetryHandler {
         let now = Instant::now();
         while let Some(delayed_info) = self.delayed_retry_queue.front() {
             if now >= delayed_info.retry_at {
-                // 时间到了，将它从延迟队列中取出
-                let mut info_to_retry = self.delayed_retry_queue.pop_front().unwrap().chunk;
+                let delayed = self
+                    .delayed_retry_queue
+                    .pop_front()
+                    .expect("front is Some, pop_front must succeed");
+                let mut info_to_retry = delayed.chunk;
 
                 // 重置失败时间戳和尝试次数，让它能进入主重试队列并被立即处理
                 info_to_retry.failure_time = Instant::now();

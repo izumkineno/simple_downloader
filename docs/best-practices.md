@@ -87,21 +87,16 @@ Downloader::builder(url, path)
 下载中断后，再次运行相同的代码会自动从断点恢复，不需要额外处理。
 
 ### 2. 定期清理不需要的断点元数据
-断点续传的元数据文件（`*.resume`）会占用少量磁盘空间，下载完成后如果不需要可以删除：
+断点续传的元数据文件（`*.download.bitcode`，见 `src/resume.rs:RESUME_EXTENSION`）本库在下载成功后已自动删除（`downloader.rs:run_internal`），失败/中断残留则下次自动复用已校验 segment；仅在需彻底清理或敏感场景下手动删除：
 ```rust
-use std::fs;
+use std::path::Path;
+use simple_downloader::{metadata_path_for, Downloader};
 
 let output_path = "output.zip";
-let resume_path = format!("{}.resume", output_path);
-
-Downloader::builder(url, output_path)
-    .resume(true)
-    .download()
-    .await
-    .unwrap();
-
-// 下载成功后删除元数据文件（可选）
-let _ = fs::remove_file(resume_path);
+Downloader::builder("https://example.com/file.zip", output_path)
+    .download().await.unwrap();
+// 成功后 sidecar 已被自动清理；若需手动清理失败残留：
+let _ = std::fs::remove_file(metadata_path_for(output_path));
 ```
 
 ### 3. 敏感文件下载的安全处理
@@ -185,35 +180,25 @@ Downloader::builder(url, path)
 - 避免使用不可靠或速度慢的源
 - 确保所有源的文件是同一个版本，避免下载到不完整或损坏的文件
 
-### 2. 合理设置源的权重和优先级
+### 2. 合理设置多源与 lane
+多源无 `weight/priority` 概念（旧文已过时），以 `MultiSourceConfig::new` + `SourceConfig::with_id` + `with_max_chunks_per_*`/`LaneModel` 为准（见 `docs/usage.md` §7）：
 ```rust
-let config = MultiSourceConfig::builder(
-    vec![
-        // 本地镜像，速度最快，权重最高
-        SourceConfig::new("https://local-mirror.example.com/file.zip")
-            .weight(3)
-            .priority(1),
-        // 官方源，速度中等
-        SourceConfig::new("https://official.example.com/file.zip")
-            .weight(2)
-            .priority(2),
-        // 第三方镜像，速度较慢
-        SourceConfig::new("https://third-party.example.com/file.zip")
-            .weight(1)
-            .priority(3),
-    ],
-    "output.zip",
-)
-.workers(24)
-.build();
+use simple_downloader::{MultiSourceConfig, SourceConfig, LaneModel, Downloader};
+
+let cfg = MultiSourceConfig::new("output.zip", 32, 0.5)
+    .with_sources(vec![
+        SourceConfig::new("https://mirror1.example.com/file.zip").with_id("m1"),
+        SourceConfig::new("https://mirror2.example.com/file.zip").with_id("m2"),
+        SourceConfig::new("https://mirror3.example.com/file.zip"),
+    ])
+    .with_lane_model(LaneModel::PerSource) // 或 PerSourceProxy 需 proxy feature
+    .with_max_chunks_per_lane(2)
+    .with_max_chunks_per_source(Some(8));
+Downloader::new_multi(cfg, Default::default).download().await.unwrap();
 ```
 
-### 3. 配置足够的备用源
-建议配置至少 2-3 个备用源，当主源故障时可以自动切换到备用源，提高下载成功率。
-
-### 4. 监控源的健康状态
-在生产环境使用多源下载时，建议定期检查各个源的可用性，及时移除不可用的源，添加新的可用源。
-
+### 3. 备用源与健康检查
+建议配置 2–3 个备用源；启动时不可用源会被自动跳过，连续失败 `≥3` 次的 lane 进黑名单，运行时健康由 `LaneScheduler` 管理，无需手动 `health_check_interval`。
 ---
 
 ## 代理使用最佳实践

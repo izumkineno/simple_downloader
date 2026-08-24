@@ -1,28 +1,45 @@
 # 配置参考
 
-本文档详细介绍 simple_downloader 的所有可配置选项和参数。
+本文档详细介绍 simple_downloader 的所有可配置选项和参数。以 `Cargo.toml:14-19` 与 `docs/usage.md` 为准。
 
 ## 核心配置选项
 
-### 1. 基本配置
+### 1. 基本配置（`Downloader::builder`）
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `url` | `String` | 必填 | 要下载的文件的 URL |
-| `output_path` | `String` | 必填 | 下载后文件的保存路径 |
-| `workers` | `u64` | CPU 核心数 | 并发下载的工作线程数，最小值为 1 |
-| `update_interval` | `f64` | 0.5 | 进度更新间隔时间（秒），必须大于 0 |
+| `url` | `impl Into<FastStr>` | 必填 | 要下载的文件 URL（`builder(url, output)` 第1参） |
+| `output_path` | `impl Into<FastStr>` | 必填 | 保存路径（第2参） |
+| `workers` | `u64` | CPU 核心数（`available_parallelism`） | 并发上限 `max(1,n)`，实际受 §11 自动降级约束：不支持 Range 或 `<1 MiB` 时降为 1 |
+| `update_interval` | `f64` | `0.5` | `MonitorUpdate` 广播间隔（秒），`>0` 才生效 |
+
+```rust
+use simple_downloader::Downloader;
+let dl = Downloader::builder("https://example.com/file.bin", "output.bin")
+    .workers(16)
+    .update_interval(0.5)
+    .build();
+```
 
 ### 2. 断点续传配置（`resume` feature）
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `resume_enabled` | `bool` | `true` | 是否启用断点续传功能 |
-| `DEFAULT_SEGMENT_SIZE` | `u64` | 1MB | 断点续传的元数据段大小（内部常量） |
+| `resume(bool)` | `DownloadBuilder::resume` / `Downloader::with_resume` | `true`（feature 启用时） | 是否启用断点续传。关闭则忽略并删除同级 `*.download.bitcode` |
+| `DEFAULT_SEGMENT_SIZE` | `u64` | `64 KiB` | `src/resume.rs` 固定 segment 大小，哈希校验粒度（非 chunk 大小） |
+
+```rust
+use simple_downloader::Downloader;
+Downloader::builder("https://example.com/large.bin", "large.bin")
+    .resume(false) // 强制全新下载
+    .download().await?;
+```
+
+sidecar 路径：`metadata_path_for("a.bin") -> "a.bin.download.bitcode"`，`verify` 仅复用哈希通过的 segment。
 
 ### 3. HTTP 客户端配置
 
-可以通过 `client_builder` 方法自定义 reqwest 客户端的所有配置：
+通过 `client_builder` 注入 `reqwest::ClientBuilder` 闭包，可定制超时、证书、代理等（见 `src/lib.rs:128-143` 示例）：
 
 ```rust
 use reqwest::ClientBuilder;
@@ -31,214 +48,150 @@ use std::time::Duration;
 let downloader = Downloader::builder("https://example.com/file.bin", "output.bin")
     .client_builder(|| {
         ClientBuilder::new()
-            .timeout(Duration::from_secs(30)) // 请求超时时间
-            .connect_timeout(Duration::from_secs(10)) // 连接超时时间
-            .tcp_keepalive(Duration::from_secs(60)) // TCP 保持连接时间
-            .gzip(true) // 启用 Gzip 压缩
-            .brotli(true) // 启用 Brotli 压缩
-            .deflate(true) // 启用 Deflate 压缩
-            .https_only(true) // 仅允许 HTTPS 请求
-            .danger_accept_invalid_certs(false) // 不接受无效证书
+            .timeout(Duration::from_secs(120))
+            .connect_timeout(Duration::from_secs(10))
+            .tcp_keepalive(Duration::from_secs(60))
     })
     .build();
 ```
 
-#### 常用客户端配置说明
-
-| 配置项 | 说明 | 默认值 |
-|--------|------|--------|
-| `timeout` | 请求总超时时间 | 无超时 |
-| `connect_timeout` | 连接建立超时时间 | 30 秒 |
-| `tcp_keepalive` | TCP 连接保持时间 | 无 |
-| `gzip`/`brotli`/`deflate` | 启用对应的压缩算法 | 全部启用 |
-| `https_only` | 是否只允许 HTTPS 请求 | `false` |
-| `danger_accept_invalid_certs` | 是否接受无效的 SSL 证书 | `false` |
-| `proxy` | 代理服务器配置 | 无 |
+常用项：`timeout` / `connect_timeout` / `tcp_keepalive` / `pool_max_idle_per_host` / `gzip/brotli/deflate` / `https_only` / `danger_accept_invalid_certs` / `proxy`。本库默认 `reqwest` 走 `rustls`（见 `cargo tree | grep rustls`），无需系统 `openssl`。
 
 ## Feature Flags 配置
 
-simple_downloader 使用 feature flags 来启用或禁用可选功能，默认启用所有功能。
+以 `Cargo.toml:14-19` 为准，默认**不启用**任何可选 feature（`default = []`）：
 
-### 可用 Feature 列表
-
-| Feature | 默认启用 | 依赖 | 说明 |
-|---------|---------|------|------|
-| `default` | ✅ | - | 默认启用所有功能 |
-| `resume` | ✅ | `serde`, `bincode` | 断点续传功能 |
-| `progress` | ✅ | - | 下载进度监控功能 |
-| `proxy` | ✅ | `reqwest/proxy` | 代理支持功能 |
-| `multi-source` | ✅ | - | 多源下载功能 |
-
-### 自定义 Feature 组合
-
-如果只需要基础下载功能，可以在 Cargo.toml 中禁用默认功能并按需启用：
+| Feature | 默认 | 隐含依赖 | 说明 |
+|---------|------|----------|------|
+| `resume` | ❌ | `bitcode@0.6` | 断点续传、`*.download.bitcode`、`resume(bool)`/`with_resume` |
+| `progress` | ❌ | — | `DownloadInfo` 与 `run(handler)` 进度回调 |
+| `multi-source` | ❌ | — | `MultiSourceConfig`/`SourceConfig`/`LaneModel`、`Downloader::new_multi` |
+| `proxy` | ❌ | `multi-source` | `ProxyConfig`、`SourceConfig::with_proxies`，支持 `http/https/socks5` |
+| `default` | ❌ | — | 仅基础单源多线程下载 `Downloader::builder().download()` |
 
 ```toml
-[dependencies]
-simple_downloader = { version = "0.1", default-features = false, features = ["resume"] }
+# 最轻量
+simple_downloader = { version = "0.1", default-features = false }
+# 常用：基础 + 断点续传 + 进度
+simple_downloader = { version = "0.1", default-features = false, features = ["resume","progress"] }
+# 全功能
+simple_downloader = { version = "0.1", default-features = false, features = ["resume","progress","multi-source","proxy"] }
 ```
+
+> 历史文档中 `default = [resume, progress, ...]` 与 `full` 已过时。
 
 ## 多源下载配置（`multi-source` feature）
 
-### MultiSourceConfig 配置
+### 构造示例（以 `docs/usage.md` §7 为准）
 
 ```rust
-use simple_downloader::{MultiSourceConfig, SourceConfig};
+use simple_downloader::{Downloader, MultiSourceConfig, SourceConfig, LaneModel};
 
-let config = MultiSourceConfig::builder(
-    vec![
-        SourceConfig::new("https://mirror1.example.com/file.bin")
-            .weight(2) // 设置源的权重，权重越高分配的任务越多
-            .priority(1), // 设置源的优先级，数字越小优先级越高
-        SourceConfig::new("https://mirror2.example.com/file.bin")
-            .weight(1)
-            .priority(2),
-    ],
-    "output.bin",
-)
-.workers(32) // 总并发线程数
-.update_interval(1.0)
-.health_check_interval(30) // 源健康检查间隔（秒）
-.max_retries_per_source(5) // 每个源的最大重试次数
-.build();
+let cfg = MultiSourceConfig::new("output.bin", 32, 0.5)
+    .with_sources(vec![
+        SourceConfig::new("https://mirror1.example.com/file.bin").with_id("m1"),
+        SourceConfig::new("https://mirror2.example.com/file.bin"), // id 自动为 url
+    ])
+    .with_lane_model(LaneModel::PerSource) // 或 PerSourceProxy（需 proxy feature）
+    .with_max_chunks_per_lane(2)
+    .with_max_chunks_per_source(Some(8));
+
+Downloader::new_multi(cfg, Default::default).download().await?;
 ```
 
-### SourceConfig 配置项
+### SourceConfig
 
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `url` | `String` | 必填 | 下载源的 URL |
-| `weight` | `u32` | 1 | 源的权重，权重越高分配的下载任务越多 |
-| `priority` | `u32` | 1 | 源的优先级，数字越小优先级越高，优先使用高优先级的源 |
-| `headers` | `HeaderMap` | 空 | 该源的自定义 HTTP 请求头 |
+| 方法 | 说明 |
+|------|------|
+| `SourceConfig::new(url)` | 新建源，`id` 默认即 `url` |
+| `.with_id("m1")` | 显式 lane/source 标识 |
+| `.with_proxies(vec![ProxyConfig::http("http://proxy:8080").unwrap()])` | 需 `proxy` feature |
 
-### MultiSourceConfig 配置项
+### MultiSourceConfig
 
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `sources` | `Vec<SourceConfig>` | 必填 | 下载源列表 |
-| `output_path` | `String` | 必填 | 文件保存路径 |
-| `workers` | `u64` | CPU 核心数 | 总并发下载线程数 |
-| `update_interval` | `f64` | 0.5 | 进度更新间隔（秒） |
-| `health_check_interval` | `u64` | 30 | 源健康检查间隔时间（秒） |
-| `max_retries_per_source` | `u32` | 5 | 每个源的最大连续失败次数，超过后会被标记为不可用 |
-| `failover_threshold` | `f64` | 0.5 | 源故障转移阈值，当源的成功率低于此值时会被降级 |
+| 方法 | 说明 |
+|------|------|
+| `MultiSourceConfig::new(output, workers, update_interval)` | `workers = max(1,n)`，`update_interval>0` |
+| `.with_sources(vec![...])` | 设置镜像列表 |
+| `.with_lane_model(LaneModel::PerSource\|PerSourceProxy)` | `PerSource` 同源共享 lane，`PerSourceProxy` 按 源×代理 独立 lane |
+| `.with_max_chunks_per_lane(n)` | 单 lane 并发上限 |
+| `.with_max_chunks_per_source(Some(n))` | 单源并发上限（仅 PerSource 生效） |
 
-## 代理配置（`proxy` feature）
+调度：启动时 `get_file_info` 探测各源，跳过不可用/不支持 Range/大小不一致的源，全不可用则 `Err(NoAvailableSources)`；`BLACKLIST_THRESHOLD=3` 连续失败进黑名单。
 
-### HTTP/HTTPS 代理
+## 代理配置（`proxy` feature，隐含 `multi-source`）
+
+`SourceConfig::with_proxies` 以 lane 维度建模，`ClientBuilder` 侧亦可直接 `proxy(Proxy::all(..))` 注入：
 
 ```rust
-use reqwest::Proxy;
+use simple_downloader::{ProxyConfig, SourceConfig, MultiSourceConfig, LaneModel, Downloader};
 
-let downloader = Downloader::builder("https://example.com/file.bin", "output.bin")
-    .client_builder(|| {
-        ClientBuilder::new()
-            .proxy(Proxy::http("http://proxy.example.com:8080").unwrap())
-            .proxy(Proxy::https("http://proxy.example.com:8080").unwrap())
-    })
-    .build();
+let src = SourceConfig::new("https://example.com/file.bin")
+    .with_proxies(vec![
+        ProxyConfig::http("http://proxy.example.com:8080").unwrap(),
+        ProxyConfig::socks5("socks5://proxy.example.com:1080").unwrap(),
+    ]);
+
+let cfg = MultiSourceConfig::new("output.bin", 16, 0.5)
+    .with_sources(vec![src])
+    .with_lane_model(LaneModel::PerSourceProxy);
+
+Downloader::new_multi(cfg, Default::default).download().await?;
 ```
 
-### SOCKS5 代理
-
-```rust
-use reqwest::Proxy;
-
-let downloader = Downloader::builder("https://example.com/file.bin", "output.bin")
-    .client_builder(|| {
-        ClientBuilder::new()
-            .proxy(Proxy::socks5("socks5://proxy.example.com:1080").unwrap())
-    })
-    .build();
-```
-
-### 带认证的代理
-
-```rust
-use reqwest::Proxy;
-
-let downloader = Downloader::builder("https://example.com/file.bin", "output.bin")
-    .client_builder(|| {
-        ClientBuilder::new()
-            .proxy(Proxy::http("http://user:password@proxy.example.com:8080").unwrap())
-    })
-    .build();
-```
+短链：`ProxyConfig::http/https/socks5(url) -> Result<Self>`，`with_id` 可显式命名。
 
 ## 环境变量配置
 
-simple_downloader 会自动识别以下环境变量：
+底层 `reqwest` 会自动识别（无需本库额外代码）：
 
 | 环境变量 | 说明 |
 |----------|------|
-| `HTTP_PROXY` / `http_proxy` | HTTP 代理服务器地址 |
-| `HTTPS_PROXY` / `https_proxy` | HTTPS 代理服务器地址 |
-| `ALL_PROXY` / `all_proxy` | 所有协议的默认代理服务器地址 |
-| `NO_PROXY` / `no_proxy` | 不使用代理的域名列表，用逗号分隔 |
+| `HTTP_PROXY` / `http_proxy` | HTTP 代理 |
+| `HTTPS_PROXY` / `https_proxy` | HTTPS 代理 |
+| `ALL_PROXY` / `all_proxy` | 默认代理 |
+| `NO_PROXY` / `no_proxy` | 直连域名列表（逗号分隔） |
 
 ## 性能优化建议
 
-### 1. 并发线程数配置
+### 1. 并发线程数
 
-- 对于小文件（< 100MB）：建议使用 4-8 个线程
-- 对于大文件（> 1GB）：建议使用 16-32 个线程
-- 对于多源下载：可以适当增加线程数，但不要超过源的数量 × 4
-- 注意：过多的线程可能会导致服务器限流或连接超时
+- 小文件（<100 MiB）：4–8
+- 大文件（>1 GiB）：16–32
+- 多源：可至 32，但受 `max_chunks_per_lane/source` 与服务器限流约束
 
-### 2. 进度更新间隔
+### 2. 进度间隔
 
-- 如果不需要实时进度，可以将 `update_interval` 设置为 1-5 秒，减少 CPU 占用
-- 如果需要精确的进度统计，可以保持默认的 0.5 秒
+- 桌面 UI：0.5–1s；服务端：1–5s 降 CPU
 
-### 3. 断点续传配置
+### 3. 断点续传
 
-- 对于大文件下载，强烈建议启用断点续传功能
-- 如果下载的是临时文件或者小文件，可以禁用断点续传以减少磁盘 I/O
+- 大文件强烈建议启用；临时小文件可 `resume(false)` 减 I/O
+- 本库下载成功后已自动删除 `*.download.bitcode`，无需手动清理；失败/中断残留则下次自动复用已校验 segment
 
-### 4. 客户端配置优化
+### 4. 客户端优化
 
 ```rust
 use reqwest::ClientBuilder;
 use std::time::Duration;
-
-let downloader = Downloader::builder("https://example.com/large_file.bin", "output.bin")
+Downloader::builder("https://example.com/large.bin", "output.bin")
     .workers(32)
     .client_builder(|| {
         ClientBuilder::new()
-            .timeout(Duration::from_secs(120)) // 大文件下载需要更长的超时时间
+            .timeout(Duration::from_secs(120))
             .tcp_keepalive(Duration::from_secs(60))
-            .pool_max_idle_per_host(32) // 增加连接池大小，避免频繁创建连接
+            .pool_max_idle_per_host(32)
     })
     .build();
 ```
 
 ## 配置验证
 
-可以通过以下方法验证配置是否正确：
-
-```rust
-use simple_downloader::Downloader;
-
-#[tokio::main]
-async fn main() {
-    let builder = Downloader::builder("https://example.com/file.bin", "output.bin")
-        .workers(16)
-        .update_interval(1.0);
-    
-    // 构建下载器实例
-    let downloader = builder.build();
-    
-    // 检查配置是否符合预期
-    assert_eq!(downloader.workers(), 16);
-    assert_eq!(downloader.update_interval(), 1.0);
-}
-```
+当前 `Downloader` 未暴露 `workers()` getter，校验应以 `DownloadBuilder` 的构建参数或运行时 `DownloadInfo::MonitorUpdate.chunk_details`/`total_speed` 为准，勿断言 `downloader.workers()`。
 
 ## 配置最佳实践
 
-1. **使用 Builder 模式**：推荐使用 `Downloader::builder()` 来配置下载器，而不是直接调用 `Downloader::new()`
-2. **合理设置超时**：根据文件大小和网络状况设置合理的超时时间，避免长时间等待
-3. **启用压缩**：默认启用的压缩算法可以显著减少下载时间，除非有特殊需求否则不要禁用
-4. **配置连接池**：对于多线程下载，适当增加连接池大小可以提高性能
-5. **使用环境变量配置代理**：优先使用环境变量配置代理，而不是硬编码在代码中
+1. 优先 `Downloader::builder(url, path)` 而非 `Downloader::new`（后者仅多源 `new_multi` 必要时使用）
+2. 大文件加长 `timeout`，小文件减 `workers`
+3. 多源仅对同文件多镜像生效，需保证各源 `Content-Length` 一致
+4. 代理优先走 `NO_PROXY` 环境变量，避免硬编码密码

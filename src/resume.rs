@@ -220,6 +220,21 @@ impl ResumePlan {
         })
     }
 
+    /// 异步入口：通过 `spawn_blocking` 将同步文件 I/O 卸载，避免阻塞 Tokio 运行时
+    pub async fn prepare_async(
+        output_path: PathBuf,
+        file_size: u64,
+        enabled: bool,
+    ) -> Result<Self> {
+        tokio::task::spawn_blocking(move || Self::prepare(&output_path, file_size, enabled))
+            .await
+            .unwrap_or_else(|e| {
+                Err(DownloadError::ResumeMetadata(format!(
+                    "resume prepare panicked: {e}"
+                )))
+            })
+    }
+
     pub fn into_recorder(self) -> Option<ResumeRecorder> {
         self.metadata
             .map(|metadata| ResumeRecorder::new(self.metadata_path, metadata))

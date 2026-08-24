@@ -427,11 +427,12 @@ where
         #[cfg(feature = "resume")]
         let writer_path_string = writer_path.to_string();
         #[cfg(feature = "resume")]
-        let resume_plan = ResumePlan::prepare(
-            Path::new(&writer_path_string),
+        let resume_plan = ResumePlan::prepare_async(
+            Path::new(&writer_path_string).to_path_buf(),
             file_size,
             self.resume_enabled,
-        )?;
+        )
+        .await?;
         #[cfg(feature = "resume")]
         if resume_plan.completed_bytes > 0 && !support_ranges {
             return Err(DownloadError::ResumeMetadata(
