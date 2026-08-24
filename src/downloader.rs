@@ -14,8 +14,8 @@ use crate::util::file_writer_task;
 use crate::util::file_writer_task_with_resume;
 use crate::util::get_file_info;
 use faststr::FastStr;
-use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use reqwest::{Client, ClientBuilder};
 #[cfg(feature = "resume")]
 use std::path::Path;
@@ -403,17 +403,23 @@ where
                         .pool_idle_timeout(Duration::from_secs(90))
                         .tcp_keepalive(Duration::from_secs(60))
                         .build()?;
-                    let (file_size, support_ranges) = match get_file_info(&client, &config.url).await {
-                        Ok(v) => v,
-                        Err(DownloadError::MissingContentLength) => {
-                            let writer_path = config.output_path.clone();
-                            let download_url = config.url.clone();
-                            return self
-                                .streaming_download(client, download_url, writer_path, progress_handler)
-                                .await;
-                        }
-                        Err(e) => return Err(e),
-                    };
+                    let (file_size, support_ranges) =
+                        match get_file_info(&client, &config.url).await {
+                            Ok(v) => v,
+                            Err(DownloadError::MissingContentLength) => {
+                                let writer_path = config.output_path.clone();
+                                let download_url = config.url.clone();
+                                return self
+                                    .streaming_download(
+                                        client,
+                                        download_url,
+                                        writer_path,
+                                        progress_handler,
+                                    )
+                                    .await;
+                            }
+                            Err(e) => return Err(e),
+                        };
                     (
                         file_size,
                         support_ranges,
@@ -440,7 +446,12 @@ where
                                 let writer_path = config.output_path.clone();
                                 let download_url = first.url.clone();
                                 return self
-                                    .streaming_download(client, download_url, writer_path, progress_handler)
+                                    .streaming_download(
+                                        client,
+                                        download_url,
+                                        writer_path,
+                                        progress_handler,
+                                    )
                                     .await;
                             } else {
                                 return Err(DownloadError::NoAvailableSources);
@@ -625,7 +636,6 @@ where
         let _ = self.info_tx.send(DownloadInfo::DownloadComplete(0));
         Ok(())
     }
-
 
     #[allow(clippy::too_many_arguments)]
     async fn orchestrate_downloads(

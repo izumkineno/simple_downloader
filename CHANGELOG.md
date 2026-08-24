@@ -22,6 +22,14 @@
 
 ---
 
+## [0.3.1] - 2026-08-24
+
+### 🔧 修复
+
+- **MissingContentLength 流式回退** `downloader::run_internal` 单源/多源在 `get_file_info` 返回 `MissingContentLength`/`NoAvailableSources` 时自动回退为 **单流流式下载**（`streaming_download`）：`file_writer_task(0)` 零预分配，`bytes_stream` 顺序 `offset+=len`，`ChunkProgress` + `ticker 0.5s MonitorUpdate(total_size 0)`，`writer flush` 前哈希，`DownloadComplete` 收尾；`progress_handler(0, rx)` 兼容
+- **is_complete 未知大小误判** `types::DownloadInfo::is_complete` 对 `total_size==0` 改为 `downloaded==0`（`0/0 完成，0/N 未完成`），修复流式 `0/10` 误判完成而 `0/0` 仍完成
+- **docs** `docs/errors.md` `MissingContentLength` 表格与详情更新为 `0.3.1+ 自动回退` 行为
+- **tests** 新增 `tests/missing_content_length.rs` 2 用例：`chunked-body-no-length` 流式回退（`HEAD 200 无长度` + `Range 0-0 200 chunked` + `GET chunked`）与 `0 字节 is_complete` 语义，`cargo test --test missing_content_length --all-features 2 passed`
 ## [0.3.0] - 2026-08-24
 
 ### 🔧 修复（Correctness - P0 挂死/丢数据）
@@ -187,9 +195,16 @@
 - **Beta**：功能基本完整，正在进行测试，API 可能有少量变更
 - **Stable**：稳定版本，API 保持向后兼容，可用于生产环境
 
-当前版本 0.3.0 已进入 Stable：P0 挂死/丢数据、P1 正确性、P2 契约与 `test_server` 9 用例集成已对齐；`0.2.x` 保持兼容。
+当前版本 0.3.1 已进入 Stable：`MissingContentLength` 流式回退与 `is_complete` 未知大小语义已对齐；`0.3.0` 保持兼容。
 
 ## 升级指南
+
+### 从 0.3.0 升级到 0.3.1
+
+Patch 级向后兼容：`cargo update -p simple_downloader` 即可
+
+- `MissingContentLength` 不再直接 `Err`，`Downloader` 自动 `streaming_download` 单流回退（`Transfer-Encoding: chunked`），`DownloadInfo::is_complete` 对 `0/N` 改为 `downloaded==0` 语义
+- 其余 `0.3.0` API 保持不变
 
 ### 从 0.2.0 升级到 0.3.0
 
