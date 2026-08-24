@@ -599,12 +599,26 @@ where
 
         #[cfg(feature = "proxy")]
         for proxy in &source.proxies {
-            let client = (client_builder)()
-                .proxy(Proxy::all(proxy.url.as_str())?)
+            let proxy_obj = match Proxy::all(proxy.url.as_str()) {
+                Ok(p) => p,
+                Err(error) => {
+                    eprintln!("[Lane] 代理 {} 解析失败: {error}, 跳过该 lane", proxy.url);
+                    continue;
+                }
+            };
+            let client = match (client_builder)()
+                .proxy(proxy_obj)
                 .pool_max_idle_per_host(32)
                 .pool_idle_timeout(std::time::Duration::from_secs(90))
                 .tcp_keepalive(std::time::Duration::from_secs(60))
-                .build()?;
+                .build()
+            {
+                Ok(c) => c,
+                Err(error) => {
+                    eprintln!("[Lane] 代理 {} 构建 Client 失败: {error}, 跳过", proxy.url);
+                    continue;
+                }
+            };
             let lane_id = match config.lane_model {
                 LaneModel::PerSource => source.id.clone(),
                 LaneModel::PerSourceProxy => {
@@ -620,6 +634,7 @@ where
                 probe_speed: 0.0,
             });
         }
+
     }
 
     Ok(runtimes)
