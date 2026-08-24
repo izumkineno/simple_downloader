@@ -24,8 +24,11 @@ use tokio::task::JoinHandle;
 /// 一个元组 `(u64, bool)`，分别代表文件总大小和服务器是否支持范围请求。
 pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
     use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE};
+    use reqwest::StatusCode;
 
-    // 1. 尝试 HEAD 请求
+    // 记录 HEAD 探测结果，但不直接作为 Range 判定依据；Accept-Ranges 缺失时仍可能支持 Range
+    let mut head_size: Option<u64> = None;
+    let mut head_support = false;
     if let Ok(resp) = client
         .head(url)
         .send()
@@ -37,14 +40,14 @@ pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
             && let Ok(len_str) = len_val.to_str()
             && let Ok(content_length) = len_str.parse::<u64>()
         {
-            let accept_ranges = headers
+            head_size = Some(content_length);
+            head_support = headers
                 .get(ACCEPT_RANGES)
                 .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"bytes"));
-            return Ok((content_length, accept_ranges));
         }
     }
 
-    // 2. 回退到范围 GET 请求
+    // 2. 范围 GET 探测：以 206/ Content-Range 为金标准
     let range_resp = client
         .get(url)
         .header("Range", "bytes=0-0")
@@ -52,34 +55,60 @@ pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
         .await?
         .error_for_status()?;
 
+    let status = range_resp.status();
     let headers = range_resp.headers();
+    if status == StatusCode::PARTIAL_CONTENT {
+        if let Some(cr) = headers.get(CONTENT_RANGE)
+            && let Ok(crs) = cr.to_str()
+        {
+            if let Some(pos) = crs.rfind('/') {
+                let total = &crs[pos + 1..].trim();
+                if *total != "*"
+                    && let Ok(content_length) = total.parse::<u64>()
+                {
+                    return Ok((content_length, true));
+                }
+            }
+        }
+        // 206 但无 Content-Range，仍判支持 Range，用 HEAD 或 Content-Length 回退
+        if let Some(size) = head_size {
+            return Ok((size, true));
+        }
+        if let Some(len_val) = headers.get(CONTENT_LENGTH)
+            && let Ok(len_str) = len_val.to_str()
+            && let Ok(content_length) = len_str.parse::<u64>()
+        {
+            return Ok((content_length, true));
+        }
+    }
+
     if let Some(cr) = headers.get(CONTENT_RANGE)
         && let Ok(crs) = cr.to_str()
     {
-        // Content-Range 格式通常是 "bytes 0-0/12345"
+        // 某些服务返回 200 但仍带 Content-Range，同样判支持
         if let Some(pos) = crs.rfind('/') {
             let total = &crs[pos + 1..].trim();
             if *total != "*"
                 && let Ok(content_length) = total.parse::<u64>()
             {
-                return Ok((content_length, true)); // 如果有 Content-Range，说明支持范围请求
+                return Ok((content_length, true));
             }
         }
     }
 
-    // 3. 最终回退到 GET 响应的 Content-Length
+    // 3. 最终回退：优先 HEAD 的 size，否则 Range 响应的 Content-Length，保守判不支持
+    if let Some(size) = head_size {
+        return Ok((size, head_support));
+    }
     if let Some(len_val) = headers.get(CONTENT_LENGTH)
         && let Ok(len_str) = len_val.to_str()
         && let Ok(content_length) = len_str.parse::<u64>()
     {
-        // 此时无法确定是否支持范围请求，保守地返回 false
         return Ok((content_length, false));
     }
 
     Err(DownloadError::MissingContentLength)
 }
-
-/// 创建并异步运行一个专门处理所有文件写入操作的任务。
 ///
 /// 这种模式将所有磁盘 I/O 操作集中在一个任务中，避免了多个下载线程同时写入文件
 /// 导致的竞争和性能问题。
