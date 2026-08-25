@@ -12,7 +12,7 @@ const BANDWIDTH_PROBE_FACTOR: f64 = 1.2;
 const STABLE_SPLIT_THRESHOLD: f64 = 0.8;
 /// 最小分割间隔，防止过于频繁地分割任务。
 const MIN_SPLIT_INTERVAL: Duration = Duration::from_millis(300);
-/// 触发分割所需的最小预估剩余时间，避免在下载即将完成时进行不必要的分割。
+/// 触发分割所需的最小预估剩余时间（兜底值），实际使用按文件大小自适应的阈值，避免在下载即将完成时进行不必要的分割。
 const MIN_REMAINING_TIME_FOR_SPLIT: f64 = 5.0;
 /// 块的最小尺寸，统一复用 `chunk::MIN_CHUNK_SIZE` 的 10 KiB 阈值（可安全二分的最小剩余量 ×2）。
 pub(crate) use crate::chunk::MIN_CHUNK_SIZE;
@@ -55,6 +55,8 @@ struct SplitObservation {
 pub struct ConcurrencyManager {
     /// 用户设置的最大并发工作线程数。
     max_workers: u64,
+    /// 状态更新间隔，用于自适应观察期与阈值。
+    update_interval: f64,
     /// 当前所处的下载阶段。
     phase: DownloadPhase,
     /// 记录到的历史最大下载速度。
@@ -74,10 +76,18 @@ pub struct ConcurrencyManager {
 }
 
 impl ConcurrencyManager {
-    /// 创建一个新的 `ConcurrencyManager` 实例。
+    /// 创建一个新的 `ConcurrencyManager` 实例（默认 update_interval 0.5s，兼容旧单元测试）。
     pub fn new(max_workers: u64) -> Self {
+        Self::new_with_interval(max_workers, 0.5)
+    }
+
+    /// 使用指定的 update_interval 创建实例，Monitor 应传入真实间隔以自适应观察期。
+    pub fn new_with_interval(max_workers: u64, update_interval: f64) -> Self {
+        let interval = if update_interval > 0.0 { update_interval } else { 0.5 };
+        ::tracing::debug!(max_workers, interval, "ConcurrencyManager created");
         Self {
             max_workers,
+            update_interval: interval,
             // 如果最大并发数只有1，则直接进入稳定阶段
             phase: if max_workers == 1 {
                 DownloadPhase::Stable
@@ -94,7 +104,29 @@ impl ConcurrencyManager {
         }
     }
 
+    /// 按文件大小自适应的最小剩余时间阈值（大文件更激进，小文件保持保守 5s）。
+    fn adaptive_remaining_threshold(total_file_size: u64) -> f64 {
+        if total_file_size >= 20 * 1024 * 1024 {
+            1.5
+        } else if total_file_size >= 10 * 1024 * 1024 {
+            2.0
+        } else if total_file_size >= 5 * 1024 * 1024 {
+            2.5
+        } else if total_file_size >= 1024 * 1024 {
+            3.5
+        } else {
+            MIN_REMAINING_TIME_FOR_SPLIT
+        }
+    }
+
+    /// 根据 update_interval 计算观察期所需样本数（覆盖约 1s 采样）。
+    fn required_samples_for_interval(update_interval: f64) -> usize {
+        let n = (1.0 / update_interval.max(0.05)).ceil() as usize;
+        n.clamp(2, 5)
+    }
+
     /// 分析当前下载状态，并决定是否需要调整并发度（即分割块）。
+    #[::tracing::instrument(skip(self, state, cmd_tx), fields(phase = ?self.phase, obs = ?self.observation_state, max_workers = self.max_workers))]
     pub fn decide_and_act(
         &mut self,
         state: &DownloadState,
@@ -102,6 +134,13 @@ impl ConcurrencyManager {
     ) {
         // 如果距离上次分割时间太短，则不做任何操作
         if self.last_split_time.elapsed() < MIN_SPLIT_INTERVAL {
+            ::tracing::trace!(
+                phase = ?self.phase,
+                obs = ?self.observation_state,
+                elapsed = ?self.last_split_time.elapsed(),
+                interval = ?MIN_SPLIT_INTERVAL,
+                "concurrency skip: throttled"
+            );
             return;
         }
 
@@ -131,9 +170,22 @@ impl ConcurrencyManager {
             self.max_speed = self.max_speed.max(avg_speed);
         }
 
-        // 更新最近最佳速度
+        // 更新最近最佳速度，并对陈旧的 recent_best 做温和衰减，避免阈值永久锁死
         if avg_speed > self.recent_best_speed {
             self.recent_best_speed = avg_speed;
+        } else if self.phase == DownloadPhase::Stable
+            && self.observation_state == ObservationState::Ready
+        {
+            // 仅在稳定期且空闲时缓慢下漂，避免后台长期阈值过高导致无法再触发
+            // 衰减系数 0.992 / tick (0.5s) ≈ 半衰期 ~43s，非常保守，近 900KiB 小文件 4 tick 仅降 3%
+            let decayed = self.recent_best_speed * 0.992;
+            // 不可低于当前均值，避免因瞬时抖动误降
+            if decayed > avg_speed {
+                self.recent_best_speed = decayed;
+            } else if avg_speed > 0.0 {
+                // 若已低于均值但均值仍 < 旧峰值，逐步让阈值贴近现实
+                self.recent_best_speed = self.recent_best_speed * 0.995 + avg_speed * 0.005;
+            }
         }
 
         // 如果处于观察状态，处理样本收集
@@ -149,6 +201,20 @@ impl ConcurrencyManager {
                 self.observation_state = ObservationState::Evaluating;
             }
         }
+
+        ::tracing::trace!(
+            phase = ?self.phase,
+            obs = ?self.observation_state,
+            active = state.chunks.len(),
+            avg_kbs = avg_speed / 1024.0,
+            cur_kbs = current_speed / 1024.0,
+            max_kbs = self.max_speed / 1024.0,
+            recent_best_kbs = self.recent_best_speed / 1024.0,
+            remaining = remaining_bytes,
+            est_s = if estimated_time.is_finite() { estimated_time } else { -1.0 },
+            samples = ?self.stable_speed_samples,
+            "concurrency tick"
+        );
 
         // 根据当前阶段执行不同的逻辑
         match self.phase {
@@ -177,32 +243,70 @@ impl ConcurrencyManager {
         let active_chunks = state.chunks.len() as u64;
         // 如果已达到最大并发数，则转换到稳定阶段
         if active_chunks >= self.max_workers {
+            ::tracing::info!(
+                active = active_chunks,
+                max = self.max_workers,
+                "probing: workers saturated -> Stable"
+            );
             self.transition_to_stable();
             return;
         }
 
-        if !self.split_is_useful(avg_speed, estimated_time) {
+        if !self.split_is_useful(state, avg_speed, estimated_time) {
+            ::tracing::trace!(
+                avg_kbs = avg_speed / 1024.0,
+                est_s = estimated_time,
+                threshold = Self::adaptive_remaining_threshold(state.total_file_size),
+                remaining = state.total_file_size.saturating_sub(state.total_downloaded()),
+                "probing: split not useful"
+            );
             return;
         }
 
         // 如果当前速度显著高于历史最大速度，说明增加并发带来了好处
         if avg_speed > previous_max_speed * BANDWIDTH_PROBE_FACTOR || previous_max_speed == 0.0 {
+            ::tracing::debug!(
+                avg_kbs = avg_speed / 1024.0,
+                prev_max_kbs = previous_max_speed / 1024.0,
+                factor = BANDWIDTH_PROBE_FACTOR,
+                "probing: gain detected -> split largest"
+            );
             // 分割当前最大的块，以期进一步提升速度
             if let Some(largest_chunk) = self.find_largest_splittable_chunk(&state.chunks) {
+                ::tracing::info!(
+                    chunk_id = largest_chunk.id,
+                    remaining = largest_chunk.remaining_bytes(),
+                    speed_kbs = largest_chunk.speed / 1024.0,
+                    "probing: splitting largest"
+                );
                 self.request_split(largest_chunk.id, cmd_tx);
                 self.consecutive_probe_no_gain = 0; // 重置连续无增益计数
             } else {
+                ::tracing::info!("probing: no splittable largest -> Stable");
                 self.transition_to_stable();
             }
         } else {
             // 没有获得显著增益，增加计数
             self.consecutive_probe_no_gain += 1;
+            ::tracing::trace!(
+                avg_kbs = avg_speed / 1024.0,
+                prev_max_kbs = previous_max_speed / 1024.0,
+                factor = BANDWIDTH_PROBE_FACTOR,
+                consecutive = self.consecutive_probe_no_gain,
+                active = active_chunks,
+                "probing: no gain"
+            );
 
             // 连续2次没有增益且有足够样本，转换到稳定阶段
             if active_chunks > 1
                 && self.stable_speed_samples.len() >= 3
                 && self.consecutive_probe_no_gain >= 2
             {
+                ::tracing::info!(
+                    consecutive = self.consecutive_probe_no_gain,
+                    samples = self.stable_speed_samples.len(),
+                    "probing: consecutive no-gain -> Stable"
+                );
                 self.transition_to_stable();
             }
         }
@@ -222,6 +326,7 @@ impl ConcurrencyManager {
             }
             ObservationState::Observing => {
                 // 观察期不做任何决策，等待样本收集完成
+                ::tracing::trace!("stable: observing, skip decision");
             }
             ObservationState::Evaluating => {
                 self.handle_stable_evaluate(state, avg_speed, estimated_time, cmd_tx);
@@ -242,15 +347,40 @@ impl ConcurrencyManager {
         // 只有在有证据表明分割可能带来收益时才考虑分割
         // 1. 当前速度显著低于最近最佳速度（可能有慢块瓶颈）
         // 2. 还有可用的并发槽位
-        // 3. 分割是有用的
-        let should_consider_split = avg_speed < self.recent_best_speed * STABLE_SPLIT_THRESHOLD
+        // 3. 分割是有用的（按文件大小自适应）
+        let threshold = self.recent_best_speed * STABLE_SPLIT_THRESHOLD;
+        let useful = self.split_is_useful(state, avg_speed, estimated_time);
+        let should_consider_split = avg_speed < threshold
             && active_chunks < self.max_workers
-            && self.split_is_useful(avg_speed, estimated_time);
+            && useful;
+
+        ::tracing::debug!(
+            avg_kbs = avg_speed / 1024.0,
+            recent_best_kbs = self.recent_best_speed / 1024.0,
+            threshold_kbs = threshold / 1024.0,
+            threshold_factor = STABLE_SPLIT_THRESHOLD,
+            active = active_chunks,
+            max = self.max_workers,
+            est_s = estimated_time,
+            adaptive_threshold = Self::adaptive_remaining_threshold(state.total_file_size),
+            remaining = state.total_file_size.saturating_sub(state.total_downloaded()),
+            useful = useful,
+            should_split = should_consider_split,
+            "stable::ready check"
+        );
 
         if should_consider_split {
             // 尝试分割最慢的块，因为它可能是瓶颈
             if let Some(slowest_chunk) = self.find_slowest_splittable_chunk(&state.chunks) {
+                ::tracing::info!(
+                    chunk_id = slowest_chunk.id,
+                    speed_kbs = slowest_chunk.speed / 1024.0,
+                    remaining = slowest_chunk.remaining_bytes(),
+                    "stable::ready splitting slowest"
+                );
                 self.request_split_with_observation(slowest_chunk.id, avg_speed, cmd_tx);
+            } else {
+                ::tracing::debug!("stable::ready no splittable slowest chunk");
             }
         }
     }
@@ -271,6 +401,16 @@ impl ConcurrencyManager {
                 observation.best_speed_seen > observation.pre_split_speed * 1.05;
             let no_regression_vs_recent_best =
                 observation.best_speed_seen > observation.pre_split_recent_best * 0.95;
+            ::tracing::debug!(
+                pre_kbs = observation.pre_split_speed / 1024.0,
+                recent_best_kbs = observation.pre_split_recent_best / 1024.0,
+                best_seen_kbs = observation.best_speed_seen / 1024.0,
+                avg_kbs = avg_speed / 1024.0,
+                gain = gain_vs_pre_split,
+                no_regression = no_regression_vs_recent_best,
+                active = state.chunks.len(),
+                "stable::evaluating"
+            );
 
             if gain_vs_pre_split && no_regression_vs_recent_best {
                 // 分割成功，更新最近最佳速度
@@ -279,7 +419,7 @@ impl ConcurrencyManager {
                 // 如果还有可用并发槽位且分割仍然有用，可以考虑继续分割
                 let active_chunks = state.chunks.len() as u64;
                 if active_chunks < self.max_workers
-                    && self.split_is_useful(avg_speed, estimated_time)
+                    && self.split_is_useful(state, avg_speed, estimated_time)
                 {
                     // 分割当前最大的块以进一步提升
                     if let Some(largest_chunk) = self.find_largest_splittable_chunk(&state.chunks) {
@@ -304,29 +444,42 @@ impl ConcurrencyManager {
         current_speed: f64,
         cmd_tx: &broadcast::Sender<DownloadCmd>,
     ) {
+        ::tracing::debug!(
+            chunk_id = id,
+            pre_kbs = current_speed / 1024.0,
+            recent_best_kbs = self.recent_best_speed / 1024.0,
+            "split request with observation"
+        );
         self.request_split(id, cmd_tx);
 
-        // 启动观察期，需要收集2个样本（1-2个采样周期）
+        // 启动观察期，样本数按 update_interval 自适应（覆盖约 1s），保证不同 tick 间隔下鲁棒
+        let required = Self::required_samples_for_interval(self.update_interval);
         self.observation_state = ObservationState::Observing;
         self.current_observation = Some(SplitObservation {
             pre_split_speed: current_speed,
             pre_split_recent_best: self.recent_best_speed,
-            required_samples: 2,
+            required_samples: required,
             collected_samples: 0,
             best_speed_seen: current_speed,
         });
+        ::tracing::debug!(chunk_id = id, pre_kbs = current_speed / 1024.0, required_samples = required, "stable -> Observing");
     }
 
     /// 发送一个分割请求。
     fn request_split(&mut self, id: ChunkId, cmd_tx: &broadcast::Sender<DownloadCmd>) {
+        ::tracing::info!(chunk_id = id, phase = ?self.phase, "BisectDownload");
         let _ = cmd_tx.send(DownloadCmd::BisectDownload { id });
         self.last_split_time = Instant::now();
     }
 
     /// 转换到稳定下载阶段。
     fn transition_to_stable(&mut self) {
+        ::tracing::info!(
+            max_kbs = self.max_speed / 1024.0,
+            samples = ?self.stable_speed_samples,
+            "Probing -> Stable"
+        );
         self.phase = DownloadPhase::Stable;
-        println!("[ConcurrencyManager] 转换到稳定下载阶段。");
         self.stable_speed_samples.clear();
         self.observation_state = ObservationState::Ready;
         self.current_observation = None;
@@ -334,8 +487,17 @@ impl ConcurrencyManager {
         self.recent_best_speed = self.max_speed;
     }
 
-    fn split_is_useful(&self, avg_speed: f64, estimated_time: f64) -> bool {
-        avg_speed > 0.0 && estimated_time > MIN_REMAINING_TIME_FOR_SPLIT
+    fn split_is_useful(&self, state: &DownloadState, avg_speed: f64, estimated_time: f64) -> bool {
+        if avg_speed <= 0.0 {
+            return false;
+        }
+        // 极小剩余量不值得再分，避免产生大量碎片与调度的线程开销
+        let remaining = state.total_file_size.saturating_sub(state.total_downloaded());
+        if remaining < MIN_CHUNK_SIZE * 4 {
+            return false;
+        }
+        let threshold = Self::adaptive_remaining_threshold(state.total_file_size);
+        estimated_time > threshold
     }
 
     /// 在所有块中找到剩余工作量最大的、且可继续分割的块。

@@ -16,8 +16,8 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 
-/// 用于速度计算的平滑因子，防止速度因瞬时网络波动而剧烈变化。
-const SMOOTHING_FACTOR: f64 = 0.15;
+/// 用于速度计算的平滑因子，0.30 更快响应新建连接的带宽变化，利于探测增益
+const SMOOTHING_FACTOR: f64 = 0.25;
 
 /// 下载监控器，充当状态、重试和并发管理的协调器。
 pub struct DownloadMonitor {
@@ -47,10 +47,17 @@ impl DownloadMonitor {
         update_interval: f64,
         max_workers: u64,
     ) -> Self {
+        ::tracing::debug!(
+            total_file_size,
+            completed_bytes,
+            update_interval,
+            max_workers,
+            "DownloadMonitor created"
+        );
         Self {
             state: DownloadState::with_completed(total_file_size, completed_bytes),
             retry_handler: RetryHandler::new(),
-            concurrency_manager: ConcurrencyManager::new(max_workers),
+            concurrency_manager: ConcurrencyManager::new_with_interval(max_workers, update_interval),
             lane_bindings: HashMap::new(),
             pending_bisects: std::collections::VecDeque::new(),
             update_interval,
@@ -61,6 +68,7 @@ impl DownloadMonitor {
     ///
     /// 这个循环会监听来自各个下载块的信息，并定期触发状态更新、并发决策和重试处理。
     #[allow(clippy::too_many_arguments)]
+    #[::tracing::instrument(skip(self, info_rx, info_tx, tasks, next_chunk_id, client, writer_tx, cmd_tx, url, initial_lanes, multi_runtime), fields(total_size = self.state.total_file_size, completed = self.state.total_downloaded()))]
     pub async fn run(
         mut self,
         mut info_rx: broadcast::Receiver<DownloadInfo>,
@@ -74,6 +82,15 @@ impl DownloadMonitor {
         initial_lanes: Vec<(ChunkId, FastStr)>,
         mut multi_runtime: Option<MultiRuntime>,
     ) -> Result<(), crate::types::DownloadError> {
+        ::tracing::info!(
+            total_size = self.state.total_file_size,
+            completed = self.state.total_downloaded(),
+            update_interval = self.update_interval,
+            pending_bisects = self.pending_bisects.len(),
+            tasks = tasks.len(),
+            lanes = ?initial_lanes.iter().map(|(id,lane)|(id,lane.as_str())).collect::<Vec<_>>(),
+            "monitor start"
+        );
         for (chunk_id, lane_id) in initial_lanes {
             self.lane_bindings.insert(chunk_id, lane_id);
         }
@@ -89,7 +106,7 @@ impl DownloadMonitor {
                     .permanent_failure_message()
                     .unwrap_or_else(|| "unknown permanent failure".to_owned());
                 let _ = cmd_tx.send(DownloadCmd::TerminateAll);
-                eprintln!("[Monitor] 永久失败，终止下载: {msg}");
+                ::tracing::error!(msg = %msg, "monitor permanent failure, terminating");
                 return Err(crate::types::DownloadError::PermanentFailure(msg));
             }
             tokio::select! {
@@ -98,7 +115,16 @@ impl DownloadMonitor {
 
                 // 一个下载任务已完成（或 panic）
                 Some(result) = tasks.next() => {
-                    if let Err(e) = result { eprintln!("[Monitor] 一个下载任务 panicked: {e}"); }
+                    if let Err(e) = result { ::tracing::error!(error = %e, "download task panicked"); }
+                    ::tracing::debug!(
+                        remaining_tasks = tasks.len(),
+                        pending_bisects = self.pending_bisects.len(),
+                        active_chunks = self.state.chunks.len(),
+                        downloaded = self.state.total_downloaded(),
+                        total = self.state.total_file_size,
+                        finished = self.state.is_download_finished(),
+                        "task joined"
+                    );
                     // 任务结束不直接判定下载完成，避免与 DownloadComplete 竞态丢事件；
                     // 真正的完成判定由定时 tick 的 handle_tick 统一处理。
                     // 仅在空任务且已完成时可提前退出，避免 0.5s tick 延迟。
@@ -106,6 +132,7 @@ impl DownloadMonitor {
                         && self.are_all_tasks_done()
                         && self.state.is_download_finished()
                     {
+                        ::tracing::info!("monitor all done fast-path exit");
                         break 'main_loop;
                     }
                 },
@@ -113,6 +140,7 @@ impl DownloadMonitor {
                 // 收到来自下载块的信息；区分 Lagged/Closed，避免因广播积压误退出
                 result = info_rx.recv() => match result {
                     Ok(info) => {
+                        ::tracing::trace!(info = ?info, "monitor recv info");
                         self.handle_download_info(
                             info,
                             &mut tasks,
@@ -130,13 +158,17 @@ impl DownloadMonitor {
                                 .permanent_failure_message()
                                 .unwrap_or_else(|| "unknown permanent failure".to_owned());
                             let _ = cmd_tx.send(DownloadCmd::TerminateAll);
+                            ::tracing::error!(msg = %msg, "permanent failure after handling info");
                             return Err(crate::types::DownloadError::PermanentFailure(msg));
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        eprintln!("[Monitor] 广播滞后，跳过 {skipped} 条事件，继续运行");
+                        ::tracing::warn!(skipped, "broadcast lagged, skip events");
                     }
-                    Err(broadcast::error::RecvError::Closed) => break 'main_loop,
+                    Err(broadcast::error::RecvError::Closed) => {
+                        ::tracing::info!("broadcast closed, monitor exit");
+                        break 'main_loop;
+                    },
                 },
 
                 // 定时器触发
@@ -166,16 +198,18 @@ impl DownloadMonitor {
                             .permanent_failure_message()
                             .unwrap_or_else(|| "unknown permanent failure".to_owned());
                         let _ = cmd_tx.send(DownloadCmd::TerminateAll);
+                        ::tracing::error!(msg = %msg, "permanent failure after tick");
                         return Err(crate::types::DownloadError::PermanentFailure(msg));
                     }
                 },
             }
         }
-        println!("[Monitor] 所有下载任务已完成。监控器正在关闭。");
+        ::tracing::info!("monitor all download tasks complete, shutting down");
         Ok(())
     }
     /// 处理从下载块接收到的各种 `DownloadInfo` 消息。
     #[allow(clippy::too_many_arguments)]
+    #[::tracing::instrument(skip(self, tasks, next_chunk_id, client, writer_tx, cmd_tx, info_tx, url, multi_runtime), fields(info = ?info))]
     fn handle_download_info(
         &mut self,
         info: DownloadInfo,
@@ -188,6 +222,16 @@ impl DownloadMonitor {
         url: Option<&FastStr>,
         multi_runtime: Option<&mut MultiRuntime>,
     ) {
+        ::tracing::trace!(
+            chunks = self.state.chunks.len(),
+            downloaded = self.state.total_downloaded(),
+            total = self.state.total_file_size,
+            speed_kbs = self.state.total_speed() / 1024.0,
+            pending_bisects = self.pending_bisects.len(),
+            retry_q = self.retry_handler.retry_queue_len(),
+            delayed = self.retry_handler.delayed_queue_len(),
+            "handle_download_info before"
+        );
         match info {
             DownloadInfo::ChunkProgress {
                 id,
@@ -214,6 +258,7 @@ impl DownloadMonitor {
                 }
             }
             DownloadInfo::DownloadComplete(id) => {
+                ::tracing::info!(chunk_id = id, "chunk DownloadComplete");
                 // 标记一个块为已完成
                 self.state.complete_chunk(&id);
                 if let Some(lane_id) = self.lane_bindings.remove(&id)
@@ -221,6 +266,7 @@ impl DownloadMonitor {
                 {
                     runtime.record_success(&lane_id);
                     runtime.release_chunk(&lane_id);
+                    ::tracing::debug!(chunk_id = id, lane_id = %lane_id, "lane success+release on complete");
                 }
                 self.retry_handler.on_download_complete(&id);
                 let _ = info_tx.send(DownloadInfo::ChunkStatusChanged {
@@ -235,28 +281,30 @@ impl DownloadMonitor {
                 end,
                 error,
             } => {
+                ::tracing::warn!(chunk_id = id, start, end, error = %error, "ChunkFailed");
                 if let Some(lane_id) = self.lane_bindings.remove(&id)
                     && let Some(runtime) = multi_runtime
                 {
                     runtime.record_failure(&lane_id);
                     runtime.release_chunk(&lane_id);
+                    ::tracing::debug!(chunk_id = id, lane_id = %lane_id, "lane failure+release on ChunkFailed");
                 }
                 // 将失败的块交给重试处理器
                 self.retry_handler
                     .on_chunk_failed(id, start, end, error, &mut self.state, info_tx);
             }
             DownloadInfo::ChunkBisected {
-                new_start, new_end, ..
+                new_start, new_end, original_id
             } => {
+                ::tracing::debug!(original_id, new_start, new_end, tasks = tasks.len(), pending = self.pending_bisects.len(), "ChunkBisected");
                 // 尝试为新区间分配 lane；若容量不足则缓冲至 pending_bisects，避免丢范围
                 let Some((lane_id, rb)) = build_request(client, url, multi_runtime) else {
-                    eprintln!(
-                        "[Monitor] lane 容量不足，缓冲分割区间 {new_start}-{new_end} 待下次 tick 调度"
-                    );
+                    ::tracing::warn!(new_start, new_end, "lane capacity insufficient, buffer bisected range");
                     self.pending_bisects.push_back((new_start, new_end));
                     return;
                 };
                 let new_id = next_chunk_id.fetch_add(1, Ordering::SeqCst);
+                ::tracing::info!(new_id, new_start, new_end, lane_id = ?lane_id.as_ref().map(|s| s.as_str()), "spawn bisected chunk");
                 if let Some(lane_id) = lane_id {
                     self.lane_bindings.insert(new_id, lane_id);
                 }
@@ -290,13 +338,36 @@ impl DownloadMonitor {
         next_chunk_id: &AtomicU64,
     ) -> bool {
         if elapsed_secs <= 0.0 {
+            ::tracing::trace!("tick skip elapsed<=0");
             return false;
         }
 
         // 委托状态更新：计算每个块的速度
         for chunk in self.state.chunks.values_mut() {
+            let before = chunk.speed;
             chunk.update_speed(elapsed_secs, SMOOTHING_FACTOR);
+            ::tracing::trace!(
+                chunk_id = chunk.id,
+                downloaded = chunk.downloaded_bytes,
+                size = chunk.size(),
+                before_kbs = before / 1024.0,
+                after_kbs = chunk.speed / 1024.0,
+                elapsed = elapsed_secs,
+                "chunk speed update"
+            );
         }
+        ::tracing::trace!(
+            elapsed_secs,
+            downloaded = self.state.total_downloaded(),
+            total = self.state.total_file_size,
+            speed_kbs = self.state.total_speed() / 1024.0,
+            active = self.state.chunks.len(),
+            pending_bisects = self.pending_bisects.len(),
+            retry_q = self.retry_handler.retry_queue_len(),
+            delayed = self.retry_handler.delayed_queue_len(),
+            tasks = tasks.len(),
+            "monitor tick"
+        );
         // 发送聚合后的监控更新
         self.send_monitor_update(info_tx);
 
@@ -304,12 +375,15 @@ impl DownloadMonitor {
         self.concurrency_manager.decide_and_act(&self.state, cmd_tx);
 
         // 调度之前因 lane 容量不足而缓冲的分割区间
+        let mut drained_pending = 0usize;
         while let Some((start, end)) = self.pending_bisects.front().copied() {
             let Some((lane_id, rb)) = build_request(client, url, multi_runtime.as_mut()) else {
+                ::tracing::debug!(start, end, remaining = self.pending_bisects.len(), "pending_bisects still blocked");
                 break;
             };
             self.pending_bisects.pop_front();
             let new_id = next_chunk_id.fetch_add(1, Ordering::SeqCst);
+            ::tracing::info!(new_id, start, end, lane_id = ?lane_id.as_ref().map(|s| s.as_str()), "drain pending_bisect");
             if let Some(lane_id) = lane_id {
                 self.lane_bindings.insert(new_id, lane_id);
             }
@@ -323,13 +397,35 @@ impl DownloadMonitor {
                 end,
             );
             tasks.push(tokio::spawn(task));
+            drained_pending += 1;
+        }
+        if drained_pending > 0 {
+            ::tracing::debug!(drained = drained_pending, tasks = tasks.len(), "drained pending_bisects");
         }
 
         // 委托重试处理：处理重试队列
+        let before_retry = self.retry_handler.retry_queue_len();
+        let before_delayed = self.retry_handler.delayed_queue_len();
         self.retry_handler.process_queues();
+        ::tracing::trace!(
+            before_retry,
+            before_delayed,
+            after_retry = self.retry_handler.retry_queue_len(),
+            after_delayed = self.retry_handler.delayed_queue_len(),
+            "retry process_queues"
+        );
         let mut deferred_retries = Vec::new();
+        let mut retried = 0usize;
         while let Some(chunk_to_retry) = self.retry_handler.pop_ready_chunk() {
+            ::tracing::debug!(
+                chunk_id = chunk_to_retry.id,
+                start = chunk_to_retry.start,
+                end = chunk_to_retry.end,
+                attempts = chunk_to_retry.attempts,
+                "pop ready retry chunk"
+            );
             let Some((lane_id, rb)) = build_request(client, url, multi_runtime.as_mut()) else {
+                ::tracing::debug!(chunk_id = chunk_to_retry.id, "lane capacity blocked for retry, deferred");
                 deferred_retries.push(chunk_to_retry);
                 continue;
             };
@@ -351,13 +447,25 @@ impl DownloadMonitor {
                 chunk_to_retry.end,
             );
             tasks.push(tokio::spawn(task));
+            retried += 1;
+        }
+        if retried > 0 || !deferred_retries.is_empty() {
+            ::tracing::debug!(retried, deferred = deferred_retries.len(), remaining_retry = self.retry_handler.retry_queue_len(), "tick retry result");
         }
         for chunk in deferred_retries.into_iter().rev() {
             self.retry_handler.push_front_retry(chunk);
         }
 
         // 检查下载是否已全部完成
-        self.are_all_tasks_done() && self.state.is_download_finished()
+        let done = self.are_all_tasks_done() && self.state.is_download_finished();
+        if done {
+            ::tracing::info!(
+                downloaded = self.state.total_downloaded(),
+                total = self.state.total_file_size,
+                "monitor tick: all done"
+            );
+        }
+        done
     }
 
     /// 发送聚合的监控更新信息。
