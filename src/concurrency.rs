@@ -7,13 +7,13 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
 /// 带宽探测因子：当速度超过历史最大速度的这个倍数时，认为带宽有提升空间。
-const BANDWIDTH_PROBE_FACTOR: f64 = 1.2;
+const BANDWIDTH_PROBE_FACTOR: f64 = 1.1;
 /// 稳定阶段分割阈值：当速度低于历史最大速度的这个比例时，可能需要分割以提升速度。
 const STABLE_SPLIT_THRESHOLD: f64 = 0.8;
 /// 最小分割间隔，防止过于频繁地分割任务。
-const MIN_SPLIT_INTERVAL: Duration = Duration::from_millis(300);
+const MIN_SPLIT_INTERVAL: Duration = Duration::from_millis(150);
 /// 触发分割所需的最小预估剩余时间（兜底值），实际使用按文件大小自适应的阈值，避免在下载即将完成时进行不必要的分割。
-const MIN_REMAINING_TIME_FOR_SPLIT: f64 = 5.0;
+const MIN_REMAINING_TIME_FOR_SPLIT: f64 = 3.0;
 /// 块的最小尺寸，统一复用 `chunk::MIN_CHUNK_SIZE` 的 10 KiB 阈值（可安全二分的最小剩余量 ×2）。
 pub(crate) use crate::chunk::MIN_CHUNK_SIZE;
 /// 下载过程所处的阶段。
@@ -104,16 +104,17 @@ impl ConcurrencyManager {
         }
     }
 
-    /// 按文件大小自适应的最小剩余时间阈值（大文件更激进，小文件保持保守 5s）。
+    /// 按文件大小自适应的最小剩余时间阈值（大文件更激进，小文件保持保守）。
+    /// 修复前 1.5/2.0/2.5/3.5/5.0 仍导致 S2/S5 零分裂（est 0.31s/1.05s <阈值），修复后更激进以允许大中文件及早探测。
     fn adaptive_remaining_threshold(total_file_size: u64) -> f64 {
         if total_file_size >= 20 * 1024 * 1024 {
-            1.5
+            0.8
         } else if total_file_size >= 10 * 1024 * 1024 {
-            2.0
+            1.0
         } else if total_file_size >= 5 * 1024 * 1024 {
-            2.5
+            1.2
         } else if total_file_size >= 1024 * 1024 {
-            3.5
+            1.8
         } else {
             MIN_REMAINING_TIME_FOR_SPLIT
         }
@@ -177,14 +178,14 @@ impl ConcurrencyManager {
             && self.observation_state == ObservationState::Ready
         {
             // 仅在稳定期且空闲时缓慢下漂，避免后台长期阈值过高导致无法再触发
-            // 衰减系数 0.992 / tick (0.5s) ≈ 半衰期 ~43s，非常保守，近 900KiB 小文件 4 tick 仅降 3%
-            let decayed = self.recent_best_speed * 0.992;
+            // 修复前 0.992 / tick 半衰 ~43s 过慢，抖动恢复慢；改为 0.97 半衰 ~11s，更快贴近现实
+            let decayed = self.recent_best_speed * 0.97;
             // 不可低于当前均值，避免因瞬时抖动误降
             if decayed > avg_speed {
                 self.recent_best_speed = decayed;
             } else if avg_speed > 0.0 {
                 // 若已低于均值但均值仍 < 旧峰值，逐步让阈值贴近现实
-                self.recent_best_speed = self.recent_best_speed * 0.995 + avg_speed * 0.005;
+                self.recent_best_speed = self.recent_best_speed * 0.98 + avg_speed * 0.02;
             }
         }
 
@@ -297,10 +298,10 @@ impl ConcurrencyManager {
                 "probing: no gain"
             );
 
-            // 连续2次没有增益且有足够样本，转换到稳定阶段
+            // 连续1次没有增益且有足够样本，转换到稳定阶段（修复前需2次导致 total瓶颈下多余分裂）
             if active_chunks > 1
                 && self.stable_speed_samples.len() >= 3
-                && self.consecutive_probe_no_gain >= 2
+                && self.consecutive_probe_no_gain >= 1
             {
                 ::tracing::info!(
                     consecutive = self.consecutive_probe_no_gain,
@@ -496,7 +497,11 @@ impl ConcurrencyManager {
         if remaining < MIN_CHUNK_SIZE * 4 {
             return false;
         }
-        let threshold = Self::adaptive_remaining_threshold(state.total_file_size);
+        let mut threshold = Self::adaptive_remaining_threshold(state.total_file_size);
+        // 首分激进：单块时阈值打 4 折，允许 S2/S5 等大中文件在 est 仅 0.3-1s 时仍探测，避免零分裂
+        if state.chunks.len() == 1 {
+            threshold *= 0.4;
+        }
         estimated_time > threshold
     }
 

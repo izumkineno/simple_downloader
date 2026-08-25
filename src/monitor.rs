@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 use tokio::time::interval;
 
 /// 用于速度计算的平滑因子，0.30 更快响应新建连接的带宽变化，利于探测增益
-const SMOOTHING_FACTOR: f64 = 0.25;
+const SMOOTHING_FACTOR: f64 = 0.30;
 
 /// 下载监控器，充当状态、重试和并发管理的协调器。
 pub struct DownloadMonitor {
