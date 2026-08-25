@@ -32,6 +32,8 @@ bytes = "1.11.1"
 thiserror = "2.0.18"
 faststr = "0.2.34"
 bitcode = { version = "0.6.9", optional = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
 [dev-dependencies]
 indicatif = "0.18.4"
