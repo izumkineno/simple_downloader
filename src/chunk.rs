@@ -35,6 +35,10 @@ fn split_range(offset: u64, end: u64) -> Option<(u64, u64)> {
 /// - `rb`: 一个 `reqwest::RequestBuilder`，用于创建下载请求。
 /// - `start_byte`: 此块下载的起始字节位置。
 /// - `end_byte`: 此块下载的结束字节位置。
+#[::tracing::instrument(
+    skip(cmd_tx, bd_rx, bd_tx, rb),
+    fields(chunk_id = id, start_byte = start_byte, end_byte = end_byte, size = end_byte.saturating_sub(start_byte).saturating_add(1))
+)]
 pub async fn chunk_run(
     id: ChunkId,
     cmd_tx: mpsc::Sender<DownloadCmd>,
@@ -53,18 +57,34 @@ pub async fn chunk_run(
     let mut last_progress = Instant::now();
     let mut last_reported = 0u64; // 已上报的 downloaded
 
+    ::tracing::debug!(
+        chunk_id = id,
+        start_byte,
+        end_byte,
+        size = end_byte.saturating_sub(start_byte).saturating_add(1),
+        "chunk start"
+    );
     // 构建 Range 请求头
     let range_header = format!("bytes={start_byte}-{end_byte}");
     let response = match rb
-        .header("Range", range_header)
+        .header("Range", range_header.clone())
         .send()
         .await
         .and_then(|r| r.error_for_status())
     {
-        Ok(resp) => resp,
+        Ok(resp) => {
+            ::tracing::debug!(
+                chunk_id = id,
+                status = %resp.status(),
+                range = %range_header,
+                headers = ?resp.headers(),
+                "chunk response"
+            );
+            resp
+        },
         Err(e) => {
             let error_msg = format!("{e}");
-            eprintln!("[Chunk {id}] 请求失败: {error_msg}");
+            ::tracing::error!(chunk_id = id, range = %range_header, error = %error_msg, "chunk request failed");
             // 发送块失败信息
             let _ = bd_tx.send(DownloadInfo::ChunkFailed {
                 id,
@@ -89,7 +109,9 @@ pub async fn chunk_run(
                 Ok(cmd) => match cmd {
                     // 如果收到分割命令且目标是当前块
                     DownloadCmd::BisectDownload { id: id_ } if id == id_ => {
+                        ::tracing::debug!(chunk_id = id, offset, end, remaining = end.saturating_sub(offset).saturating_add(1), "recv BisectDownload");
                         let Some((midpoint, new_chunk_start)) = split_range(offset, end) else {
+                            ::tracing::debug!(chunk_id = id, remaining = end.saturating_sub(offset).saturating_add(1), "bisect rejected: remaining < 2*MIN_CHUNK");
                             continue;
                         };
 
@@ -99,19 +121,28 @@ pub async fn chunk_run(
                             new_start: new_chunk_start,
                             new_end: end,
                         }).is_ok() {
-                            println!("[Chunk {id}] 已分割。新范围: {offset}-{midpoint}");
+                            ::tracing::info!(chunk_id = id, kept_range = format!("{offset}-{midpoint}"), new_range = format!("{new_chunk_start}-{end}"), "chunk bisected");
+                            ::tracing::debug!(chunk_id = id, offset, midpoint, new_start = new_chunk_start, new_end = end, "bisected detail");
                             // 更新当前块的结束位置
                             end = midpoint;
+                        } else {
+                            ::tracing::warn!(chunk_id = id, "bisected send failed (no monitor)");
                         }
                     }
                     // 收到终止命令，退出循环
-                    DownloadCmd::TerminateAll => break,
+                    DownloadCmd::TerminateAll => {
+                        ::tracing::debug!(chunk_id = id, "recv TerminateAll, exiting");
+                        break;
+                    },
                     _ => {}
                 },
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    eprintln!("[Chunk {id}] 广播滞后跳过 {skipped} 条控制命令，继续运行");
+                    ::tracing::warn!(chunk_id = id, skipped, "broadcast lagged, skip control commands");
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Closed) => {
+                    ::tracing::debug!(chunk_id = id, "broadcast closed, exiting");
+                    break;
+                },
             },
             // 从网络流中获取下一个数据块
             chunk_result = stream.next() => match chunk_result {
@@ -135,7 +166,7 @@ pub async fn chunk_run(
                     // 将数据发送给文件写入任务
                     if cmd_tx.send(DownloadCmd::WriteFile { offset, data: to_write }).await.is_err() {
                         let error_msg = format!("[Chunk {id}] 文件写入通道已关闭");
-                        eprintln!("{error_msg}");
+                        ::tracing::error!(chunk_id = id, "file writer channel closed");
                         let _ = bd_tx.send(DownloadInfo::ChunkFailed { id, start: offset, end, error: error_msg });
                         failed = true;
                         break;
@@ -163,27 +194,33 @@ pub async fn chunk_run(
 
                     // 如果写入的数据小于接收到的数据块，说明已到达当前块的边界，终止下载
                     if write_len < remaining_chunk_len {
+                        ::tracing::debug!(chunk_id = id, offset, end, "reached range boundary, break");
                         break;
                     }
                 }
                 Some(Err(e)) => {
                     let error_msg = format!("{e}");
-                    eprintln!("[Chunk {id}] 下载流错误: {error_msg}");
+                    ::tracing::error!(chunk_id = id, error = %error_msg, "download stream error");
                     let _ = bd_tx.send(DownloadInfo::ChunkFailed { id, start: offset, end, error: error_msg });
                     failed = true;
                     break;
                 },
                 // 流结束
-                None => break,
+                None => {
+                    ::tracing::debug!(chunk_id = id, offset, end, "stream exhausted");
+                    break;
+                },
             },
             // 所有分支都无法进行时退出
             else => break,
         }
     }
+    ::tracing::debug!(chunk_id = id, offset, end, failed, downloaded = offset.saturating_sub(start_byte), "chunk exit");
     // 收尾：若最后一段被节流未发送，补一次最终进度，避免 Monitor 统计低估
     if !failed {
         let final_downloaded = offset.saturating_sub(start_byte);
         if final_downloaded != last_reported {
+            ::tracing::trace!(chunk_id = id, final_downloaded, total = end.saturating_sub(start_byte).saturating_add(1), "final progress補發");
             let _ = bd_tx.send(DownloadInfo::ChunkProgress {
                 id,
                 start_byte,
@@ -192,7 +229,10 @@ pub async fn chunk_run(
             });
         }
         // 如果没有发生失败，则广播下载完成消息
+        ::tracing::debug!(chunk_id = id, "DownloadComplete");
         let _ = bd_tx.send(DownloadInfo::DownloadComplete(id));
+    } else {
+        ::tracing::warn!(chunk_id = id, "chunk exit with failure");
     }
 }
 

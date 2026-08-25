@@ -55,6 +55,7 @@ impl Default for RetryHandler {
 
 impl RetryHandler {
     pub fn new() -> Self {
+        ::tracing::trace!("RetryHandler created");
         Self {
             retry_queue: VecDeque::new(),
             delayed_retry_queue: VecDeque::new(),
@@ -64,7 +65,15 @@ impl RetryHandler {
         }
     }
 
+    pub fn retry_queue_len(&self) -> usize {
+        self.retry_queue.len()
+    }
+    pub fn delayed_queue_len(&self) -> usize {
+        self.delayed_retry_queue.len()
+    }
+
     /// 处理一个失败的块，将其添加到适当的重试队列中。
+    #[::tracing::instrument(skip(self, state, info_tx), fields(chunk_id = id, range = format!("{start}-{end}")))]
     pub fn on_chunk_failed(
         &mut self,
         id: ChunkId,
@@ -74,7 +83,18 @@ impl RetryHandler {
         state: &mut DownloadState,
         info_tx: &broadcast::Sender<DownloadInfo>,
     ) {
-        eprintln!("[RetryHandler] 收到块 {id} 的失败报告: {error}");
+        ::tracing::warn!(
+            chunk_id = id,
+            start,
+            end,
+            error = %error,
+            downloaded = state.total_downloaded(),
+            total = state.total_file_size,
+            active_chunks = state.chunks.len(),
+            retry_q = self.retry_queue.len(),
+            delayed = self.delayed_retry_queue.len(),
+            "chunk failed"
+        );
 
         // 保留已下载前缀，避免 total_downloaded 瞬时回落
         state.preserve_partial(&id);
@@ -85,7 +105,7 @@ impl RetryHandler {
         let total = self.total_attempts.entry(id).or_insert(0);
         *total += 1;
         if *total > MAX_TOTAL_ATTEMPTS {
-            eprintln!("[RetryHandler] 块 {id} 已达总重试上限 {MAX_TOTAL_ATTEMPTS}，标记永久失败");
+            ::tracing::error!(chunk_id = id, total = *total, max = MAX_TOTAL_ATTEMPTS, "chunk permanent failure: total attempts exceeded");
             let _ = info_tx.send(DownloadInfo::ChunkStatusChanged {
                 id,
                 status: 5,
@@ -108,9 +128,12 @@ impl RetryHandler {
 
         if *attempts <= MAX_RETRIES {
             // 如果未达到最大重试次数，放入即时重试队列
-            println!(
-                "[Monitor] 块 {id} 将进行第 {} 次重试 (共 {} 次, 总 {}/{MAX_TOTAL_ATTEMPTS}).",
-                *attempts, MAX_RETRIES, *total
+            ::tracing::info!(
+                chunk_id = id,
+                attempt = *attempts,
+                max = MAX_RETRIES,
+                total = *total,
+                "chunk will retry"
             );
 
             // 发送状态变更为“等待重试”
@@ -133,9 +156,11 @@ impl RetryHandler {
         } else {
             // 如果已达到最大重试次数，放入延迟队列，等待一段时间后再次尝试。
             let retry_at = Instant::now() + DELAYED_RETRY_DURATION;
-            println!(
-                "[Monitor] 块 {id} 已达到最大重试次数，将延迟到 {:?} 后再次尝试 (总 {}/{MAX_TOTAL_ATTEMPTS})。",
-                DELAYED_RETRY_DURATION, *total
+            ::tracing::warn!(
+                chunk_id = id,
+                total = *total,
+                delay = ?DELAYED_RETRY_DURATION,
+                "chunk max retries reached, move to delayed queue"
             );
 
             // 发送状态变更为“延迟重试中”
@@ -176,9 +201,9 @@ impl RetryHandler {
                 info_to_retry.failure_time = Instant::now();
                 info_to_retry.attempts = 0; // 重置尝试次数
 
-                println!(
-                    "[Monitor] 块 {} 长时间等待结束，重新加入下载队列。",
-                    info_to_retry.id
+                ::tracing::info!(
+                    chunk_id = info_to_retry.id,
+                    "delayed retry queue: chunk re-queued"
                 );
 
                 // 将其放回主重试队列
@@ -195,19 +220,27 @@ impl RetryHandler {
         if let Some(failed_chunk) = self.retry_queue.front()
             && failed_chunk.failure_time.elapsed() >= RETRY_DELAY
         {
-            return self.retry_queue.pop_front();
+            let chunk = self.retry_queue.pop_front();
+            if let Some(ref c) = chunk {
+                ::tracing::debug!(chunk_id = c.id, attempts = c.attempts, "pop ready retry chunk");
+            }
+            return chunk;
         }
         None
     }
 
     pub(crate) fn push_front_retry(&mut self, chunk: FailedChunkInfo) {
+        ::tracing::debug!(chunk_id = chunk.id, "push front deferred retry");
         self.retry_queue.push_front(chunk);
     }
 
     /// 当一个块最终下载成功时，清除其重试记录。
     pub fn on_download_complete(&mut self, id: &ChunkId) {
-        self.retry_attempts.remove(id);
-        self.total_attempts.remove(id);
+        if self.retry_attempts.remove(id).is_some() || self.total_attempts.remove(id).is_some() {
+            ::tracing::debug!(chunk_id = id, "retry records cleared on complete");
+        } else {
+            self.total_attempts.remove(id);
+        }
     }
 
     /// 检查所有重试队列是否都为空。

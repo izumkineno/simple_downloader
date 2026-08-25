@@ -306,6 +306,7 @@ impl LaneScheduler {
             })
             .collect();
         lanes.sort_by(|a, b| b.candidate.probe_speed.total_cmp(&a.candidate.probe_speed));
+        ::tracing::debug!(lanes = lanes.len(), model = ?lane_model, max_workers, "LaneScheduler created");
         Self {
             lane_model,
             max_workers: max_workers.max(1),
@@ -325,8 +326,12 @@ impl LaneScheduler {
         if let Some(entry) = self.select_lane(false) {
             return Some(entry.candidate.lane_id.clone());
         }
-        self.select_lane(true)
-            .map(|entry| entry.candidate.lane_id.clone())
+        let fallback = self.select_lane(true)
+            .map(|entry| entry.candidate.lane_id.clone());
+        if fallback.is_some() {
+            ::tracing::debug!("best_lane fallback to blacklisted lane");
+        }
+        fallback
     }
 
     fn decay_expired_blacklists(&mut self) {
@@ -334,6 +339,7 @@ impl LaneScheduler {
             if entry.health == LaneHealth::Blacklisted {
                 if let Some(at) = entry.blacklisted_at {
                     if at.elapsed() >= BLACKLIST_DURATION {
+                        ::tracing::info!(lane_id = %entry.candidate.lane_id, "lane blacklist expired -> Healthy");
                         entry.health = LaneHealth::Healthy;
                         entry.consecutive_failures = 0;
                         entry.blacklisted_at = None;
@@ -357,6 +363,7 @@ impl LaneScheduler {
             .find(|entry| entry.candidate.lane_id.as_str() == lane_id.as_ref())
         {
             entry.active_chunks += 1;
+            ::tracing::trace!(lane_id = %entry.candidate.lane_id, active = entry.active_chunks, "assign_chunk");
         }
     }
 
@@ -367,6 +374,7 @@ impl LaneScheduler {
             .find(|entry| entry.candidate.lane_id.as_str() == lane_id.as_ref())
         {
             entry.active_chunks = entry.active_chunks.saturating_sub(1);
+            ::tracing::trace!(lane_id = %entry.candidate.lane_id, active = entry.active_chunks, "release_chunk");
         }
     }
 
@@ -377,7 +385,9 @@ impl LaneScheduler {
             .find(|entry| entry.candidate.lane_id.as_str() == lane_id.as_ref())
         {
             entry.consecutive_failures += 1;
+            ::tracing::warn!(lane_id = %entry.candidate.lane_id, consecutive = entry.consecutive_failures, threshold = BLACKLIST_THRESHOLD, "lane failure");
             if entry.consecutive_failures >= BLACKLIST_THRESHOLD {
+                ::tracing::warn!(lane_id = %entry.candidate.lane_id, "lane blacklisted");
                 entry.health = LaneHealth::Blacklisted;
                 entry.blacklisted_at = Some(Instant::now());
             }
@@ -390,6 +400,9 @@ impl LaneScheduler {
             .iter_mut()
             .find(|entry| entry.candidate.lane_id.as_str() == lane_id.as_ref())
         {
+            if entry.consecutive_failures > 0 || entry.health != LaneHealth::Healthy {
+                ::tracing::debug!(lane_id = %entry.candidate.lane_id, "lane success -> reset health");
+            }
             entry.consecutive_failures = 0;
             entry.health = LaneHealth::Healthy;
             entry.blacklisted_at = None;
@@ -487,6 +500,7 @@ pub struct MultiRuntime {
 }
 
 impl MultiRuntime {
+    #[::tracing::instrument(skip(config, client_builder), fields(sources = config.sources.len(), workers = config.workers, path = %config.output_path))]
     pub async fn from_config<F>(
         config: &MultiSourceConfig,
         client_builder: &F,
@@ -495,6 +509,7 @@ impl MultiRuntime {
         F: Fn() -> ClientBuilder,
     {
         let expanded = expand_lanes(config, client_builder)?;
+        ::tracing::debug!(expanded = expanded.len(), "expanded lanes");
         let mut probe_futs = FuturesUnordered::new();
         for runtime in expanded {
             let url = runtime.url.clone();
@@ -512,59 +527,68 @@ impl MultiRuntime {
         let mut fallback_candidates = Vec::new();
 
         while let Some((mut runtime, res)) = probe_futs.next().await {
-            let Ok((file_size, support_ranges)) = res else {
-                continue;
-            };
-            if support_ranges {
-                if let Some(expected) = range_file_size {
-                    if expected != file_size {
-                        continue;
-                    }
-                } else {
-                    range_file_size = Some(file_size);
-                    // 若此前已收集 fallback 但文件大小不一致，清空 fallback 以避免混用
-                    if let Some(fb) = fallback_file_size {
-                        if fb != file_size {
-                            fallback_candidates.clear();
-                            fallback_runtimes.clear();
-                            fallback_file_size = None;
+            match res {
+                Ok((file_size, support_ranges)) => {
+                    ::tracing::debug!(lane_id = %runtime.lane_id, url = %runtime.url, file_size, support_ranges, "probe success");
+                    if support_ranges {
+                        if let Some(expected) = range_file_size {
+                            if expected != file_size {
+                                ::tracing::warn!(lane_id = %runtime.lane_id, expected, got = file_size, "probe file size mismatch, skipping lane");
+                                continue;
+                            }
+                        } else {
+                            range_file_size = Some(file_size);
+                            // 若此前已收集 fallback 但文件大小不一致，清空 fallback 以避免混用
+                            if let Some(fb) = fallback_file_size {
+                                if fb != file_size {
+                                    fallback_candidates.clear();
+                                    fallback_runtimes.clear();
+                                    fallback_file_size = None;
+                                }
+                            }
                         }
+                        runtime.probe_speed = 1.0;
+                        range_candidates.push(LaneCandidate {
+                            lane_id: runtime.lane_id.clone(),
+                            source_id: runtime.source_id.clone(),
+                            proxy_id: runtime.proxy_id.clone(),
+                            probe_speed: runtime.probe_speed,
+                        });
+                        range_runtimes
+                            .entry(runtime.lane_id.clone())
+                            .or_default()
+                            .push(runtime);
+                    } else {
+                        // 非 Range 仅作为 fallback：仅在无 Range 可用时启用
+                        if range_file_size.is_some() {
+                            ::tracing::debug!(lane_id = %runtime.lane_id, "non-range lane skipped because range lanes exist");
+                            continue;
+                        }
+                        if let Some(expected) = fallback_file_size {
+                            if expected != file_size {
+                                ::tracing::warn!(lane_id = %runtime.lane_id, expected, got = file_size, "fallback size mismatch, skipping");
+                                continue;
+                            }
+                        } else {
+                            fallback_file_size = Some(file_size);
+                        }
+                        runtime.probe_speed = 1.0;
+                        fallback_candidates.push(LaneCandidate {
+                            lane_id: runtime.lane_id.clone(),
+                            source_id: runtime.source_id.clone(),
+                            proxy_id: runtime.proxy_id.clone(),
+                            probe_speed: runtime.probe_speed,
+                        });
+                        fallback_runtimes
+                            .entry(runtime.lane_id.clone())
+                            .or_default()
+                            .push(runtime);
                     }
                 }
-                runtime.probe_speed = 1.0;
-                range_candidates.push(LaneCandidate {
-                    lane_id: runtime.lane_id.clone(),
-                    source_id: runtime.source_id.clone(),
-                    proxy_id: runtime.proxy_id.clone(),
-                    probe_speed: runtime.probe_speed,
-                });
-                range_runtimes
-                    .entry(runtime.lane_id.clone())
-                    .or_default()
-                    .push(runtime);
-            } else {
-                // 非 Range 仅作为 fallback：仅在无 Range 可用时启用
-                if range_file_size.is_some() {
+                Err(e) => {
+                    ::tracing::warn!(lane_id = %runtime.lane_id, url = %runtime.url, error = %e, "probe failed, lane skipped");
                     continue;
                 }
-                if let Some(expected) = fallback_file_size {
-                    if expected != file_size {
-                        continue;
-                    }
-                } else {
-                    fallback_file_size = Some(file_size);
-                }
-                runtime.probe_speed = 1.0;
-                fallback_candidates.push(LaneCandidate {
-                    lane_id: runtime.lane_id.clone(),
-                    source_id: runtime.source_id.clone(),
-                    proxy_id: runtime.proxy_id.clone(),
-                    probe_speed: runtime.probe_speed,
-                });
-                fallback_runtimes
-                    .entry(runtime.lane_id.clone())
-                    .or_default()
-                    .push(runtime);
             }
         }
         let (file_size, supports_ranges, runtimes, candidates) = if !range_candidates.is_empty() {
@@ -582,8 +606,11 @@ impl MultiRuntime {
                 fallback_candidates,
             )
         } else {
+            ::tracing::error!("no available sources after probe");
             return Err(DownloadError::NoAvailableSources);
         };
+
+        ::tracing::info!(file_size, supports_ranges, lanes = candidates.len(), "multi-source probe done");
 
         let scheduler = LaneScheduler::from_candidates(
             candidates,
@@ -608,6 +635,7 @@ impl MultiRuntime {
         let lane_id = self.scheduler.best_lane()?;
         self.scheduler.assign_chunk(lane_id.as_str());
         let runtime = self.next_runtime(&lane_id)?;
+        ::tracing::trace!(lane_id = %lane_id, url = %runtime.url, "claim lane");
         Some((lane_id, runtime.client.get(runtime.url.as_str())))
     }
 
@@ -661,6 +689,7 @@ where
                 .pool_idle_timeout(std::time::Duration::from_secs(90))
                 .tcp_keepalive(std::time::Duration::from_secs(60))
                 .build()?;
+            ::tracing::debug!(source_id = %source.id, url = %source.url, "expand lane (no proxy)");
             runtimes.push(LaneRuntime {
                 lane_id: source.id.clone(),
                 source_id: source.id.clone(),
@@ -679,6 +708,7 @@ where
                 .pool_idle_timeout(std::time::Duration::from_secs(90))
                 .tcp_keepalive(std::time::Duration::from_secs(60))
                 .build()?;
+            ::tracing::debug!(source_id = %source.id, url = %source.url, "expand lane (source has no proxies)");
             runtimes.push(LaneRuntime {
                 lane_id: source.id.clone(),
                 source_id: source.id.clone(),
@@ -695,7 +725,7 @@ where
             let proxy_obj = match Proxy::all(proxy.url.as_str()) {
                 Ok(p) => p,
                 Err(error) => {
-                    eprintln!("[Lane] 代理 {} 解析失败: {error}, 跳过该 lane", proxy.url);
+                    ::tracing::warn!(proxy_url = %proxy.url, error = %error, "proxy parse failed, skip lane");
                     continue;
                 }
             };
@@ -708,7 +738,7 @@ where
             {
                 Ok(c) => c,
                 Err(error) => {
-                    eprintln!("[Lane] 代理 {} 构建 Client 失败: {error}, 跳过", proxy.url);
+                    ::tracing::warn!(proxy_url = %proxy.url, error = %error, "proxy client build failed, skip lane");
                     continue;
                 }
             };
@@ -718,6 +748,7 @@ where
                     FastStr::from_string(format!("{}::{}", source.id, proxy.id))
                 }
             };
+            ::tracing::debug!(lane_id = %lane_id, source_id = %source.id, proxy_id = %proxy.id, "expand lane (proxy)");
             runtimes.push(LaneRuntime {
                 lane_id,
                 source_id: source.id.clone(),
