@@ -798,11 +798,10 @@ impl Downloader<fn() -> ClientBuilder> {
 fn split_resume_ranges(
     ranges: Vec<(u64, u64)>,
     workers: u64,
-    split_for_multi_source: bool,
+    _split_for_multi_source: bool,
 ) -> Vec<(u64, u64)> {
-    if !split_for_multi_source {
-        return ranges;
-    }
+    // M3-03 单源统一分裂：移除 multi_source 独占守卫，统一按 workers 与 support_ranges（已在 workers 降级前判断）决定分裂
+    // 保留参量兼容旧调用，实际分裂仅受 workers 与碎片阈值控制，已通过上层 workers==1 降级保证非 Range 不分裂
     let target = workers.max(1) as usize;
     let mut ranges = ranges;
 
