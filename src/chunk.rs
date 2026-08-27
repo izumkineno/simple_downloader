@@ -247,6 +247,10 @@ pub async fn chunk_run(
                     if cmd_tx.send(DownloadCmd::WriteFile { offset, data: to_write }).await.is_err() {
                         let error_msg = format!("[Chunk {id}] 文件写入通道已关闭");
                         ::tracing::error!(chunk_id = id, "file writer channel closed");
+                        let actual = offset.saturating_sub(start_byte);
+                        if actual != last_reported {
+                            let _ = bd_tx.send(DownloadInfo::ChunkProgress { id, start_byte, end_byte: end, downloaded: actual });
+                        }
                         let _ = bd_tx.send(DownloadInfo::ChunkFailed { id, start: offset, end, error: error_msg });
                         failed = true;
                         break;
@@ -281,6 +285,10 @@ pub async fn chunk_run(
                 Some(Err(e)) => {
                     let error_msg = format!("{e}");
                     ::tracing::error!(chunk_id = id, error = %error_msg, "download stream error");
+                    let actual = offset.saturating_sub(start_byte);
+                    if actual != last_reported {
+                        let _ = bd_tx.send(DownloadInfo::ChunkProgress { id, start_byte, end_byte: end, downloaded: actual });
+                    }
                     let _ = bd_tx.send(DownloadInfo::ChunkFailed { id, start: offset, end, error: error_msg });
                     failed = true;
                     break;
@@ -298,6 +306,10 @@ pub async fn chunk_run(
                                 expected, start_byte, end, got
                             );
                             ::tracing::error!(chunk_id = id, offset, end, error = %error_msg, "early EOF");
+                            let actual = offset.saturating_sub(start_byte);
+                            if actual != last_reported {
+                                let _ = bd_tx.send(DownloadInfo::ChunkProgress { id, start_byte, end_byte: end, downloaded: actual });
+                            }
                             let _ = bd_tx.send(DownloadInfo::ChunkFailed {
                                 id,
                                 start: offset,
