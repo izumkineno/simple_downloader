@@ -205,7 +205,22 @@ impl ResumePlan {
 
             let mut metadata = ResumeMetadata::load(&metadata_path)?;
             ::tracing::debug!(path = %metadata_path.display(), segments = metadata.segments.len(), "loaded resume metadata");
-            metadata.validate_shape(file_size)?;
+            if let Err(e) = metadata.validate_shape(file_size) {
+                ::tracing::warn!(error=%e, path=%metadata_path.display(), "resume shape mismatch, discarding sidecar and rebuilding");
+                let _ = fs::remove_file(&metadata_path);
+                let metadata = ResumeMetadata::new(file_size, DEFAULT_SEGMENT_SIZE);
+                if let Err(save_err) = metadata.save_atomic(&metadata_path) {
+                    ::tracing::warn!(error=%save_err, path=%metadata_path.display(), "rebuild resume metadata save failed");
+                }
+                ::tracing::info!(path=%metadata_path.display(), file_size, "rebuilt resume plan after shape mismatch (full download)");
+                return Ok(Self {
+                    metadata_path,
+                    metadata: Some(metadata),
+                    truncate_output: true,
+                    remaining_ranges: full_ranges(file_size),
+                    completed_bytes: 0,
+                });
+            }
             metadata.verify_against_file(output_path)?;
             metadata.save_atomic(&metadata_path)?;
             ::tracing::info!(
@@ -469,5 +484,48 @@ mod tests {
     fn hash_is_stable() {
         assert_eq!(hash_bytes(b"abc"), hash_bytes(b"abc"));
         assert_ne!(hash_bytes(b"abc"), hash_bytes(b"abd"));
+    }
+
+    #[test]
+    fn prepare_self_heals_on_file_size_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out.bin");
+        std::fs::write(&out, vec![0u8; 10]).unwrap();
+        let old_size = 1024 * 1024;
+        let new_size = 2 * 1024 * 1024;
+        let meta = ResumeMetadata::new(old_size, DEFAULT_SEGMENT_SIZE);
+        let meta_path = metadata_path_for(&out);
+        meta.save_atomic(&meta_path).unwrap();
+        let plan = ResumePlan::prepare(&out, new_size, true).unwrap();
+        assert!(plan.truncate_output);
+        assert_eq!(plan.remaining_ranges, vec![(0, new_size - 1)]);
+        assert_eq!(plan.completed_bytes, 0);
+        let rebuilt = ResumeMetadata::load(&meta_path).unwrap();
+        assert_eq!(rebuilt.file_size, new_size);
+    }
+
+    #[test]
+    fn prepare_self_heals_on_version_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out2.bin");
+        std::fs::write(&out, vec![0u8; 10]).unwrap();
+        let mut meta = ResumeMetadata::new(1024 * 1024, DEFAULT_SEGMENT_SIZE);
+        meta.version = 999;
+        let meta_path = metadata_path_for(&out);
+        meta.save_atomic(&meta_path).unwrap();
+        let plan = ResumePlan::prepare(&out, 1024 * 1024, true).unwrap();
+        assert!(plan.truncate_output);
+        assert_eq!(plan.completed_bytes, 0);
+    }
+
+    #[test]
+    fn prepare_still_errors_on_corrupted_bitcode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out3.bin");
+        std::fs::write(&out, vec![0u8; 10]).unwrap();
+        let meta_path = metadata_path_for(&out);
+        std::fs::write(&meta_path, b"corrupted").unwrap();
+        let res = ResumePlan::prepare(&out, 1024, true);
+        assert!(res.is_err());
     }
 }
