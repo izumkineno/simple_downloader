@@ -492,9 +492,9 @@ impl ConcurrencyManager {
         if avg_speed <= 0.0 {
             return false;
         }
-        // 极小剩余量不值得再分，避免产生大量碎片与调度的线程开销
+        // M3-02: 极小剩余量不值得再分，避免碎片；门槛提升至 256KiB（覆盖原 40KiB），防止小文件过度分裂
         let remaining = state.total_file_size.saturating_sub(state.total_downloaded());
-        if remaining < MIN_CHUNK_SIZE * 4 {
+        if remaining < 256 * 1024 {
             return false;
         }
         let mut threshold = Self::adaptive_remaining_threshold(state.total_file_size);
@@ -634,7 +634,7 @@ mod tests {
         manager.stable_speed_samples = VecDeque::from(vec![700.0, 700.0, 700.0]); // 速度低于阈值
 
         let state = state_with_chunks(
-            200_000,
+            5_000_000,
             [
                 chunk(1, 0, 60_000, 55_000, 400.0),
                 chunk(2, 60_001, 120_000, 15_000, 300.0), // 慢块，总和700
@@ -679,7 +679,7 @@ mod tests {
         // 第一次调用：速度低，触发分割
         manager.stable_speed_samples = VecDeque::from(vec![700.0, 700.0, 700.0]);
         let state1 = state_with_chunks(
-            200_000,
+            5_000_000,
             [
                 chunk(1, 0, 60_000, 55_000, 400.0),
                 chunk(2, 60_001, 120_000, 15_000, 300.0), // 总和700
@@ -697,7 +697,7 @@ mod tests {
 
         // 观察期第一次样本：速度提升
         let state2 = state_with_chunks(
-            200_000,
+            5_000_000,
             [
                 chunk(1, 0, 60_000, 58_000, 450.0),
                 chunk(2, 60_001, 90_000, 10_000, 225.0),
@@ -713,7 +713,7 @@ mod tests {
 
         // 观察期第二次样本：速度进一步提升，进入评估状态
         let state3 = state_with_chunks(
-            200_000,
+            5_000_000,
             [
                 chunk(1, 0, 60_000, 60_000, 0.0),
                 chunk(2, 60_001, 90_000, 20_000, 350.0),
@@ -740,7 +740,7 @@ mod tests {
         // 第一次调用：速度低，触发分割
         manager.stable_speed_samples = VecDeque::from(vec![700.0, 700.0, 700.0]);
         let state1 = state_with_chunks(
-            200_000,
+            5_000_000,
             [
                 chunk(1, 0, 60_000, 55_000, 400.0),
                 chunk(2, 60_001, 120_000, 15_000, 300.0), // 总和700
@@ -758,7 +758,7 @@ mod tests {
 
         // 观察期样本：速度没有提升
         let state2 = state_with_chunks(
-            200_000,
+            5_000_000,
             [
                 chunk(1, 0, 60_000, 58_000, 400.0),
                 chunk(2, 60_001, 90_000, 10_000, 175.0),
@@ -793,7 +793,7 @@ mod tests {
         // 初始状态：已经分割过一次，有2个活跃块
         manager.stable_speed_samples = VecDeque::from(vec![1000.0, 1000.0, 1000.0]);
         let state1 = state_with_chunks(
-            100_000,
+            5_000_000,
             [
                 chunk(1, 0, 49_999, 25_000, 500.0),
                 chunk(2, 50_000, 99_999, 25_000, 500.0),
