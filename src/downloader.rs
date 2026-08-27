@@ -400,11 +400,8 @@ where
             match &self.mode {
                 DownloadMode::Single(config) => {
                     ::tracing::debug!(url = %config.url, workers = config.workers, interval = self.update_interval, "probing single source");
-                    let client = (self.client_builder)()
-                        .pool_max_idle_per_host(32)
-                        .pool_idle_timeout(Duration::from_secs(90))
-                        .tcp_keepalive(Duration::from_secs(60))
-                        .build()?;
+                    // M3-05 保留用户 pool 配置，不二次覆盖；默认值由 default_client_builder 提供
+                    let client = (self.client_builder)().build()?;
                     let (file_size, support_ranges) =
                         match get_file_info(&client, &config.url).await {
                             Ok(v) => {
@@ -449,11 +446,8 @@ where
                             // 多源探测失败，回退为单流流式下载（首源）
                             ::tracing::warn!("multi-source probe failed, fallback to streaming with first source");
                             if let Some(first) = config.sources.first() {
-                                let client = (self.client_builder)()
-                                    .pool_max_idle_per_host(32)
-                                    .pool_idle_timeout(Duration::from_secs(90))
-                                    .tcp_keepalive(Duration::from_secs(60))
-                                    .build()?;
+                                // M3-05 保留用户 pool 配置
+                                let client = (self.client_builder)().build()?;
                                 let writer_path = config.output_path.clone();
                                 let download_url = first.url.clone();
                                 return self
