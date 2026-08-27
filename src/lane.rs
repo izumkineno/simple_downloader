@@ -600,24 +600,45 @@ impl MultiRuntime {
                         } else {
                             fallback_file_size = Some(file_size);
                         }
-                        // M3-01 fallback 同样实测（无 Range 则全量采样首 64KiB）
+                        // M3-01 fallback 同样实测（无 Range 则全量采样首 64KiB，流式限长避免 OOM）
                         let measured = {
                             let start = Instant::now();
-                            let resp_res = runtime.client.get(runtime.url.as_str()).send().await;
+                            let resp_res = runtime
+                                .client
+                                .get(runtime.url.as_str())
+                                .header("Range", "bytes=0-65535")
+                                .send()
+                                .await;
                             match resp_res {
-                                Ok(r) => match r.bytes().await {
-                                    Ok(b) => {
-                                        let len = b.len().min(65535) as f64;
+                                Ok(r) => {
+                                    let mut stream = r.bytes_stream();
+                                    let mut total: usize = 0;
+                                    let mut stream_err: Option<String> = None;
+                                    while let Some(chunk) = stream.next().await {
+                                        match chunk {
+                                            Ok(bytes) => {
+                                                total = total.saturating_add(bytes.len());
+                                                if total >= 65535 {
+                                                    break;
+                                                }
+                                            }
+                                            Err(e) => {
+                                                stream_err = Some(e.to_string());
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    drop(stream);
+                                    if let Some(err) = stream_err {
+                                        ::tracing::warn!(lane_id = %runtime.lane_id, error = %err, "probe_speed fallback bytes failed, 1.0");
+                                        1.0
+                                    } else {
                                         let elapsed = start.elapsed().as_secs_f64().max(0.001);
-                                        let s = len / elapsed;
-                                        ::tracing::info!(lane_id = %runtime.lane_id, bytes = b.len(), elapsed, speed = s, "probe_speed measured (fallback)");
+                                        let s = total as f64 / elapsed;
+                                        ::tracing::info!(lane_id = %runtime.lane_id, bytes = total, elapsed, speed = s, "probe_speed measured (fallback)");
                                         if s > 0.0 { s } else { 1.0 }
                                     }
-                                    Err(e) => {
-                                        ::tracing::warn!(lane_id = %runtime.lane_id, error = %e, "probe_speed fallback bytes failed, 1.0");
-                                        1.0
-                                    }
-                                },
+                                }
                                 Err(e) => {
                                     ::tracing::warn!(lane_id = %runtime.lane_id, error = %e, "probe_speed fallback request failed, 1.0");
                                     1.0
