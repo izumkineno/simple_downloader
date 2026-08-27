@@ -197,8 +197,8 @@ impl RetryHandler {
                     .expect("front is Some, pop_front must succeed");
                 let mut info_to_retry = delayed.chunk;
 
-                // 重置失败时间戳和尝试次数，让它能进入主重试队列并被立即处理
-                info_to_retry.failure_time = Instant::now();
+                // P0-06 修复：延迟队列已等待 10s，无需再等 2s，设为可立即 pop
+                info_to_retry.failure_time = Instant::now() - RETRY_DELAY;
                 info_to_retry.attempts = 0; // 重置尝试次数
 
                 ::tracing::info!(
@@ -230,8 +230,13 @@ impl RetryHandler {
     }
 
     pub(crate) fn push_front_retry(&mut self, chunk: FailedChunkInfo) {
-        ::tracing::debug!(chunk_id = chunk.id, "push front deferred retry");
+        ::tracing::debug!(chunk_id = chunk.id, "push front deferred retry (deprecated, use push_back)");
         self.retry_queue.push_front(chunk);
+    }
+
+    pub(crate) fn push_back_retry(&mut self, chunk: FailedChunkInfo) {
+        ::tracing::debug!(chunk_id = chunk.id, "push back deferred retry");
+        self.retry_queue.push_back(chunk);
     }
 
     /// 当一个块最终下载成功时，清除其重试记录。

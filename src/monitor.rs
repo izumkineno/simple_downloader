@@ -456,8 +456,8 @@ impl DownloadMonitor {
         if retried > 0 || !deferred_retries.is_empty() {
             ::tracing::debug!(retried, deferred = deferred_retries.len(), remaining_retry = self.retry_handler.retry_queue_len(), "tick retry result");
         }
-        for chunk in deferred_retries.into_iter().rev() {
-            self.retry_handler.push_front_retry(chunk);
+        for chunk in deferred_retries {
+            self.retry_handler.push_back_retry(chunk);
         }
 
         // 检查下载是否已全部完成
