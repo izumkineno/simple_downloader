@@ -5,12 +5,32 @@ use crate::resume::ResumeRecorder;
 use crate::types::DownloadCmd;
 use crate::types::{DownloadError, Result};
 use faststr::FastStr;
-use reqwest::Client;
+use reqwest::header::{HeaderValue, USER_AGENT};
+use reqwest::{Client, RequestBuilder};
 use std::io;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+
+/// 确保请求携带 `User-Agent`，若 `Client` 默认头与 `RequestBuilder` 均未设置则注入 crate 默认 UA。
+/// 优先保留用户显式配置（client 默认头或已设置的 header），仅在缺失时回退。
+pub(crate) fn ensure_user_agent(rb: RequestBuilder) -> RequestBuilder {
+    // RequestBuilder 未暴露已设置 header 的直接查询，借助 try_clone + build 探测
+    if let Some(cloned) = rb.try_clone() {
+        if let Ok(req) = cloned.build() {
+            if req.headers().contains_key(USER_AGENT) {
+                return rb;
+            }
+        }
+    }
+    // try_clone 失败（如不可克隆 body）或探测到缺失则注入
+    // HeaderValue::from_static 对 DEFAULT_USER_AGENT 是合法的（仅 ascii）
+    match HeaderValue::from_str(crate::DEFAULT_USER_AGENT) {
+        Ok(v) => rb.header(USER_AGENT, v),
+        Err(_) => rb.header(USER_AGENT, crate::DEFAULT_USER_AGENT),
+    }
+}
 
 /// 从 URL 检索文件元数据（大小和是否支持范围请求）。
 ///
@@ -30,8 +50,7 @@ pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
     // 记录 HEAD 探测结果，但不直接作为 Range 判定依据；Accept-Ranges 缺失时仍可能支持 Range
     let mut head_size: Option<u64> = None;
     let mut head_support = false;
-    if let Ok(resp) = client
-        .head(url)
+    if let Ok(resp) = ensure_user_agent(client.head(url))
         .send()
         .await
         .and_then(|r| r.error_for_status())
@@ -50,11 +69,14 @@ pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
 
     ::tracing::debug!(head_size = ?head_size, head_support, "HEAD probe result");
     // 2. 范围 GET 探测：以 206/ Content-Range 为金标准，失败则回退 HEAD 避免 501 误判
-    let range_resp = match client.get(url).header("Range", "bytes=0-0").send().await {
+    let range_resp = match ensure_user_agent(client.get(url).header("Range", "bytes=0-0"))
+        .send()
+        .await
+    {
         Ok(resp) => {
             ::tracing::debug!(status = %resp.status(), headers = ?resp.headers(), "Range GET probe");
             resp
-        },
+        }
         Err(e) => {
             ::tracing::warn!(error = %e, head_size = ?head_size, "Range GET failed, fallback to HEAD");
             if let Some(size) = head_size {
@@ -67,19 +89,23 @@ pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
     let status = range_resp.status();
     let headers = range_resp.headers();
     if !status.is_success() && status != StatusCode::PARTIAL_CONTENT {
+        // 416 特殊处理：尝试从 Content-Range: bytes */<total> 解析文件大小
+        if status == StatusCode::RANGE_NOT_SATISFIABLE
+            && let Some(cr) = headers.get(CONTENT_RANGE)
+            && let Ok(crs) = cr.to_str()
+            && let Some((_, _, total)) = crate::util::parse_content_range(crs)
+            && total != 0
+        {
+            ::tracing::info!(total, "probe via 416 Content-Range");
+            return Ok((total, true));
+        }
         if let Some(size) = head_size {
             ::tracing::debug!(size, "Range GET non-success, fallback to HEAD size");
             return Ok((size, head_support));
         }
-        // 无 HEAD 回退则尝试从 Range 响应的 Content-Length 兜底
-        if let Some(len_val) = headers.get(CONTENT_LENGTH)
-            && let Ok(len_str) = len_val.to_str()
-            && let Ok(content_length) = len_str.parse::<u64>()
-        {
-            ::tracing::info!(content_length, "Range probe fallback via Content-Length (no range support)");
-            return Ok((content_length, false));
-        }
-        ::tracing::error!(status = %status, "probe failed: no Content-Length");
+        // 4xx/5xx 且无 HEAD 回退时，不应把错误响应体的 Content-Length 当作文件大小（例如 400 "No userAgent" 27B）
+        // 仅对 2xx 的兜底在后续分支处理，此处直接失败以触发 streaming 回退或上层错误
+        ::tracing::error!(status = %status, "probe failed: non-success without HEAD fallback");
         return Err(DownloadError::MissingContentLength);
     }
     if status == StatusCode::PARTIAL_CONTENT {
@@ -91,21 +117,31 @@ pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
                 if *total != "*"
                     && let Ok(content_length) = total.parse::<u64>()
                 {
-                    ::tracing::info!(content_length, support_ranges = true, "probe via 206 Content-Range");
+                    ::tracing::info!(
+                        content_length,
+                        support_ranges = true,
+                        "probe via 206 Content-Range"
+                    );
                     return Ok((content_length, true));
                 }
             }
         }
         // 206 但无 Content-Range，仍判支持 Range，用 HEAD 或 Content-Length 回退
         if let Some(size) = head_size {
-            ::tracing::info!(size, "206 without Content-Range, fallback to HEAD size with range support");
+            ::tracing::info!(
+                size,
+                "206 without Content-Range, fallback to HEAD size with range support"
+            );
             return Ok((size, true));
         }
         if let Some(len_val) = headers.get(CONTENT_LENGTH)
             && let Ok(len_str) = len_val.to_str()
             && let Ok(content_length) = len_str.parse::<u64>()
         {
-            ::tracing::info!(content_length, "206 without Content-Range, fallback via Content-Length");
+            ::tracing::info!(
+                content_length,
+                "206 without Content-Range, fallback via Content-Length"
+            );
             return Ok((content_length, true));
         }
     }
@@ -119,7 +155,11 @@ pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
             if *total != "*"
                 && let Ok(content_length) = total.parse::<u64>()
             {
-                ::tracing::info!(content_length, support_ranges = true, "probe via 200 Content-Range");
+                ::tracing::info!(
+                    content_length,
+                    support_ranges = true,
+                    "probe via 200 Content-Range"
+                );
                 return Ok((content_length, true));
             }
         }
@@ -134,7 +174,10 @@ pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
         && let Ok(len_str) = len_val.to_str()
         && let Ok(content_length) = len_str.parse::<u64>()
     {
-        ::tracing::info!(content_length, "probe fallback via GET Content-Length (no range)");
+        ::tracing::info!(
+            content_length,
+            "probe fallback via GET Content-Length (no range)"
+        );
         return Ok((content_length, false));
     }
 
@@ -200,7 +243,10 @@ pub(crate) fn parse_content_range(header: &str) -> Option<(u64, u64, u64)> {
 pub async fn file_writer_task(
     filepath: FastStr,
     size: u64,
-) -> Result<(mpsc::Sender<DownloadCmd>, JoinHandle<std::result::Result<(), DownloadError>>)> {
+) -> Result<(
+    mpsc::Sender<DownloadCmd>,
+    JoinHandle<std::result::Result<(), DownloadError>>,
+)> {
     file_writer_task_impl(
         filepath,
         size,
@@ -217,7 +263,10 @@ pub async fn file_writer_task_with_resume(
     size: u64,
     truncate: bool,
     resume_recorder: Option<ResumeRecorder>,
-) -> Result<(mpsc::Sender<DownloadCmd>, JoinHandle<std::result::Result<(), DownloadError>>)> {
+) -> Result<(
+    mpsc::Sender<DownloadCmd>,
+    JoinHandle<std::result::Result<(), DownloadError>>,
+)> {
     file_writer_task_impl(filepath, size, truncate, resume_recorder).await
 }
 
@@ -226,7 +275,10 @@ async fn file_writer_task_impl(
     size: u64,
     truncate: bool,
     #[cfg(feature = "resume")] resume_recorder: Option<ResumeRecorder>,
-) -> Result<(mpsc::Sender<DownloadCmd>, JoinHandle<std::result::Result<(), DownloadError>>)> {
+) -> Result<(
+    mpsc::Sender<DownloadCmd>,
+    JoinHandle<std::result::Result<(), DownloadError>>,
+)> {
     const WRITER_QUEUE_CAP: usize = 128;
     let (tx, mut rx) = mpsc::channel::<DownloadCmd>(WRITER_QUEUE_CAP);
     #[cfg(feature = "resume")]
@@ -314,7 +366,11 @@ async fn file_writer_task_impl(
                             writer_err = Some(e);
                             break;
                         }
-                        ::tracing::trace!(offset = p_off, len = p_buf.len(), "flushed coalesced write");
+                        ::tracing::trace!(
+                            offset = p_off,
+                            len = p_buf.len(),
+                            "flushed coalesced write"
+                        );
                     }
                     pending = Some((offset, data.to_vec()));
                 }
@@ -341,7 +397,11 @@ async fn file_writer_task_impl(
                                 writer_err = Some(e);
                             }
                             if writer_err.is_none() {
-                                ::tracing::trace!(offset = p_off, len = p_buf.len(), "final pending flushed on TerminateAll");
+                                ::tracing::trace!(
+                                    offset = p_off,
+                                    len = p_buf.len(),
+                                    "final pending flushed on TerminateAll"
+                                );
                             }
                         }
                     }
@@ -353,7 +413,11 @@ async fn file_writer_task_impl(
         // 通道关闭：落盘剩余 pending（仅当之前未出错）
         if writer_err.is_none() {
             if let Some((p_off, p_buf)) = pending.take() {
-                ::tracing::debug!(offset = p_off, len = p_buf.len(), "channel closed, flushing remaining pending");
+                ::tracing::debug!(
+                    offset = p_off,
+                    len = p_buf.len(),
+                    "channel closed, flushing remaining pending"
+                );
                 if let Err(e) = file.seek(io::SeekFrom::Start(p_off)).await {
                     ::tracing::error!(offset = p_off, len = p_buf.len(), error = %e, "flush remaining pending seek failed");
                     writer_err = Some(DownloadError::Io(e));
@@ -376,7 +440,11 @@ async fn file_writer_task_impl(
                 }
             }
         } else if let Some((p_off, p_buf)) = pending.take() {
-            ::tracing::warn!(offset = p_off, len = p_buf.len(), "discarding pending due to prior writer error");
+            ::tracing::warn!(
+                offset = p_off,
+                len = p_buf.len(),
+                "discarding pending due to prior writer error"
+            );
         }
         #[cfg(feature = "resume")]
         if let Some(recorder) = resume_recorder.as_mut() {

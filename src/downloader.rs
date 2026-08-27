@@ -11,7 +11,7 @@ use crate::types::{DownloadCmd, DownloadInfo, Result};
 use crate::util::file_writer_task;
 #[cfg(feature = "resume")]
 use crate::util::file_writer_task_with_resume;
-use crate::util::get_file_info;
+use crate::util::{ensure_user_agent, get_file_info};
 use faststr::FastStr;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
@@ -35,6 +35,7 @@ type ProgressHandler =
 
 fn default_client_builder() -> ClientBuilder {
     ClientBuilder::new()
+        .user_agent(crate::DEFAULT_USER_AGENT)
         .pool_max_idle_per_host(32)
         .pool_idle_timeout(std::time::Duration::from_secs(90))
         .tcp_keepalive(std::time::Duration::from_secs(60))
@@ -402,30 +403,31 @@ where
                     ::tracing::debug!(url = %config.url, workers = config.workers, interval = self.update_interval, "probing single source");
                     // M3-05 保留用户 pool 配置，不二次覆盖；默认值由 default_client_builder 提供
                     let client = (self.client_builder)().build()?;
-                    let (file_size, support_ranges) =
-                        match get_file_info(&client, &config.url).await {
-                            Ok(v) => {
-                                ::tracing::info!(size = v.0, support_ranges = v.1, url = %config.url, "probe ok");
-                                v
-                            },
-                            Err(DownloadError::MissingContentLength) => {
-                                ::tracing::warn!(url = %config.url, "missing Content-Length -> streaming fallback");
-                                let writer_path = config.output_path.clone();
-                                let download_url = config.url.clone();
-                                return self
-                                    .streaming_download(
-                                        client,
-                                        download_url,
-                                        writer_path,
-                                        progress_handler,
-                                    )
-                                    .await;
-                            }
-                            Err(e) => {
-                                ::tracing::error!(error = %e, url = %config.url, "probe failed");
-                                return Err(e)
-                            },
-                        };
+                    let (file_size, support_ranges) = match get_file_info(&client, &config.url)
+                        .await
+                    {
+                        Ok(v) => {
+                            ::tracing::info!(size = v.0, support_ranges = v.1, url = %config.url, "probe ok");
+                            v
+                        }
+                        Err(DownloadError::MissingContentLength) => {
+                            ::tracing::warn!(url = %config.url, "missing Content-Length -> streaming fallback");
+                            let writer_path = config.output_path.clone();
+                            let download_url = config.url.clone();
+                            return self
+                                .streaming_download(
+                                    client,
+                                    download_url,
+                                    writer_path,
+                                    progress_handler,
+                                )
+                                .await;
+                        }
+                        Err(e) => {
+                            ::tracing::error!(error = %e, url = %config.url, "probe failed");
+                            return Err(e);
+                        }
+                    };
                     (
                         file_size,
                         support_ranges,
@@ -444,7 +446,9 @@ where
                         Err(DownloadError::NoAvailableSources)
                         | Err(DownloadError::MissingContentLength) => {
                             // 多源探测失败，回退为单流流式下载（首源）
-                            ::tracing::warn!("multi-source probe failed, fallback to streaming with first source");
+                            ::tracing::warn!(
+                                "multi-source probe failed, fallback to streaming with first source"
+                            );
                             if let Some(first) = config.sources.first() {
                                 // M3-05 保留用户 pool 配置
                                 let client = (self.client_builder)().build()?;
@@ -466,7 +470,7 @@ where
                         Err(e) => {
                             ::tracing::error!(error = %e, "multi-source probe failed");
                             return Err(e);
-                        },
+                        }
                     };
                     let support_ranges = runtime.supports_ranges;
                     ::tracing::info!(file_size, support_ranges, "multi-source probe ok");
@@ -497,7 +501,10 @@ where
         .await?;
         #[cfg(feature = "resume")]
         if resume_plan.completed_bytes > 0 && !support_ranges {
-            ::tracing::error!(completed = resume_plan.completed_bytes, "partial resume requires HTTP Range support but server does not support it");
+            ::tracing::error!(
+                completed = resume_plan.completed_bytes,
+                "partial resume requires HTTP Range support but server does not support it"
+            );
             return Err(DownloadError::ResumeMetadata(
                 "partial resume requires HTTP Range support".to_owned(),
             ));
@@ -633,7 +640,10 @@ where
             spawn(handler(0, self.info_tx.subscribe()));
             ::tracing::debug!("streaming progress handler spawned");
         }
-        let resp = client.get(url.as_str()).send().await?.error_for_status()?;
+        let resp = ensure_user_agent(client.get(url.as_str()))
+            .send()
+            .await?
+            .error_for_status()?;
         ::tracing::debug!(status = %resp.status(), url = %url, "streaming GET response");
         let mut stream = resp.bytes_stream();
         let mut offset = 0u64;
@@ -738,12 +748,27 @@ where
         let next_chunk_id = AtomicU64::new(0);
 
         let workers = if !support_ranges || workers == 1 || file_size < MIN_PARALLEL_FILE_SIZE {
-            ::tracing::info!(support_ranges, file_size, workers, "downgrade to single worker");
+            ::tracing::info!(
+                support_ranges,
+                file_size,
+                workers,
+                "downgrade to single worker"
+            );
             1
         } else {
             workers
         };
-        ::tracing::debug!(effective_workers = workers, file_size, support_ranges, mode = if multi_runtime.is_some() { "multi" } else { "single" }, "effective workers");
+        ::tracing::debug!(
+            effective_workers = workers,
+            file_size,
+            support_ranges,
+            mode = if multi_runtime.is_some() {
+                "multi"
+            } else {
+                "single"
+            },
+            "effective workers"
+        );
 
         let initial_ranges = split_resume_ranges(resume_ranges, workers, multi_runtime.is_some());
         ::tracing::debug!(initial_ranges = ?initial_ranges, "initial ranges after split");

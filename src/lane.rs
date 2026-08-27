@@ -1,5 +1,5 @@
 use crate::types::{DownloadError, Result};
-use crate::util::get_file_info;
+use crate::util::{ensure_user_agent, get_file_info};
 use faststr::FastStr;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 #[cfg(feature = "proxy")]
@@ -326,7 +326,8 @@ impl LaneScheduler {
         if let Some(entry) = self.select_lane(false) {
             return Some(entry.candidate.lane_id.clone());
         }
-        let fallback = self.select_lane(true)
+        let fallback = self
+            .select_lane(true)
             .map(|entry| entry.candidate.lane_id.clone());
         if fallback.is_some() {
             ::tracing::debug!("best_lane fallback to blacklisted lane");
@@ -550,12 +551,14 @@ impl MultiRuntime {
                         // M3-01 实测 probe_speed：64KiB 采样替代硬编码 1.0
                         let measured = {
                             let start = Instant::now();
-                            let resp_res = runtime
-                                .client
-                                .get(runtime.url.as_str())
-                                .header("Range", "bytes=0-65535")
-                                .send()
-                                .await;
+                            let resp_res = ensure_user_agent(
+                                runtime
+                                    .client
+                                    .get(runtime.url.as_str())
+                                    .header("Range", "bytes=0-65535"),
+                            )
+                            .send()
+                            .await;
                             match resp_res {
                                 Ok(r) => match r.bytes().await {
                                     Ok(b) => {
@@ -603,12 +606,14 @@ impl MultiRuntime {
                         // M3-01 fallback 同样实测（无 Range 则全量采样首 64KiB，流式限长避免 OOM）
                         let measured = {
                             let start = Instant::now();
-                            let resp_res = runtime
-                                .client
-                                .get(runtime.url.as_str())
-                                .header("Range", "bytes=0-65535")
-                                .send()
-                                .await;
+                            let resp_res = ensure_user_agent(
+                                runtime
+                                    .client
+                                    .get(runtime.url.as_str())
+                                    .header("Range", "bytes=0-65535"),
+                            )
+                            .send()
+                            .await;
                             match resp_res {
                                 Ok(r) => {
                                     let mut stream = r.bytes_stream();
@@ -683,7 +688,12 @@ impl MultiRuntime {
             return Err(DownloadError::NoAvailableSources);
         };
 
-        ::tracing::info!(file_size, supports_ranges, lanes = candidates.len(), "multi-source probe done");
+        ::tracing::info!(
+            file_size,
+            supports_ranges,
+            lanes = candidates.len(),
+            "multi-source probe done"
+        );
 
         let scheduler = LaneScheduler::from_candidates(
             candidates,

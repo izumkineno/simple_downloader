@@ -1,6 +1,7 @@
 //! 定义和管理单个下载块（chunk）的执行逻辑。
 
 use crate::types::{ChunkId, DownloadCmd, DownloadInfo};
+use crate::util::ensure_user_agent;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::RequestBuilder;
@@ -64,9 +65,12 @@ pub async fn chunk_run(
         size = end_byte.saturating_sub(start_byte).saturating_add(1),
         "chunk start"
     );
-    // 构建 Range 请求头
+    // 构建 Range 请求头，确保携带 User-Agent（保留用户自定义，仅缺失时注入默认值）
     let range_header = format!("bytes={start_byte}-{end_byte}");
-    let response = match rb.header("Range", range_header.clone()).send().await {
+    let response = match ensure_user_agent(rb.header("Range", range_header.clone()))
+        .send()
+        .await
+    {
         Ok(resp) => {
             ::tracing::debug!(
                 chunk_id = id,
@@ -102,7 +106,8 @@ pub async fn chunk_run(
                                 return;
                             }
                         } else {
-                            let error_msg = format!("invalid Content-Range header for 206: {cr_str}");
+                            let error_msg =
+                                format!("invalid Content-Range header for 206: {cr_str}");
                             ::tracing::error!(chunk_id = id, range = %range_header, error = %error_msg, "invalid Content-Range");
                             let _ = bd_tx.send(DownloadInfo::ChunkFailed {
                                 id,
@@ -114,7 +119,8 @@ pub async fn chunk_run(
                         }
                     }
                     None => {
-                        let error_msg = "missing Content-Range header for 206 Partial Content".to_string();
+                        let error_msg =
+                            "missing Content-Range header for 206 Partial Content".to_string();
                         ::tracing::error!(chunk_id = id, range = %range_header, error = %error_msg, "missing Content-Range");
                         let _ = bd_tx.send(DownloadInfo::ChunkFailed {
                             id,
@@ -326,12 +332,24 @@ pub async fn chunk_run(
             else => break,
         }
     }
-    ::tracing::debug!(chunk_id = id, offset, end, failed, downloaded = offset.saturating_sub(start_byte), "chunk exit");
+    ::tracing::debug!(
+        chunk_id = id,
+        offset,
+        end,
+        failed,
+        downloaded = offset.saturating_sub(start_byte),
+        "chunk exit"
+    );
     // 收尾：若最后一段被节流未发送，补一次最终进度，避免 Monitor 统计低估
     if !failed {
         let final_downloaded = offset.saturating_sub(start_byte);
         if final_downloaded != last_reported {
-            ::tracing::trace!(chunk_id = id, final_downloaded, total = end.saturating_sub(start_byte).saturating_add(1), "final progress補發");
+            ::tracing::trace!(
+                chunk_id = id,
+                final_downloaded,
+                total = end.saturating_sub(start_byte).saturating_add(1),
+                "final progress補發"
+            );
             let _ = bd_tx.send(DownloadInfo::ChunkProgress {
                 id,
                 start_byte,

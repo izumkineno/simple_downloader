@@ -164,6 +164,9 @@ mod types;
 #[doc(hidden)]
 pub mod util;
 
+pub(crate) const DEFAULT_USER_AGENT: &str =
+    concat!("simple_downloader/", env!("CARGO_PKG_VERSION"));
+
 // --- 公共 API 导出 ---
 
 // 导出核心的 `Downloader`，它是用户的主要入口点。
