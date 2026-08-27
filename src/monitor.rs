@@ -33,6 +33,8 @@ pub struct DownloadMonitor {
     pub(crate) pending_bisects: std::collections::VecDeque<(u64, u64)>,
     /// 状态更新的间隔时间（秒）。
     update_interval: f64,
+    /// Lagged 事件计数，用于 P0-03 对账
+    lagged_count: u64,
 }
 
 impl DownloadMonitor {
@@ -61,6 +63,7 @@ impl DownloadMonitor {
             lane_bindings: HashMap::new(),
             pending_bisects: std::collections::VecDeque::new(),
             update_interval,
+            lagged_count: 0,
         }
     }
 
@@ -163,7 +166,8 @@ impl DownloadMonitor {
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        ::tracing::warn!(skipped, "broadcast lagged, skip events");
+                        self.lagged_count += skipped as u64;
+                        ::tracing::warn!(skipped, total_lagged = self.lagged_count, pending_bisects = self.pending_bisects.len(), active_chunks = self.state.chunks.len(), "broadcast lagged, skip events (P0-03 reconciliation: complete/failed rely on task join + tick, not solely broadcast)");
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         ::tracing::info!("broadcast closed, monitor exit");
