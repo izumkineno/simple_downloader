@@ -575,12 +575,30 @@ where
         orchestrate_result?;
         #[cfg(feature = "resume")]
         {
-            // 下载成功后清理 sidecar，避免下次启动做全量哈希校验
+            // M3-04: 下载成功后清理 sidecar，重试 3 次避免偶发 PermissionDenied/文件占用导致泄漏
             let meta_path = crate::resume::metadata_path_for(Path::new(&writer_path_string));
-            match tokio::fs::remove_file(&meta_path).await {
-                Ok(_) => ::tracing::info!(path = %meta_path.display(), "resume sidecar cleaned after success"),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
-                Err(e) => ::tracing::warn!(error = %e, path = %meta_path.display(), "failed to clean resume sidecar"),
+            let mut attempts = 0;
+            loop {
+                match tokio::fs::remove_file(&meta_path).await {
+                    Ok(_) => {
+                        ::tracing::info!(path = %meta_path.display(), "resume sidecar cleaned after success");
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                        ::tracing::warn!(error = %e, path = %meta_path.display(), "failed to clean resume sidecar (permission denied, not retrying)");
+                        break;
+                    }
+                    Err(e) => {
+                        attempts += 1;
+                        if attempts >= 3 {
+                            ::tracing::error!(error = %e, path = %meta_path.display(), attempts, "failed to clean resume sidecar after 3 retries");
+                            break;
+                        }
+                        ::tracing::warn!(error = %e, path = %meta_path.display(), attempt = attempts, "failed to clean resume sidecar, retrying");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
             }
         }
         ::tracing::info!(writer_path = %writer_path, "download complete");
