@@ -215,18 +215,17 @@ impl RetryHandler {
         }
     }
 
-    /// 从即时重试队列中弹出一个已达到重试延迟时间的块。
+    /// 从即时重试队列中弹出一个已达到重试延迟时间的块（扫描首个就绪项，避免队头阻塞）。
     pub fn pop_ready_chunk(&mut self) -> Option<FailedChunkInfo> {
-        if let Some(failed_chunk) = self.retry_queue.front()
-            && failed_chunk.failure_time.elapsed() >= RETRY_DELAY
-        {
-            let chunk = self.retry_queue.pop_front();
-            if let Some(ref c) = chunk {
-                ::tracing::debug!(chunk_id = c.id, attempts = c.attempts, "pop ready retry chunk");
-            }
-            return chunk;
+        let pos = self
+            .retry_queue
+            .iter()
+            .position(|c| c.failure_time.elapsed() >= RETRY_DELAY)?;
+        let chunk = self.retry_queue.remove(pos);
+        if let Some(ref c) = chunk {
+            ::tracing::debug!(chunk_id = c.id, attempts = c.attempts, pos, "pop ready retry chunk (scan)");
         }
-        None
+        chunk
     }
 
     pub(crate) fn push_front_retry(&mut self, chunk: FailedChunkInfo) {
