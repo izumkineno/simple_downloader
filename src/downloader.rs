@@ -559,14 +559,24 @@ where
             )
             .await;
         let _ = writer_shutdown_tx.send(DownloadCmd::TerminateAll).await;
-        let _ = writer_handle.await;
+        let writer_join = writer_handle.await;
+        let writer_result: std::result::Result<(), DownloadError> = match writer_join {
+            Ok(r) => r,
+            Err(e) => Err(DownloadError::Join(e)),
+        };
         let _ = self.cmd_tx.send(DownloadCmd::TerminateAll);
         if let Err(ref e) = orchestrate_result {
             ::tracing::error!(error = %e, "orchestrate_downloads failed");
+            if let Err(ref we) = writer_result {
+                ::tracing::error!(error = %we, "writer task also failed");
+            }
+        } else if let Err(ref e) = writer_result {
+            ::tracing::error!(error = %e, "writer task failed");
         } else {
             ::tracing::info!(writer_path = %writer_path, file_size, "orchestrate_downloads done");
         }
         orchestrate_result?;
+        writer_result?;
         #[cfg(feature = "resume")]
         {
             // M3-04: 下载成功后清理 sidecar，重试 3 次避免偶发 PermissionDenied/文件占用导致泄漏
@@ -689,8 +699,16 @@ where
             }
         }
         let _ = writer_shutdown_tx.send(DownloadCmd::TerminateAll).await;
-        let _ = writer_handle.await;
+        let writer_join = writer_handle.await;
+        let writer_result: std::result::Result<(), DownloadError> = match writer_join {
+            Ok(r) => r,
+            Err(e) => Err(DownloadError::Join(e)),
+        };
         let _ = self.cmd_tx.send(DownloadCmd::TerminateAll);
+        if let Err(ref e) = writer_result {
+            ::tracing::error!(error = %e, "streaming writer task failed");
+            return Err(writer_result.unwrap_err());
+        }
         let _ = self.info_tx.send(DownloadInfo::MonitorUpdate {
             total_size: total_downloaded,
             total_downloaded,

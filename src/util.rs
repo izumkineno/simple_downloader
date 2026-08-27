@@ -200,7 +200,7 @@ pub(crate) fn parse_content_range(header: &str) -> Option<(u64, u64, u64)> {
 pub async fn file_writer_task(
     filepath: FastStr,
     size: u64,
-) -> Result<(mpsc::Sender<DownloadCmd>, JoinHandle<()>)> {
+) -> Result<(mpsc::Sender<DownloadCmd>, JoinHandle<std::result::Result<(), DownloadError>>)> {
     file_writer_task_impl(
         filepath,
         size,
@@ -217,7 +217,7 @@ pub async fn file_writer_task_with_resume(
     size: u64,
     truncate: bool,
     resume_recorder: Option<ResumeRecorder>,
-) -> Result<(mpsc::Sender<DownloadCmd>, JoinHandle<()>)> {
+) -> Result<(mpsc::Sender<DownloadCmd>, JoinHandle<std::result::Result<(), DownloadError>>)> {
     file_writer_task_impl(filepath, size, truncate, resume_recorder).await
 }
 
@@ -226,7 +226,7 @@ async fn file_writer_task_impl(
     size: u64,
     truncate: bool,
     #[cfg(feature = "resume")] resume_recorder: Option<ResumeRecorder>,
-) -> Result<(mpsc::Sender<DownloadCmd>, JoinHandle<()>)> {
+) -> Result<(mpsc::Sender<DownloadCmd>, JoinHandle<std::result::Result<(), DownloadError>>)> {
     const WRITER_QUEUE_CAP: usize = 128;
     let (tx, mut rx) = mpsc::channel::<DownloadCmd>(WRITER_QUEUE_CAP);
     #[cfg(feature = "resume")]
@@ -265,10 +265,11 @@ async fn file_writer_task_impl(
     }
     ::tracing::info!(path = %filepath, size, truncate, "output file ready (preallocated)");
 
-    // 异步执行文件写入循环（带相邻段合并，128KiB 限）
+    // 异步执行文件写入循环（带相邻段合并，128KiB 限）—— P0-1 修复：所有 seek/write/flush/record 错误回传
     let writer_handle = tokio::spawn(async move {
         let mut pending: Option<(u64, Vec<u8>)> = None;
         const COALESCE_LIMIT: usize = 128 * 1024;
+        let mut writer_err: Option<DownloadError> = None;
 
         while let Some(command) = rx.recv().await {
             match command {
@@ -288,14 +289,21 @@ async fn file_writer_task_impl(
                     }
                     // 先落盘之前的 pending
                     if let Some((p_off, p_buf)) = pending.take() {
-                        if file.seek(io::SeekFrom::Start(p_off)).await.is_err()
-                            || file.write_all(&p_buf).await.is_err()
-                        {
-                            ::tracing::error!(offset = p_off, len = p_buf.len(), "file writer write failed");
+                        if let Err(e) = file.seek(io::SeekFrom::Start(p_off)).await {
+                            ::tracing::error!(offset = p_off, len = p_buf.len(), error = %e, "file writer seek failed");
+                            writer_err = Some(DownloadError::Io(e));
                             break;
                         }
-                        // 确保数据落盘可见后再做哈希校验，避免同一 fd 读到旧数据
-                        let _ = file.flush().await;
+                        if let Err(e) = file.write_all(&p_buf).await {
+                            ::tracing::error!(offset = p_off, len = p_buf.len(), error = %e, "file writer write failed");
+                            writer_err = Some(DownloadError::Io(e));
+                            break;
+                        }
+                        if let Err(e) = file.flush().await {
+                            ::tracing::error!(offset = p_off, error = %e, "file writer flush failed");
+                            writer_err = Some(DownloadError::Io(e));
+                            break;
+                        }
                         #[cfg(feature = "resume")]
                         if let Some(recorder) = resume_recorder.as_mut()
                             && let Err(e) = recorder
@@ -303,6 +311,7 @@ async fn file_writer_task_impl(
                                 .await
                         {
                             ::tracing::error!(error = %e, offset = p_off, "resume metadata update failed");
+                            writer_err = Some(e);
                             break;
                         }
                         ::tracing::trace!(offset = p_off, len = p_buf.len(), "flushed coalesced write");
@@ -312,19 +321,28 @@ async fn file_writer_task_impl(
                 DownloadCmd::TerminateAll => {
                     ::tracing::debug!("file writer recv TerminateAll");
                     if let Some((p_off, p_buf)) = pending.take() {
-                        if file.seek(io::SeekFrom::Start(p_off)).await.is_err()
-                            || file.write_all(&p_buf).await.is_err()
-                        {
-                            ::tracing::error!(offset = p_off, len = p_buf.len(), "file writer final write failed");
+                        if let Err(e) = file.seek(io::SeekFrom::Start(p_off)).await {
+                            ::tracing::error!(offset = p_off, len = p_buf.len(), error = %e, "file writer final seek failed");
+                            writer_err = Some(DownloadError::Io(e));
+                        } else if let Err(e) = file.write_all(&p_buf).await {
+                            ::tracing::error!(offset = p_off, len = p_buf.len(), error = %e, "file writer final write failed");
+                            writer_err = Some(DownloadError::Io(e));
+                        } else if let Err(e) = file.flush().await {
+                            ::tracing::error!(offset = p_off, error = %e, "file writer final flush failed");
+                            writer_err = Some(DownloadError::Io(e));
                         } else {
-                            let _ = file.flush().await;
                             #[cfg(feature = "resume")]
-                            if let Some(recorder) = resume_recorder.as_mut() {
-                                let _ = recorder
+                            if let Some(recorder) = resume_recorder.as_mut()
+                                && let Err(e) = recorder
                                     .record_write(&mut file, p_off, p_buf.len() as u64)
-                                    .await;
+                                    .await
+                            {
+                                ::tracing::error!(error = %e, offset = p_off, "resume metadata update failed on TerminateAll");
+                                writer_err = Some(e);
                             }
-                            ::tracing::trace!(offset = p_off, len = p_buf.len(), "final pending flushed on TerminateAll");
+                            if writer_err.is_none() {
+                                ::tracing::trace!(offset = p_off, len = p_buf.len(), "final pending flushed on TerminateAll");
+                            }
                         }
                     }
                     break;
@@ -332,30 +350,56 @@ async fn file_writer_task_impl(
                 _ => {}
             }
         }
-        // 通道关闭：落盘剩余 pending
-        if let Some((p_off, p_buf)) = pending.take() {
-            ::tracing::debug!(offset = p_off, len = p_buf.len(), "channel closed, flushing remaining pending");
-            if file.seek(io::SeekFrom::Start(p_off)).await.is_ok()
-                && file.write_all(&p_buf).await.is_ok()
-            {
-                let _ = file.flush().await;
-                #[cfg(feature = "resume")]
-                if let Some(recorder) = resume_recorder.as_mut() {
-                    let _ = recorder
-                        .record_write(&mut file, p_off, p_buf.len() as u64)
-                        .await;
+        // 通道关闭：落盘剩余 pending（仅当之前未出错）
+        if writer_err.is_none() {
+            if let Some((p_off, p_buf)) = pending.take() {
+                ::tracing::debug!(offset = p_off, len = p_buf.len(), "channel closed, flushing remaining pending");
+                if let Err(e) = file.seek(io::SeekFrom::Start(p_off)).await {
+                    ::tracing::error!(offset = p_off, len = p_buf.len(), error = %e, "flush remaining pending seek failed");
+                    writer_err = Some(DownloadError::Io(e));
+                } else if let Err(e) = file.write_all(&p_buf).await {
+                    ::tracing::error!(offset = p_off, len = p_buf.len(), error = %e, "flush remaining pending write failed");
+                    writer_err = Some(DownloadError::Io(e));
+                } else if let Err(e) = file.flush().await {
+                    ::tracing::error!(offset = p_off, error = %e, "flush remaining pending flush failed");
+                    writer_err = Some(DownloadError::Io(e));
+                } else {
+                    #[cfg(feature = "resume")]
+                    if let Some(recorder) = resume_recorder.as_mut()
+                        && let Err(e) = recorder
+                            .record_write(&mut file, p_off, p_buf.len() as u64)
+                            .await
+                    {
+                        ::tracing::error!(error = %e, offset = p_off, "resume metadata update failed on channel close");
+                        writer_err = Some(e);
+                    }
                 }
-            } else {
-                ::tracing::error!(offset = p_off, len = p_buf.len(), "flush remaining pending failed");
             }
+        } else if let Some((p_off, p_buf)) = pending.take() {
+            ::tracing::warn!(offset = p_off, len = p_buf.len(), "discarding pending due to prior writer error");
         }
         #[cfg(feature = "resume")]
         if let Some(recorder) = resume_recorder.as_mut() {
-            let _ = recorder.flush().await;
-            ::tracing::debug!("resume recorder flushed on writer exit");
+            if let Err(e) = recorder.flush().await {
+                ::tracing::error!(error = %e, "resume recorder final flush failed");
+                if writer_err.is_none() {
+                    writer_err = Some(e);
+                }
+            } else {
+                ::tracing::debug!("resume recorder flushed on writer exit");
+            }
         }
-        let _ = file.flush().await;
+        if writer_err.is_none() {
+            if let Err(e) = file.flush().await {
+                ::tracing::error!(error = %e, "final file flush failed");
+                writer_err = Some(DownloadError::Io(e));
+            }
+        }
         ::tracing::info!("file writer task exited");
+        match writer_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     });
 
     Ok((tx, writer_handle))
