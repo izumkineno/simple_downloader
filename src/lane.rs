@@ -547,7 +547,35 @@ impl MultiRuntime {
                                 }
                             }
                         }
-                        runtime.probe_speed = 1.0;
+                        // M3-01 实测 probe_speed：64KiB 采样替代硬编码 1.0
+                        let measured = {
+                            let start = Instant::now();
+                            let resp_res = runtime
+                                .client
+                                .get(runtime.url.as_str())
+                                .header("Range", "bytes=0-65535")
+                                .send()
+                                .await;
+                            match resp_res {
+                                Ok(r) => match r.bytes().await {
+                                    Ok(b) => {
+                                        let elapsed = start.elapsed().as_secs_f64().max(0.001);
+                                        let s = b.len() as f64 / elapsed;
+                                        ::tracing::info!(lane_id = %runtime.lane_id, bytes = b.len(), elapsed, speed = s, "probe_speed measured (range)");
+                                        if s > 0.0 { s } else { 1.0 }
+                                    }
+                                    Err(e) => {
+                                        ::tracing::warn!(lane_id = %runtime.lane_id, error = %e, "probe_speed bytes read failed, fallback 1.0");
+                                        1.0
+                                    }
+                                },
+                                Err(e) => {
+                                    ::tracing::warn!(lane_id = %runtime.lane_id, error = %e, "probe_speed request failed, fallback 1.0");
+                                    1.0
+                                }
+                            }
+                        };
+                        runtime.probe_speed = measured;
                         range_candidates.push(LaneCandidate {
                             lane_id: runtime.lane_id.clone(),
                             source_id: runtime.source_id.clone(),
@@ -572,7 +600,31 @@ impl MultiRuntime {
                         } else {
                             fallback_file_size = Some(file_size);
                         }
-                        runtime.probe_speed = 1.0;
+                        // M3-01 fallback 同样实测（无 Range 则全量采样首 64KiB）
+                        let measured = {
+                            let start = Instant::now();
+                            let resp_res = runtime.client.get(runtime.url.as_str()).send().await;
+                            match resp_res {
+                                Ok(r) => match r.bytes().await {
+                                    Ok(b) => {
+                                        let len = b.len().min(65535) as f64;
+                                        let elapsed = start.elapsed().as_secs_f64().max(0.001);
+                                        let s = len / elapsed;
+                                        ::tracing::info!(lane_id = %runtime.lane_id, bytes = b.len(), elapsed, speed = s, "probe_speed measured (fallback)");
+                                        if s > 0.0 { s } else { 1.0 }
+                                    }
+                                    Err(e) => {
+                                        ::tracing::warn!(lane_id = %runtime.lane_id, error = %e, "probe_speed fallback bytes failed, 1.0");
+                                        1.0
+                                    }
+                                },
+                                Err(e) => {
+                                    ::tracing::warn!(lane_id = %runtime.lane_id, error = %e, "probe_speed fallback request failed, 1.0");
+                                    1.0
+                                }
+                            }
+                        };
+                        runtime.probe_speed = measured;
                         fallback_candidates.push(LaneCandidate {
                             lane_id: runtime.lane_id.clone(),
                             source_id: runtime.source_id.clone(),
