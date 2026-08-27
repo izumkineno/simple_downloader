@@ -11,13 +11,15 @@ async fn test_chunk_download_success() {
     // 创建模拟服务器
     let mut server = Server::new_async().await;
     let test_data = b"Hello World! This is a test file content.";
-
-    // 模拟范围请求
+    let len = test_data.len() as u64;
+    // 模拟范围请求 — Range 与 Content-Range 需与 body 长度一致，避免触发 P0-02 early EOF
+    let range_hdr = format!("bytes=0-{}", len - 1);
+    let cr_hdr = format!("bytes 0-{}/{}", len - 1, len);
     let mock = server
         .mock("GET", "/testfile")
-        .match_header("Range", "bytes=0-44")
+        .match_header("Range", range_hdr.as_str())
         .with_status(206)
-        .with_header("Content-Range", "bytes 0-44/45")
+        .with_header("Content-Range", cr_hdr.as_str())
         .with_body(test_data)
         .create_async()
         .await;
@@ -36,8 +38,9 @@ async fn test_chunk_download_success() {
 
     // 启动chunk任务
     let chunk_id: ChunkId = 1;
+    let end = len - 1;
     let handle = tokio::spawn(async move {
-        chunk_run(chunk_id, cmd_tx, cmd_bd_rx, info_bd_tx.clone(), rb, 0, 44).await;
+        chunk_run(chunk_id, cmd_tx, cmd_bd_rx, info_bd_tx.clone(), rb, 0, end).await;
     });
 
     // 收集写入命令
@@ -53,27 +56,60 @@ async fn test_chunk_download_success() {
             DownloadCmd::TerminateAll => break,
             _ => {}
         }
-        if offset >= 45 {
+        if offset >= len {
             break;
         }
     }
 
-    // 检查接收到的数据是否正确
+    // 检查接收到的数据是否正确 — 若不匹配先打印 info 以定位 P0-01/02 校验失败
+    if received_data != test_data {
+        // 尝试收集 info 以诊断
+        let mut diag = Vec::new();
+        while let Ok(info) = info_bd_rx.try_recv() {
+            diag.push(format!("{:?}", info));
+        }
+        eprintln!("diag infos before complete check: {:?}", diag);
+        eprintln!("received len {}, expected len {}", received_data.len(), test_data.len());
+    }
     assert_eq!(received_data, test_data);
 
     // 检查是否收到完成消息
     let mut complete_received = false;
-    while let Ok(info) = info_bd_rx.recv().await {
-        match info {
-            DownloadInfo::DownloadComplete(id) if id == chunk_id => {
-                complete_received = true;
+    let mut all_infos = Vec::new();
+    // 使用 try_recv 轮询避免无限阻塞，等待 2s
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(2) {
+        match info_bd_rx.try_recv() {
+            Ok(info) => {
+                eprintln!("info recv: {:?}", info);
+                all_infos.push(format!("{:?}", info));
+                match info {
+                    DownloadInfo::DownloadComplete(id) if id == chunk_id => {
+                        complete_received = true;
+                        break;
+                    }
+                    DownloadInfo::ChunkProgress { .. } => continue,
+                    DownloadInfo::ChunkFailed { id, error, .. } if id == chunk_id => {
+                        eprintln!("ChunkFailed: {}", error);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            Err(broadcast::error::TryRecvError::Empty) => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue;
+            }
+            Err(e) => {
+                eprintln!("recv err: {:?}", e);
                 break;
             }
-            DownloadInfo::ChunkProgress { .. } => continue,
-            _ => {}
         }
     }
-    assert!(complete_received);
+    if !complete_received {
+        eprintln!("all_infos: {:?}", all_infos);
+    }
+    assert!(complete_received, "all_infos: {:?}", all_infos);
 
     mock.assert_async().await;
     handle.await.unwrap();
@@ -293,6 +329,65 @@ async fn test_chunk_206_wrong_content_range_rejected() {
         }
     }
     assert!(failed);
+    mock.assert_async().await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_chunk_early_eof_is_failed() {
+    // P0-02: 流提前结束 (None) 且 offset != end+1 -> ChunkFailed, 不发送 DownloadComplete
+    let mut server = Server::new_async().await;
+    let test_data = vec![0u8; 512]; // 仅 512B，但 Range 请求 0-1023 (1KiB)
+    let mock = server
+        .mock("GET", "/testfile")
+        .match_header("Range", "bytes=0-1023")
+        .with_status(206)
+        .with_header("Content-Range", "bytes 0-1023/1024")
+        .with_body(test_data.clone())
+        .create_async()
+        .await;
+
+    let (cmd_tx, mut cmd_rx) = mpsc::channel(10);
+    let (_cmd_bd_tx, cmd_bd_rx) = broadcast::channel(10);
+    let (info_bd_tx, mut info_bd_rx) = broadcast::channel(10);
+
+    let client = Client::new();
+    let url = format!("{}/testfile", server.url());
+    let rb = client.get(&url);
+
+    let chunk_id: ChunkId = 99;
+    let handle = tokio::spawn(async move {
+        chunk_run(chunk_id, cmd_tx, cmd_bd_rx, info_bd_tx.clone(), rb, 0, 1023).await;
+    });
+
+    let mut received: Vec<u8> = Vec::new();
+    while let Some(cmd) = cmd_rx.recv().await {
+        if let DownloadCmd::WriteFile { data, .. } = cmd {
+            received.extend_from_slice(&data);
+        }
+    }
+    // 仅收到 512B
+    assert_eq!(received.len(), 512);
+
+    let mut failed = false;
+    let mut completed = false;
+    while let Ok(info) = info_bd_rx.recv().await {
+        match info {
+            DownloadInfo::ChunkFailed { id, error, .. } if id == chunk_id => {
+                assert!(error.contains("early EOF"), "error should mention early EOF: {error}");
+                failed = true;
+                break;
+            }
+            DownloadInfo::DownloadComplete(id) if id == chunk_id => {
+                completed = true;
+                break;
+            }
+            DownloadInfo::ChunkProgress { .. } => continue,
+            _ => {}
+        }
+    }
+    assert!(failed, "early EOF should be ChunkFailed, not Complete");
+    assert!(!completed);
     mock.assert_async().await;
     handle.await.unwrap();
 }

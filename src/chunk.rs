@@ -285,9 +285,28 @@ pub async fn chunk_run(
                     failed = true;
                     break;
                 },
-                // 流结束
+                // 流结束：P0-02 完整性门，offset 必须到达 end+1 否则判 Early-EOF
                 None => {
                     ::tracing::debug!(chunk_id = id, offset, end, "stream exhausted");
+                    if offset != end.saturating_add(1) {
+                        // bisect 后 end 已缩小，此处按当前 end 判定；offset>end 视为已完成不判失败
+                        if offset <= end {
+                            let expected = end.saturating_sub(start_byte).saturating_add(1);
+                            let got = offset.saturating_sub(start_byte);
+                            let error_msg = format!(
+                                "early EOF: expected {} bytes ({}-{}), got {}",
+                                expected, start_byte, end, got
+                            );
+                            ::tracing::error!(chunk_id = id, offset, end, error = %error_msg, "early EOF");
+                            let _ = bd_tx.send(DownloadInfo::ChunkFailed {
+                                id,
+                                start: offset,
+                                end,
+                                error: error_msg,
+                            });
+                            failed = true;
+                        }
+                    }
                     break;
                 },
             },
