@@ -232,17 +232,37 @@ async fn file_writer_task_impl(
     #[cfg(feature = "resume")]
     let mut resume_recorder = resume_recorder;
 
-    // 打开（或创建）文件
+    // P0-04: 确保父目录存在 + 原子化预分配（先 set_len 成功再视为截断，避免 ENOSPC 清零）
+    if let Some(parent) = std::path::Path::new(&*filepath).parent() {
+        if !parent.as_os_str().is_empty() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+    }
     ::tracing::debug!(path = %filepath, size, truncate, "opening output file");
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
-        .truncate(truncate)
+        .truncate(false)
         .open(&*filepath)
         .await?;
-    // 预分配文件大小，防止磁盘空间不足，并可能提高写入性能
-    file.set_len(size).await?;
+    // 原子化预分配：全量下载直接 set_len；resume 仅长度不一致时 set_len；size==0 时 truncate 场景清零
+    if size > 0 {
+        if truncate {
+            file.set_len(size).await?;
+        } else {
+            let current_len = file.metadata().await?.len();
+            if current_len != size {
+                file.set_len(size).await?;
+            }
+        }
+    } else if truncate {
+        // 空文件全量场景：显式截断为 0（open 时 truncate=false 故需手动清零）
+        let current_len = file.metadata().await?.len();
+        if current_len != 0 {
+            file.set_len(0).await?;
+        }
+    }
     ::tracing::info!(path = %filepath, size, truncate, "output file ready (preallocated)");
 
     // 异步执行文件写入循环（带相邻段合并，128KiB 限）
