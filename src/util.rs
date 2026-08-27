@@ -141,6 +141,52 @@ pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
     ::tracing::error!("probe failed: MissingContentLength");
     Err(DownloadError::MissingContentLength)
 }
+
+/// 解析 `Content-Range` 头，支持 `bytes <start>-<end>/<total>` 及 `bytes */<total>` 形式。
+///
+/// - 正常范围：`bytes 0-44/45` -> `Some((0,44,45))`
+/// - 通配总大小：`bytes 0-44/*` -> `Some((0,44,0))` (total 未知以 0 表示)
+/// - 416 形态：`bytes */1234` -> `Some((0,0,1234))`
+///
+/// 大小写不敏感地匹配 `bytes ` 前缀，失败返回 `None`。
+pub(crate) fn parse_content_range(header: &str) -> Option<(u64, u64, u64)> {
+    let header = header.trim();
+    // case-insensitive prefix "bytes "
+    if header.len() < 6 || !header[..6].eq_ignore_ascii_case("bytes ") {
+        return None;
+    }
+    let rest = header[6..].trim();
+    let slash_pos = rest.rfind('/')?;
+    let range_part = rest[..slash_pos].trim();
+    let total_part = rest[slash_pos + 1..].trim();
+
+    // 解析 total： "*" 表示未知，用 0 占位；否则解析数字
+    let total: u64 = if total_part == "*" {
+        0
+    } else {
+        total_part.parse::<u64>().ok()?
+    };
+
+    // 416 形态：range_part == "*"
+    if range_part == "*" {
+        // total 必须为有效数字（非 "*"）
+        if total_part == "*" {
+            return None;
+        }
+        return Some((0, 0, total));
+    }
+
+    // 正常形态：range_part = "start-end"
+    let dash_pos = range_part.find('-')?;
+    let start_str = range_part[..dash_pos].trim();
+    let end_str = range_part[dash_pos + 1..].trim();
+    let start: u64 = start_str.parse::<u64>().ok()?;
+    let end: u64 = end_str.parse::<u64>().ok()?;
+    if start > end {
+        return None;
+    }
+    Some((start, end, total))
+}
 ///
 /// 这种模式将所有磁盘 I/O 操作集中在一个任务中，避免了多个下载线程同时写入文件
 /// 导致的竞争和性能问题。

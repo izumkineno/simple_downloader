@@ -160,6 +160,144 @@ async fn test_chunk_bisect() {
 }
 
 #[tokio::test]
+async fn test_chunk_200_single_segment_downgrade_allowed() {
+    // P0-01: 200 单段全量允许降级 (start==0)
+    let mut server = Server::new_async().await;
+    let test_data = b"0123456789"; // 10 bytes
+    let mock = server
+        .mock("GET", "/testfile")
+        .match_header("Range", "bytes=0-9")
+        .with_status(200)
+        .with_body(test_data)
+        .create_async()
+        .await;
+
+    let (cmd_tx, mut cmd_rx) = mpsc::channel(10);
+    let (_cmd_bd_tx, cmd_bd_rx) = broadcast::channel(10);
+    let (info_bd_tx, mut info_bd_rx) = broadcast::channel(10);
+
+    let client = Client::new();
+    let url = format!("{}/testfile", server.url());
+    let rb = client.get(&url);
+
+    let chunk_id: ChunkId = 10;
+    let handle = tokio::spawn(async move {
+        chunk_run(chunk_id, cmd_tx, cmd_bd_rx, info_bd_tx.clone(), rb, 0, 9).await;
+    });
+
+    let mut received = Vec::new();
+    while let Some(cmd) = cmd_rx.recv().await {
+        if let DownloadCmd::WriteFile { data, .. } = cmd {
+            received.extend_from_slice(&data);
+            break;
+        }
+    }
+    assert_eq!(received, test_data);
+
+    let mut ok = false;
+    while let Ok(info) = info_bd_rx.recv().await {
+        match info {
+            DownloadInfo::DownloadComplete(id) if id == chunk_id => {
+                ok = true;
+                break;
+            }
+            DownloadInfo::ChunkFailed { id, .. } if id == chunk_id => panic!("expected downgrade success but got ChunkFailed"),
+            _ => continue,
+        }
+    }
+    assert!(ok);
+    mock.assert_async().await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_chunk_200_multi_segment_rejected() {
+    // P0-01: 200 多段必须失败 (start !=0)
+    let mut server = Server::new_async().await;
+    let test_data = b"0123456789";
+    let mock = server
+        .mock("GET", "/testfile")
+        .match_header("Range", "bytes=10-19")
+        .with_status(200)
+        .with_body(test_data)
+        .create_async()
+        .await;
+
+    let (cmd_tx, _cmd_rx) = mpsc::channel(10);
+    let (_cmd_bd_tx, cmd_bd_rx) = broadcast::channel(10);
+    let (info_bd_tx, mut info_bd_rx) = broadcast::channel(10);
+
+    let client = Client::new();
+    let url = format!("{}/testfile", server.url());
+    let rb = client.get(&url);
+
+    let chunk_id: ChunkId = 11;
+    let handle = tokio::spawn(async move {
+        chunk_run(chunk_id, cmd_tx, cmd_bd_rx, info_bd_tx.clone(), rb, 10, 19).await;
+    });
+
+    let mut failed = false;
+    while let Ok(info) = info_bd_rx.recv().await {
+        match info {
+            DownloadInfo::ChunkFailed { id, error, .. } if id == chunk_id => {
+                assert!(error.contains("200"), "error should mention 200: {error}");
+                failed = true;
+                break;
+            }
+            DownloadInfo::DownloadComplete(id) if id == chunk_id => panic!("multi-segment 200 should not succeed"),
+            _ => continue,
+        }
+    }
+    assert!(failed);
+    mock.assert_async().await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_chunk_206_wrong_content_range_rejected() {
+    // P0-01: 206 但 Content-Range 与请求不一致 -> ChunkFailed
+    let mut server = Server::new_async().await;
+    let test_data = b"0123456789";
+    let mock = server
+        .mock("GET", "/testfile")
+        .match_header("Range", "bytes=10-19")
+        .with_status(206)
+        .with_header("Content-Range", "bytes 0-9/20")
+        .with_body(test_data)
+        .create_async()
+        .await;
+
+    let (cmd_tx, _cmd_rx) = mpsc::channel(10);
+    let (_cmd_bd_tx, cmd_bd_rx) = broadcast::channel(10);
+    let (info_bd_tx, mut info_bd_rx) = broadcast::channel(10);
+
+    let client = Client::new();
+    let url = format!("{}/testfile", server.url());
+    let rb = client.get(&url);
+
+    let chunk_id: ChunkId = 12;
+    let handle = tokio::spawn(async move {
+        chunk_run(chunk_id, cmd_tx, cmd_bd_rx, info_bd_tx.clone(), rb, 10, 19).await;
+    });
+
+    let mut failed = false;
+    while let Ok(info) = info_bd_rx.recv().await {
+        match info {
+            DownloadInfo::ChunkFailed { id, error, .. } if id == chunk_id => {
+                assert!(error.contains("Content-Range mismatch") || error.contains("mismatch"), "error should mention mismatch: {error}");
+                failed = true;
+                break;
+            }
+            DownloadInfo::DownloadComplete(id) if id == chunk_id => panic!("wrong Content-Range should not succeed"),
+            _ => continue,
+        }
+    }
+    assert!(failed);
+    mock.assert_async().await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
 async fn test_chunk_request_failure() {
     // 创建模拟服务器，返回错误
     let mut server = Server::new_async().await;

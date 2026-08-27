@@ -801,15 +801,9 @@ mod tests {
         ); // 总速度1000
         let (cmd_tx, _) = broadcast::channel(4);
 
-        // 第一次探测：没有增益（速度还是1000，没有超过1000*1.2=1200）
+        // 第一次探测：没有增益（速度还是1000，没有超过1000*1.2=1200），阈值1次即切 Stable (0.3.1后 2->1)
         manager.decide_and_act(&state1, &cmd_tx);
-        assert_eq!(manager.phase, DownloadPhase::Probing);
+        assert_eq!(manager.phase, DownloadPhase::Stable);
         assert_eq!(manager.consecutive_probe_no_gain, 1);
-
-        // 第二次探测：仍然没有增益
-        manager.last_split_time = Instant::now() - MIN_SPLIT_INTERVAL; // 重置分割间隔
-        manager.stable_speed_samples = VecDeque::from(vec![1000.0, 1000.0, 1000.0]);
-        manager.decide_and_act(&state1, &cmd_tx);
-        assert_eq!(manager.phase, DownloadPhase::Stable); // 转换到稳定阶段
     }
 }

@@ -66,12 +66,7 @@ pub async fn chunk_run(
     );
     // 构建 Range 请求头
     let range_header = format!("bytes={start_byte}-{end_byte}");
-    let response = match rb
-        .header("Range", range_header.clone())
-        .send()
-        .await
-        .and_then(|r| r.error_for_status())
-    {
+    let response = match rb.header("Range", range_header.clone()).send().await {
         Ok(resp) => {
             ::tracing::debug!(
                 chunk_id = id,
@@ -80,8 +75,93 @@ pub async fn chunk_run(
                 headers = ?resp.headers(),
                 "chunk response"
             );
+            // P0-01: 校验 HTTP 状态与 Content-Range 一致性
+            let status = resp.status();
+            if status == reqwest::StatusCode::PARTIAL_CONTENT {
+                // 必须携带 Content-Range 且与请求范围一致
+                let cr_opt = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|v| v.to_str().ok());
+                match cr_opt {
+                    Some(cr_str) => {
+                        if let Some((cr_start, cr_end, _cr_total)) =
+                            crate::util::parse_content_range(cr_str)
+                        {
+                            if cr_start != start_byte || cr_end != end_byte {
+                                let error_msg = format!(
+                                    "Content-Range mismatch: expected bytes {start_byte}-{end_byte}/*, got {cr_str}"
+                                );
+                                ::tracing::error!(chunk_id = id, range = %range_header, content_range = %cr_str, error = %error_msg, "range mismatch");
+                                let _ = bd_tx.send(DownloadInfo::ChunkFailed {
+                                    id,
+                                    start: start_byte,
+                                    end,
+                                    error: error_msg,
+                                });
+                                return;
+                            }
+                        } else {
+                            let error_msg = format!("invalid Content-Range header for 206: {cr_str}");
+                            ::tracing::error!(chunk_id = id, range = %range_header, error = %error_msg, "invalid Content-Range");
+                            let _ = bd_tx.send(DownloadInfo::ChunkFailed {
+                                id,
+                                start: start_byte,
+                                end,
+                                error: error_msg,
+                            });
+                            return;
+                        }
+                    }
+                    None => {
+                        let error_msg = "missing Content-Range header for 206 Partial Content".to_string();
+                        ::tracing::error!(chunk_id = id, range = %range_header, error = %error_msg, "missing Content-Range");
+                        let _ = bd_tx.send(DownloadInfo::ChunkFailed {
+                            id,
+                            start: start_byte,
+                            end,
+                            error: error_msg,
+                        });
+                        return;
+                    }
+                }
+            } else if status == reqwest::StatusCode::OK {
+                // 仅允许单段全量降级：start_byte 必须为 0
+                if start_byte != 0 {
+                    let error_msg = format!(
+                        "server returned 200 OK but Range requested {start_byte}-{end_byte}, only single-segment full download (0-*) is allowed to downgrade"
+                    );
+                    ::tracing::error!(chunk_id = id, range = %range_header, status = %status, error = %error_msg, "range ignored");
+                    let _ = bd_tx.send(DownloadInfo::ChunkFailed {
+                        id,
+                        start: start_byte,
+                        end,
+                        error: error_msg,
+                    });
+                    return;
+                }
+                ::tracing::warn!(chunk_id = id, range = %range_header, status = %status, "server ignored Range, returned 200 OK, downgrading to single-stream full download");
+            } else {
+                let cr_info = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let error_msg = format!(
+                    "unexpected status {} for Range request bytes={start_byte}-{end_byte}, Content-Range: {cr_info}",
+                    status
+                );
+                ::tracing::error!(chunk_id = id, range = %range_header, status = %status, error = %error_msg, "unexpected status");
+                let _ = bd_tx.send(DownloadInfo::ChunkFailed {
+                    id,
+                    start: start_byte,
+                    end,
+                    error: error_msg,
+                });
+                return;
+            }
             resp
-        },
+        }
         Err(e) => {
             let error_msg = format!("{e}");
             ::tracing::error!(chunk_id = id, range = %range_header, error = %error_msg, "chunk request failed");
