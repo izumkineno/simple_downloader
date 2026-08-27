@@ -203,7 +203,25 @@ impl ResumePlan {
                 ));
             }
 
-            let mut metadata = ResumeMetadata::load(&metadata_path)?;
+            let mut metadata = match ResumeMetadata::load(&metadata_path) {
+                Ok(m) => m,
+                Err(e) => {
+                    ::tracing::warn!(error=%e, path=%metadata_path.display(), "resume metadata corrupted, discarding sidecar and rebuilding");
+                    let _ = fs::remove_file(&metadata_path);
+                    let metadata = ResumeMetadata::new(file_size, DEFAULT_SEGMENT_SIZE);
+                    if let Err(save_err) = metadata.save_atomic(&metadata_path) {
+                        ::tracing::warn!(error=%save_err, path=%metadata_path.display(), "rebuild resume metadata save failed");
+                    }
+                    ::tracing::info!(path=%metadata_path.display(), file_size, "rebuilt resume plan after corrupted sidecar");
+                    return Ok(Self {
+                        metadata_path,
+                        metadata: Some(metadata),
+                        truncate_output: true,
+                        remaining_ranges: full_ranges(file_size),
+                        completed_bytes: 0,
+                    });
+                }
+            };
             ::tracing::debug!(path = %metadata_path.display(), segments = metadata.segments.len(), "loaded resume metadata");
             if let Err(e) = metadata.validate_shape(file_size) {
                 ::tracing::warn!(error=%e, path=%metadata_path.display(), "resume shape mismatch, discarding sidecar and rebuilding");
@@ -519,13 +537,16 @@ mod tests {
     }
 
     #[test]
-    fn prepare_still_errors_on_corrupted_bitcode() {
+    fn prepare_self_heals_on_corrupted_bitcode() {
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("out3.bin");
         std::fs::write(&out, vec![0u8; 10]).unwrap();
         let meta_path = metadata_path_for(&out);
         std::fs::write(&meta_path, b"corrupted").unwrap();
         let res = ResumePlan::prepare(&out, 1024, true);
-        assert!(res.is_err());
+        assert!(res.is_ok());
+        let plan = res.unwrap();
+        assert!(plan.truncate_output);
+        assert_eq!(plan.completed_bytes, 0);
     }
 }
