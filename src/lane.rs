@@ -1,3 +1,4 @@
+use crate::limiter::RateLimiter;
 use crate::types::{DownloadError, Result};
 use crate::util::{ensure_user_agent, get_file_info};
 use faststr::FastStr;
@@ -6,6 +7,7 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::Proxy;
 use reqwest::{Client, ClientBuilder};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 const BLACKLIST_THRESHOLD: u32 = 3;
 const BLACKLIST_DURATION: Duration = Duration::from_secs(30);
@@ -112,6 +114,8 @@ pub struct SourceConfig {
     /// 该源绑定的代理列表（需 `proxy` feature）
     #[cfg(feature = "proxy")]
     pub proxies: Vec<ProxyConfig>,
+    /// 该源限速（bytes/s），`rate-limit` feature 生效
+    pub speed_limit: Option<u64>,
 }
 
 impl SourceConfig {
@@ -124,12 +128,20 @@ impl SourceConfig {
             url,
             #[cfg(feature = "proxy")]
             proxies: Vec::new(),
+            speed_limit: None,
         }
     }
 
     /// 覆盖源 `id`（用于日志/统计辨识）。
     pub fn with_id(mut self, id: impl Into<FastStr>) -> Self {
         self.id = id.into();
+        self
+    }
+
+    /// 设置该源限速（bytes/s），`rate-limit` 生效。`0` 将在下载时返回 `InvalidArgument`。
+    #[cfg(feature = "rate-limit")]
+    pub fn with_speed_limit(mut self, bytes_per_sec: u64) -> Self {
+        self.speed_limit = Some(bytes_per_sec);
         self
     }
 
@@ -172,6 +184,10 @@ pub struct MultiSourceConfig {
     pub max_chunks_per_lane: usize,
     /// 每个源最大并发 chunk 数（`None` 不限）
     pub max_chunks_per_source: Option<usize>,
+    /// 全局限速（bytes/s），`rate-limit` 生效
+    pub global_speed_limit: Option<u64>,
+    /// 全局突发（bytes），`rate-limit` 生效
+    pub global_burst: Option<u64>,
 }
 
 impl MultiSourceConfig {
@@ -185,6 +201,8 @@ impl MultiSourceConfig {
             lane_model: LaneModel::PerSource,
             max_chunks_per_lane: 1,
             max_chunks_per_source: None,
+            global_speed_limit: None,
+            global_burst: None,
         }
     }
 
@@ -209,6 +227,20 @@ impl MultiSourceConfig {
     /// 设置每个源最大并发 chunk 数，`None` 表示不限。
     pub fn with_max_chunks_per_source(mut self, max_chunks_per_source: Option<usize>) -> Self {
         self.max_chunks_per_source = max_chunks_per_source;
+        self
+    }
+
+    /// 设置全局限速（bytes/s），`rate-limit` 生效。
+    #[cfg(feature = "rate-limit")]
+    pub fn with_global_speed_limit(mut self, bytes_per_sec: u64) -> Self {
+        self.global_speed_limit = Some(bytes_per_sec);
+        self
+    }
+
+    /// 设置全局突发（bytes），`rate-limit` 生效。
+    #[cfg(feature = "rate-limit")]
+    pub fn with_global_burst(mut self, burst_bytes: u64) -> Self {
+        self.global_burst = Some(burst_bytes);
         self
     }
 }
@@ -498,6 +530,8 @@ pub struct MultiRuntime {
     runtimes: HashMap<FastStr, Vec<LaneRuntime>>,
     next_runtime_index: HashMap<FastStr, usize>,
     pub supports_ranges: bool,
+    per_source_limiters: HashMap<FastStr, Arc<RateLimiter>>,
+    global_limiter: Option<Arc<RateLimiter>>,
 }
 
 impl MultiRuntime {
@@ -703,6 +737,28 @@ impl MultiRuntime {
             config.max_chunks_per_source,
         );
 
+        // 限速：per_source + global
+        let mut per_source_limiters: HashMap<FastStr, Arc<RateLimiter>> = HashMap::new();
+        for src in &config.sources {
+            if let Some(limit) = src.speed_limit {
+                if limit == 0 {
+                    return Err(DownloadError::InvalidArgument(format!("source {} speed_limit 0 无效", src.id)));
+                }
+                let burst = Some(std::num::NonZeroU32::new(64*1024).unwrap());
+                let nz = std::num::NonZeroU32::new(limit as u32).unwrap();
+                per_source_limiters.insert(src.id.clone(), Arc::new(RateLimiter::new(nz, burst)));
+            }
+        }
+        let global_limiter = if let Some(limit) = config.global_speed_limit {
+            if limit == 0 {
+                return Err(DownloadError::InvalidArgument("global_speed_limit 0 无效".to_string()));
+            }
+            let burst = config.global_burst.and_then(|b| std::num::NonZeroU32::new(b as u32)).or_else(|| std::num::NonZeroU32::new(64*1024));
+            let nz = std::num::NonZeroU32::new(limit as u32).unwrap();
+            Some(Arc::new(RateLimiter::new(nz, burst)))
+        } else {
+            None
+        };
         Ok((
             file_size,
             Self {
@@ -710,8 +766,19 @@ impl MultiRuntime {
                 runtimes,
                 next_runtime_index: HashMap::new(),
                 supports_ranges,
+                per_source_limiters,
+                global_limiter,
             },
         ))
+    }
+
+    pub fn limiter_for_lane(&self, lane_id: &str) -> Option<Arc<RateLimiter>> {
+        let source_id = self.scheduler.lanes.iter().find(|e| e.candidate.lane_id.as_str() == lane_id).map(|e| e.candidate.source_id.clone())?;
+        self.per_source_limiters.get(&source_id).cloned()
+    }
+
+    pub fn global_limiter(&self) -> Option<Arc<RateLimiter>> {
+        self.global_limiter.clone()
     }
 
     pub fn claim_request_builder(&mut self) -> Option<(FastStr, reqwest::RequestBuilder)> {

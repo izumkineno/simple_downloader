@@ -1,6 +1,10 @@
 //! 定义和管理单个下载块（chunk）的执行逻辑。
 
 use crate::types::{ChunkId, DownloadCmd, DownloadInfo};
+use crate::limiter::RateLimiter;
+#[cfg(feature = "rate-limit")]
+use std::num::NonZeroU32;
+use std::sync::Arc;
 use crate::util::ensure_user_agent;
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -36,8 +40,9 @@ fn split_range(offset: u64, end: u64) -> Option<(u64, u64)> {
 /// - `rb`: 一个 `reqwest::RequestBuilder`，用于创建下载请求。
 /// - `start_byte`: 此块下载的起始字节位置。
 /// - `end_byte`: 此块下载的结束字节位置。
+#[allow(clippy::too_many_arguments)]
 #[::tracing::instrument(
-    skip(cmd_tx, bd_rx, bd_tx, rb),
+    skip(cmd_tx, bd_rx, bd_tx, rb, global_limiter, per_source_limiter),
     fields(chunk_id = id, start_byte = start_byte, end_byte = end_byte, size = end_byte.saturating_sub(start_byte).saturating_add(1))
 )]
 pub async fn chunk_run(
@@ -48,6 +53,8 @@ pub async fn chunk_run(
     rb: RequestBuilder,
     start_byte: u64,
     end_byte: u64,
+    global_limiter: Option<Arc<RateLimiter>>,
+    per_source_limiter: Option<Arc<RateLimiter>>,
 ) {
     let mut end = end_byte;
     let mut offset = start_byte;
@@ -249,6 +256,25 @@ pub async fn chunk_run(
                         chunk.split_to(write_len as usize)
                     };
 
+                    // 限速：全局+分源两级串联，32-64KiB 批量，禁止 jitter
+                    #[cfg(feature = "rate-limit")]
+                    {
+                        if write_len > 0 {
+                            // 将 write_len 按 65536 批量切分，避免 1-4KiB 小片高频 acquire
+                            let mut remaining = write_len as u32;
+                            while remaining > 0 {
+                                let batch = std::cmp::min(remaining, 64*1024) as u32;
+                                let nz = NonZeroU32::new(batch).unwrap();
+                                if let Some(ref limiter) = per_source_limiter {
+                                    limiter.acquire(nz).await;
+                                }
+                                if let Some(ref limiter) = global_limiter {
+                                    limiter.acquire(nz).await;
+                                }
+                                remaining -= batch;
+                            }
+                        }
+                    }
                     // 将数据发送给文件写入任务
                     if cmd_tx.send(DownloadCmd::WriteFile { offset, data: to_write }).await.is_err() {
                         let error_msg = format!("[Chunk {id}] 文件写入通道已关闭");

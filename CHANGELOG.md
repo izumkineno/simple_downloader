@@ -9,7 +9,6 @@
 
 ### 新增
 
-- [ ] 下载速度限制功能（全局/分源限速）
 - [ ] 下载任务队列管理（暂停/恢复/取消/查询）
 - [ ] 并行下载多个文件
 - [ ] 图形化进度展示工具
@@ -19,6 +18,20 @@
 - [ ] 更智能的多源调度评分（响应时间/吞吐/失败率）
 - [ ] 更完整的多代理端到端测试矩阵
 - [ ] 元数据 schema 跨版本迁移策略与可观测性增强
+
+---
+
+## [0.5.0] - 2026-08-31
+
+### ✨ 新增
+
+- **限速 `rate-limit` feature** 基于 `governor 0.7` 令牌桶，`DownloadBuilder::speed_limit(bps)` 全局 + `SourceConfig::with_speed_limit(bps)` 分源 + `with_burst(bytes)` 可配突发（默认 64KiB 硬限），`MultiSourceConfig::with_global_speed_limit`，`0` → `InvalidArgument`，全局为硬上限（和>global 按剩余分配），`src/limiter.rs` 封装 `RateLimiter::acquire` 32-64KiB 批量，`src/chunk.rs` 植入两级串联 `per_source → global`，`src/downloader.rs` 校验与 `global_limiter` 创建，`src/lane.rs` `MultiRuntime` per_source/global 限速器映射，`src/monitor.rs` 冻结自适应（`is_rate_limited` 跳过 `decide_and_act`），`examples/with_rate_limit.rs` 演示
+- **测试** `tests/rate_limit.rs` 5 用例：`invalid_zero` / `global_duration 5MiB@1MiB/s 9-11s` / `hard_limit burst=0` / `per_source` / `global_hard`，`test_server` 精度矩阵，`cargo test --features rate-limit,multi-source` 全绿
+
+### 🔧 修复
+
+- **clippy** `chunk_run` 参数过多 → `#[allow(clippy::too_many_arguments)]`，`tracing::instrument` 增 `global_limiter/per_source_limiter` 跳过
+- **依赖** `Cargo.toml` 新增 `governor 0.7` optional，`rate-limit = ["dep:governor"]`
 
 ---
 
@@ -228,9 +241,18 @@
 - **Beta**：功能基本完整，正在进行测试，API 可能有少量变更
 - **Stable**：稳定版本，API 保持向后兼容，可用于生产环境
 
-当前版本 0.4.0 已进入 Stable：`trace` 可观测性与自适应引擎调优 + `0.3.1` 的 `MissingContentLength` 流式回退语义；完全向后兼容 `0.3.x`。
+当前版本 0.5.0 已进入 Stable：`rate-limit` 限速（全局+分源）+ `0.4.0` 可观测性；完全向后兼容 `0.4.x`：`trace` 可观测性与自适应引擎调优 + `0.3.1` 的 `MissingContentLength` 流式回退语义；完全向后兼容 `0.3.x`。
 
 ## 升级指南
+
+### 从 0.4.0 升级到 0.5.0
+
+Minor 级向后兼容：`cargo update -p simple_downloader` 即可
+
+- **新增 `rate-limit` feature** 默认不启用，启用后 `DownloadBuilder::speed_limit(bps)` 全局、`SourceConfig::with_speed_limit` 分源、`with_burst` 突发可配，`0` 值返回 `InvalidArgument`，`test_server` 精度矩阵 `±10%` 验证
+- **全局硬上限** `global 500KiB/s + per_source 400+400` 时实际 `≤525KiB/s`，不报错按剩余分配；`limit >4GiB/s` 需分片，文档已说明
+- **自适应冻结** 限速启用时 `ConcurrencyManager` 不因限速误判，`adaptive_bench` 不劣化>10%
+- 其余 `0.4.0` API 保持不变
 
 ### 从 0.3.1 升级到 0.4.0
 

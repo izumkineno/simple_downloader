@@ -1,6 +1,8 @@
 //! 下载监控器，作为状态、重试和并发管理的协调中心。
 
 use crate::chunk::chunk_run;
+use crate::limiter::RateLimiter;
+use std::sync::Arc;
 use crate::concurrency::ConcurrencyManager;
 use crate::lane::MultiRuntime;
 use crate::retry::RetryHandler;
@@ -35,6 +37,8 @@ pub struct DownloadMonitor {
     update_interval: f64,
     /// Lagged 事件计数，用于 P0-03 对账
     lagged_count: u64,
+    is_rate_limited: bool,
+    global_limiter: Option<Arc<RateLimiter>>,
 }
 
 impl DownloadMonitor {
@@ -64,7 +68,15 @@ impl DownloadMonitor {
             pending_bisects: std::collections::VecDeque::new(),
             update_interval,
             lagged_count: 0,
+            is_rate_limited: false,
+            global_limiter: None,
         }
+    }
+
+    pub fn with_rate_limit(mut self, limiter: Option<Arc<RateLimiter>>) -> Self {
+        self.is_rate_limited = limiter.is_some();
+        self.global_limiter = limiter;
+        self
     }
 
     /// 运行监控器的主事件循环。
@@ -326,6 +338,8 @@ impl DownloadMonitor {
                     rb,
                     new_start,
                     new_end,
+                    self.global_limiter.clone(),
+                    None,
                 );
                 tasks.push(tokio::spawn(task));
             }
@@ -405,6 +419,8 @@ impl DownloadMonitor {
                 rb,
                 start,
                 end,
+                    self.global_limiter.clone(),
+                    None
             );
             tasks.push(tokio::spawn(task));
             drained_pending += 1;
@@ -455,6 +471,8 @@ impl DownloadMonitor {
                 rb,
                 chunk_to_retry.start,
                 chunk_to_retry.end,
+                    self.global_limiter.clone(),
+                    None
             );
             tasks.push(tokio::spawn(task));
             retried += 1;

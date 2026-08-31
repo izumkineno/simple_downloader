@@ -28,11 +28,11 @@
 //!
 //! ```toml
 //! # 最轻量：仅基础下载
-//! simple_downloader = { version = "0.4", default-features = false }
+//! simple_downloader = { version = "0.5", default-features = false }
 //! # 常用：基础 + 断点续传 + 进度
-//! simple_downloader = { version = "0.4", default-features = false, features = ["resume", "progress"] }
+//! simple_downloader = { version = "0.5", default-features = false, features = ["resume", "progress"] }
 //! # 全功能
-//! simple_downloader = { version = "0.4", default-features = false, features = ["resume", "progress", "multi-source", "proxy"] }
+//! simple_downloader = { version = "0.5", default-features = false, features = ["resume", "progress", "multi-source", "proxy"] }
 //! ```
 //!
 //! ## 快速开始
@@ -160,6 +160,7 @@ pub mod retry;
 #[doc(hidden)]
 pub mod state;
 pub mod trace;
+pub mod limiter;
 mod types;
 #[doc(hidden)]
 pub mod util;

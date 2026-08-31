@@ -12,6 +12,9 @@ use crate::util::file_writer_task;
 #[cfg(feature = "resume")]
 use crate::util::file_writer_task_with_resume;
 use crate::util::{ensure_user_agent, get_file_info};
+use crate::limiter::RateLimiter;
+use std::num::NonZeroU32;
+use std::sync::Arc;
 use faststr::FastStr;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
@@ -92,6 +95,8 @@ where
     update_interval: f64,
     client_builder: F,
     resume_enabled: bool,
+    speed_limit: Option<u64>,
+    burst: Option<u64>,
 }
 
 impl DownloadBuilder {
@@ -116,6 +121,8 @@ impl DownloadBuilder {
             update_interval: DEFAULT_UPDATE_INTERVAL,
             client_builder: default_client_builder,
             resume_enabled: cfg!(feature = "resume"),
+            speed_limit: None,
+            burst: None,
         }
     }
 }
@@ -185,6 +192,8 @@ where
             update_interval: self.update_interval,
             client_builder,
             resume_enabled: self.resume_enabled,
+            speed_limit: self.speed_limit,
+            burst: self.burst,
         }
     }
 
@@ -203,6 +212,23 @@ where
         self
     }
 
+
+    /// 设置全局限速（bytes/s），仅 `rate-limit` feature 可用。
+    /// `0` 将在 `build().download().await` 时返回 `InvalidArgument`。
+    #[cfg(feature = "rate-limit")]
+    pub fn speed_limit(mut self, bytes_per_sec: u64) -> Self {
+        self.speed_limit = Some(bytes_per_sec);
+        self
+    }
+
+    /// 设置突发容量（bytes），仅 `rate-limit` feature 可用。默认 64KiB 硬限。
+    #[cfg(feature = "rate-limit")]
+    pub fn with_burst(mut self, burst_bytes: u64) -> Self {
+        self.burst = Some(burst_bytes);
+        self
+    }
+
+    /// 构建 Downloader 实例。
     /// 构建 Downloader 实例。
     pub fn build(self) -> Downloader<F> {
         let mut downloader = Downloader::new(
@@ -213,6 +239,11 @@ where
             self.client_builder,
         );
         downloader.resume_enabled = self.resume_enabled;
+        {
+            downloader.speed_limit = self.speed_limit;
+            downloader.burst = self.burst;
+            downloader.global_limiter = None;
+        }
         downloader
     }
 
@@ -269,6 +300,9 @@ where
     update_interval: f64,
     /// 是否启用自动断点续传。
     resume_enabled: bool,
+    speed_limit: Option<u64>,
+    burst: Option<u64>,
+    global_limiter: Option<Arc<RateLimiter>>,
 }
 
 impl<F> Downloader<F>
@@ -306,6 +340,9 @@ where
             info_tx,
             update_interval,
             resume_enabled: cfg!(feature = "resume"),
+            speed_limit: None,
+            burst: None,
+            global_limiter: None,
         }
     }
 
@@ -328,6 +365,9 @@ where
             cmd_tx,
             info_tx,
             resume_enabled: cfg!(feature = "resume"),
+            speed_limit: None,
+            burst: None,
+            global_limiter: None,
         }
     }
 
@@ -395,8 +435,27 @@ where
     }
 
     #[::tracing::instrument(skip(self, progress_handler), fields(mode = ?match &self.mode { DownloadMode::Single(c) => format!("single:{}", c.url), DownloadMode::Multi(c) => format!("multi:{}", c.output_path) }))]
-    async fn run_internal(self, progress_handler: Option<ProgressHandler>) -> Result<()> {
+    async fn run_internal(mut self, progress_handler: Option<ProgressHandler>) -> Result<()> {
         ::tracing::info!("download run_internal start");
+        if let Some(limit) = self.speed_limit {
+                if limit == 0 {
+                    return Err(DownloadError::InvalidArgument("speed_limit 0 无效，需 >0".to_string()));
+                }
+                if limit > u32::MAX as u64 {
+                    return Err(DownloadError::InvalidArgument(format!("speed_limit {} 超过 {} 需 ≤4GiB/s", limit, u32::MAX)));
+                }
+                if let Some(b) = self.burst {
+                    if b == 0 {
+                        return Err(DownloadError::InvalidArgument("burst 0 无效，需 >0".to_string()));
+                    }
+                }
+                // 创建全局限速器
+                let burst_nz = self.burst.and_then(|b| NonZeroU32::new(b as u32)).or_else(|| NonZeroU32::new(64*1024));
+                let limit_nz = NonZeroU32::new(limit as u32).unwrap();
+                let limiter = crate::limiter::RateLimiter::new(limit_nz, burst_nz);
+                self.global_limiter = Some(std::sync::Arc::new(limiter));
+                ::tracing::info!(limit, burst = ?burst_nz, "rate-limit global limiter created");
+            }
         let (file_size, support_ranges, writer_path, client, download_url, workers, multi_runtime) =
             match &self.mode {
                 DownloadMode::Single(config) => {
@@ -660,6 +719,20 @@ where
                         if len == 0 {
                             continue;
                         }
+                        {
+                            if let Some(ref limiter) = self.global_limiter {
+                                let len = bytes.len() as u32;
+                                if len > 0 {
+                                    let mut rem = len;
+                                    while rem > 0 {
+                                        let batch = std::cmp::min(rem, 64*1024);
+                                        let nz = NonZeroU32::new(batch).unwrap();
+                                        limiter.acquire(nz).await;
+                                        rem -= batch;
+                                    }
+                                }
+                            }
+                        }
                         writer_tx
                             .send(DownloadCmd::WriteFile { offset, data: bytes })
                             .await
@@ -781,6 +854,9 @@ where
             self.update_interval,
             workers,
         );
+        {
+            monitor = monitor.with_rate_limit(self.global_limiter.clone());
+        }
         for (start_byte, end_byte) in initial_ranges {
             let (lane_id, rb) = if let Some(runtime) = multi_runtime.as_mut() {
                 match runtime.claim_request_builder() {
@@ -811,6 +887,8 @@ where
                 rb,
                 start_byte,
                 end_byte,
+                self.global_limiter.clone(),
+                None,
             );
             tasks.push(spawn(task));
         }
