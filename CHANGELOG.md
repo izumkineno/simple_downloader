@@ -9,7 +9,6 @@
 
 ### 新增
 
-- [ ] 下载任务队列管理（暂停/恢复/取消/查询）
 - [ ] 并行下载多个文件
 - [ ] 图形化进度展示工具
 
@@ -18,6 +17,20 @@
 - [ ] 更智能的多源调度评分（响应时间/吞吐/失败率）
 - [ ] 更完整的多代理端到端测试矩阵
 - [ ] 元数据 schema 跨版本迁移策略与可观测性增强
+
+---
+
+## [0.6.0] - 2026-08-31
+
+### ✨ 新增
+
+- **任务队列 `queue` feature（可选）** 基于 `uuid 1` 的 `TaskQueue` 进程内 FIFO 调度：`TaskQueue::with_max_concurrent(3)`（`clamp 1..64`，默认 3）、`enqueue`/`enqueue_with_workers`（per-task `workers` 与队列层独立）、`pause`/`resume`/`cancel`/`query`/`wait_all`/`queued_len`/`active_count`，`TaskId`/`TaskState`/`TaskSnapshot`/`QueueError`；两阶段 CAS 重命名（`occupied` 快照 + `try_exists` 文件/`*.download.bitcode` + 锁内 `exists` 回检，`a(N).ext` 无限递增，`windows` 大小写折叠），`JoinSet` + `AbortHandle` 驱动 `mpsc 128` + `Notify`，`Completed/Failed → Removed` 可取消删文件；`queue` 为可选特性 `queue = ["dep:uuid"]`，`[[test]] queue` 需 `queue`，`examples/with_queue.rs` 演示同名重命名/workers 隔离/pause-resume/cancel
+- **运行期配置热更新（0.5.5 合入）** `src/config.rs::SharedConfig(Arc<RwLock<RuntimeConfig>>)` + `DownloadMonitor::apply_config`，支持 `workers/update_interval` 运行时热更（`build` 后 `apply_config`），`DownloadInfo::Stable` 收敛参数调优与 `SharedConfig` 热更底座验证
+
+### 🔧 修复
+
+- **队列并发与取消** `pause(Active)` 释放槽后 `Pump` 防 FIFO 停滞、`cancel Queued` 补 `occupied.remove` 且 `drop` 后再 `remove_file` 防 `Mutex` 跨 `await`、`Completed/Failed` 清 `occupied` 防幽灵占用、`Cancelled` 仍 `pump`、`ac2_pause_resume` 800ms 稳定期 + `ac3_cancel` 允许已完成取消删文件
+- **重命名与 sidecar** `sidecar_path` `cfg(resume)` `Option`，无 `resume` 时队内重命名正确；`tests/queue` `64m` 非 `0` 限速防 `error decoding`，`metadata_path_for` 检查 `cfg(resume)`
 
 ---
 

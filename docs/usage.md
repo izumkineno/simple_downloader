@@ -20,30 +20,29 @@
 
 ---
 
-## 1. 安装与 Feature 选型
-
-`Cargo.toml` 中当前真实定义（见 `Cargo.toml:14-19`）：
-
 | Feature | 默认 | 作用 | 额外依赖 |
-|---|:---:|---|---|
-| _(none)_ | ✅ | 基础单源多线程下载 `Downloader::builder().download()` | 无 |
-| `resume` | ❌ | 断点续传、sidecar 元数据 `*.download.bitcode`、`with_resume()`/`ResumeMetadata` | `bitcode@0.6` |
-| `progress` | ❌ | `DownloadInfo` 进度事件与 `Downloader::run()` / `DownloadBuilder::run()` | 无 |
-| `multi-source` | ❌ | `MultiSourceConfig`/`SourceConfig`/`LaneModel`、`Downloader::new_multi()` | 无 |
-| `proxy` | ❌ | `ProxyConfig`、`SourceConfig::with_proxies()` | 隐含 `multi-source` |
+|---|---|---|---|
+| `resume` | ❌ | 断点续传、sidecar 元数据 `*.download.bitcode` | `bitcode@0.6` |
+| `progress` | ❌ | 进度事件 `DownloadInfo` 与 `run(handler)` | — |
+| `multi-source` | ❌ | 多源下载建模 `MultiSourceConfig/SourceConfig/LaneModel` 与 `new_multi` | — |
+| `proxy` | ❌ | 代理能力，隐含 `multi-source` | — |
 | `rate-limit` | ❌ | 全局/分源限速 `governor` 令牌桶 `1 token=1 byte` `speed_limit/with_burst` | `governor@0.7` |
+| `queue` | ❌ | 任务队列 FIFO/并发/pause/resume/cancel/重命名 `TaskQueue` | `uuid@1` |
 
 ```toml
 # 仅基础能力（最轻量，1.5 MiB rlib）
 [dependencies]
-simple_downloader = { version = "0.5", default-features = false }
+simple_downloader = { version = "0.6", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 # 常用组合：基础 + 断点续传 + 进度
-simple_downloader = { version = "0.5", default-features = false, features = ["resume", "progress"] }
+simple_downloader = { version = "0.6", default-features = false, features = ["resume", "progress"] }
 
-# 全功能（含限速）
-simple_downloader = { version = "0.5", default-features = false, features = ["resume", "progress", "multi-source", "proxy", "rate-limit"] }
+# 队列调度
+simple_downloader = { version = "0.6", default-features = false, features = ["queue"] }
+
+# 全功能（含限速与队列）
+simple_downloader = { version = "0.6", default-features = false, features = ["resume", "progress", "multi-source", "proxy", "rate-limit", "queue"] }
 ```
 
 > 历史文档中 `default = [resume, progress, ...]` 已过时，以 `Cargo.toml` 为准。

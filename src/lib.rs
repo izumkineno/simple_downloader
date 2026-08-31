@@ -26,13 +26,13 @@
 //!
 //! ```toml
 //! # 最轻量：仅基础下载
-//! simple_downloader = { version = "0.5", default-features = false }
+//! simple_downloader = { version = "0.6", default-features = false }
 //! # 常用：基础 + 断点续传 + 进度
-//! simple_downloader = { version = "0.5", default-features = false, features = ["resume", "progress"] }
+//! simple_downloader = { version = "0.6", default-features = false, features = ["resume", "progress"] }
 //! # 队列调度（可选）
-//! simple_downloader = { version = "0.5", default-features = false, features = ["queue"] }
+//! simple_downloader = { version = "0.6", default-features = false, features = ["queue"] }
 //! # 全功能（含限速与队列）
-//! simple_downloader = { version = "0.5", default-features = false, features = ["resume", "progress", "multi-source", "proxy", "rate-limit", "queue"] }
+//! simple_downloader = { version = "0.6", default-features = false, features = ["resume", "progress", "multi-source", "proxy", "rate-limit", "queue"] }
 //! ```
 //! ### 基础下载（无需任何 feature）
 //!
