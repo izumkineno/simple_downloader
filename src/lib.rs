@@ -21,22 +21,19 @@
 //! | `multi-source` | ❌ | 多源调度建模 | `MultiSourceConfig`, `SourceConfig`, `LaneModel`, `Downloader::new_multi()` |
 //! | `proxy` | ❌ | 代理 lane 建模（隐含 `multi-source`） | `ProxyConfig`, `SourceConfig::with_proxies()` |
 //! | `rate-limit` | ❌ | 全局/分源限速 `governor` 令牌桶 `1 token=1 byte` | `DownloadBuilder::speed_limit()/with_burst()`, `SourceConfig::with_speed_limit()` 等 |
-//! 完整调用形态见 [`docs/usage.md`](https://github.com/simple_downloader/docs/usage.md)（仓库内 `docs/usage.md`），
-//! 配置项见 `docs/configuration.md`，错误全表见 `docs/errors.md`。
-//!
+//! | `queue` | ❌ | 任务队列 FIFO、并发调度、pause/resume/cancel、重命名 | `TaskQueue`, `TaskId`, `TaskState`, `TaskSnapshot`, `QueueError` |
 //! ## 安装
 //!
 //! ```toml
 //! # 最轻量：仅基础下载
-//! simple_downloader = { version = "0.5", default-features = false }
+//! simple_downloader = { version = "0.6", default-features = false }
 //! # 常用：基础 + 断点续传 + 进度
-//! simple_downloader = { version = "0.5", default-features = false, features = ["resume", "progress"] }
-//! # 全功能（含限速）
-//! simple_downloader = { version = "0.5", default-features = false, features = ["resume", "progress", "multi-source", "proxy", "rate-limit"] }
+//! simple_downloader = { version = "0.6", default-features = false, features = ["resume", "progress"] }
+//! # 队列调度（可选）
+//! simple_downloader = { version = "0.6", default-features = false, features = ["queue"] }
+//! # 全功能（含限速与队列）
+//! simple_downloader = { version = "0.6", default-features = false, features = ["resume", "progress", "multi-source", "proxy", "rate-limit", "queue"] }
 //! ```
-//!
-//! ## 快速开始
-//!
 //! ### 基础下载（无需任何 feature）
 //!
 //! ```no_run
@@ -155,24 +152,28 @@ mod lane;
 pub mod monitor;
 #[cfg(feature = "resume")]
 mod resume;
-#[doc(hidden)]
 pub mod retry;
 #[doc(hidden)]
 pub mod state;
 pub mod trace;
 pub mod limiter;
 pub mod config;
+#[cfg(feature = "queue")]
+pub mod task;
+#[cfg(feature = "queue")]
+pub mod queue;
 mod types;
 #[doc(hidden)]
 pub mod util;
-
 pub(crate) const DEFAULT_USER_AGENT: &str =
     concat!("simple_downloader/", env!("CARGO_PKG_VERSION"));
 
-// --- 公共 API 导出 ---
-
 // 导出核心的 `Downloader`，它是用户的主要入口点。
 pub use downloader::{DownloadBuilder, Downloader};
+#[cfg(feature = "queue")]
+pub use queue::{QueueError, TaskQueue};
+#[cfg(feature = "queue")]
+pub use task::{TaskId, TaskSnapshot, TaskState};
 #[cfg(feature = "proxy")]
 pub use lane::ProxyConfig;
 #[cfg(feature = "multi-source")]
@@ -181,7 +182,6 @@ pub use lane::{
 };
 #[cfg(feature = "resume")]
 pub use resume::{DEFAULT_SEGMENT_SIZE, ResumeMetadata, hash_bytes, metadata_path_for};
-
 // 导出公共类型，方便用户在类型注解和模式匹配中使用。
 #[cfg(feature = "progress")]
 pub use types::DownloadInfo;
@@ -189,9 +189,8 @@ pub use types::{ChunkId, DownloadError, Result};
 
 #[doc(hidden)]
 pub mod internal {
-    pub use crate::types::{DownloadCmd, DownloadInfo};
+ pub use crate::types::{DownloadCmd, DownloadInfo};
 }
-
 // 日志门面：基于 tracing 的调试/生产分级初始化，库本身不自动安装全局订阅者。
 // 二进制按需调用 `simple_downloader::trace::init_tracing()` 即可通过
 // RUST_LOG / SIMPLE_DOWNLOADER_LOG 控制级别；见 `crate::trace` 模块文档。

@@ -54,7 +54,7 @@
 | `proxy` | 否 | 代理配置能力，依赖 `multi-source` |
 | `progress` | 否 | 公开 `DownloadInfo` 进度事件与 `run(...)` 进度回调接口 |
 | `rate-limit` | 否 | 全局/分源限速（`governor` 令牌桶，`burst` 可配，自适应冻结） |
-
+| `queue` | 否 | 任务队列 FIFO/并发调度/pause/resume/cancel/重命名（`uuid`） |
 推荐理解方式：
 
 - **默认模式**：`Downloader::builder(...).download().await`
@@ -63,6 +63,7 @@
 - **需要代理**：打开 `proxy`
 - **需要 UI / 进度事件**：打开 `progress`
 - **需要限速**：打开 `rate-limit`，见下节
+- **需要队列**：打开 `queue`，见 `examples/with_queue.rs`
 
 > 完整调用形态见 [`docs/usage.md`](docs/usage.md)，`cargo doc` 见 `src/lib.rs`  crate 文档。
 
@@ -105,8 +106,8 @@
 #### 4. **其他改进**
 -   [x] **默认 API 易用性重构（第一阶段）**: 已新增 `Downloader::builder(...).download().await` 的简化入口，不再强制默认调用方接入 progress receiver。
 -   [x] **Feature 能力裁剪（第一阶段）**: 默认模式仅保留基础多线程下载；`resume` / `multi-source` / `proxy` / `progress` 已拆为按需启用的 Cargo features。
--   [ ] **配置灵活性**: 允许用户在运行时动态调整配置，如并发数、重试策略（次数、延迟算法）等。虽然已通过 `ClientBuilder` 提供了网络层面的高度自定义能力（如代理、超时），但应用层的策略也应更灵活。
--   [ ] **任务队列 API**: 在单个下载任务之外，提供可暂停、恢复、取消、查询状态的任务队列抽象。
+-   [x] **配置热更新（0.6.0）**: `SharedConfig` 热更底座 `RuntimeConfig`（`workers`/`update_interval`）支持运行时 `apply_config`，`DownloadMonitor` 动态生效
+-   [x] **任务队列 API（0.6.0 `queue` feature）**: `TaskQueue::with_max_concurrent(3)`（`1..64` clamp）+ `enqueue`/`enqueue_with_workers`（两层并发独立）、`pause`/`resume`/`cancel`/`query`/`wait_all`，`TaskId/TaskState/TaskSnapshot/QueueError`，`examples/with_queue.rs` 演示重命名/隔离
 -   [ ] **更稳定的 UI 对接层**: 将 `DownloadInfo` 事件语义整理成面向 UI 的稳定契约，并补充字段兼容性说明。
 
 

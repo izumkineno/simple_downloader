@@ -1,6 +1,6 @@
 //! 下载监控器，作为状态、重试和并发管理的协调中心。
 
-use crate::chunk::chunk_run;
+use crate::chunk::chunk_run_with_reliable;
 use crate::limiter::RateLimiter;
 use std::sync::Arc;
 use crate::concurrency::ConcurrencyManager;
@@ -83,20 +83,79 @@ impl DownloadMonitor {
         self.is_rate_limited = limited;
     }
 
-    /// 0.5.5 热更新：运行时调整并发与间隔（配置灵活性）
+    /// 运行时调整并发、间隔和全局限速配置。
     pub fn apply_config(&mut self, cfg: &crate::config::RuntimeConfig) {
         self.concurrency_manager.set_max_workers(cfg.workers);
         if cfg.update_interval > 0.0 && cfg.update_interval.is_finite() {
             self.update_interval = cfg.update_interval;
         }
-        ::tracing::info!(workers = cfg.workers, interval = self.update_interval, "monitor apply_config hot-update");
+        #[cfg(feature = "rate-limit")]
+        match runtime_limiter_from_config(cfg) {
+            Ok(Some((limit, burst))) => {
+                if let Some(limiter) = self.global_limiter.as_ref() {
+                    limiter.reconfigure(limit, burst);
+                } else {
+                    self.global_limiter = Some(Arc::new(RateLimiter::new(limit, burst)));
+                }
+                self.is_rate_limited = true;
+            }
+            Ok(None) => {
+                if let Some(limiter) = self.global_limiter.as_ref() {
+                    limiter.disable();
+                }
+                self.global_limiter = None;
+                self.is_rate_limited = false;
+            }
+            Err(error) => {
+                ::tracing::warn!(error = %error, "invalid runtime rate-limit config; keeping previous limiter");
+            }
+        }
+        ::tracing::info!(
+            workers = cfg.workers,
+            interval = self.update_interval,
+            rate_limited = self.is_rate_limited,
+            "monitor apply_config hot-update"
+        );
     }
     /// 运行监控器的主事件循环。
     ///
     /// 这个循环会监听来自各个下载块的信息，并定期触发状态更新、并发决策和重试处理。
     #[allow(clippy::too_many_arguments)]
-    #[::tracing::instrument(skip(self, info_rx, info_tx, tasks, next_chunk_id, client, writer_tx, cmd_tx, url, initial_lanes, multi_runtime), fields(total_size = self.state.total_file_size, completed = self.state.total_downloaded()))]
     pub async fn run(
+        self,
+        info_rx: broadcast::Receiver<DownloadInfo>,
+        info_tx: broadcast::Sender<DownloadInfo>,
+        tasks: FuturesUnordered<JoinHandle<()>>,
+        next_chunk_id: &AtomicU64,
+        client: &Client,
+        writer_tx: mpsc::Sender<DownloadCmd>,
+        cmd_tx: &broadcast::Sender<DownloadCmd>,
+        url: Option<&FastStr>,
+        initial_lanes: Vec<(ChunkId, FastStr)>,
+        multi_runtime: Option<MultiRuntime>,
+    ) -> Result<(), crate::types::DownloadError> {
+        let (reliable_tx, reliable_rx) = mpsc::channel(1);
+        drop(reliable_tx);
+        self.run_with_reliable(
+            info_rx,
+            info_tx,
+            tasks,
+            next_chunk_id,
+            client,
+            writer_tx,
+            cmd_tx,
+            url,
+            initial_lanes,
+            multi_runtime,
+            None,
+            reliable_rx,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[::tracing::instrument(skip(self, info_rx, info_tx, tasks, next_chunk_id, client, writer_tx, cmd_tx, url, initial_lanes, multi_runtime, reliable_tx, reliable_rx), fields(total_size = self.state.total_file_size, completed = self.state.total_downloaded()))]
+    pub(crate) async fn run_with_reliable(
         mut self,
         mut info_rx: broadcast::Receiver<DownloadInfo>,
         info_tx: broadcast::Sender<DownloadInfo>,
@@ -108,6 +167,8 @@ impl DownloadMonitor {
         url: Option<&FastStr>,
         initial_lanes: Vec<(ChunkId, FastStr)>,
         mut multi_runtime: Option<MultiRuntime>,
+        reliable_tx: Option<mpsc::Sender<DownloadInfo>>,
+        mut reliable_rx: mpsc::Receiver<DownloadInfo>,
     ) -> Result<(), crate::types::DownloadError> {
         ::tracing::info!(
             total_size = self.state.total_file_size,
@@ -124,6 +185,7 @@ impl DownloadMonitor {
 
         let mut ticker = interval(Duration::from_secs_f64(self.update_interval));
         let mut last_tick_time = Instant::now();
+        let mut reliable_open = reliable_tx.is_some();
 
         'main_loop: loop {
             // 永久失败快速退出，避免无限挂死
@@ -139,6 +201,38 @@ impl DownloadMonitor {
             tokio::select! {
                 // `biased` 确保优先处理已完成的任务和信息，而不是等待定时器。
                 biased;
+
+                // 完成、失败、分割事件同时走可靠 mpsc，避免 broadcast Lagged 丢失状态迁移。
+                result = reliable_rx.recv(), if reliable_open => match result {
+                    Some(info) => {
+                        ::tracing::trace!(info = ?info, "monitor recv reliable info");
+                        self.handle_download_info(
+                            info,
+                            &mut tasks,
+                            next_chunk_id,
+                            client,
+                            &writer_tx,
+                            &reliable_tx,
+                            cmd_tx,
+                            &info_tx,
+                            url,
+                            &mut multi_runtime,
+                        );
+                        if self.retry_handler.has_permanent_failure() {
+                            let msg = self
+                                .retry_handler
+                                .permanent_failure_message()
+                                .unwrap_or_else(|| "unknown permanent failure".to_owned());
+                            let _ = cmd_tx.send(DownloadCmd::TerminateAll);
+                            ::tracing::error!(msg = %msg, "permanent failure after reliable info");
+                            return Err(crate::types::DownloadError::PermanentFailure(msg));
+                        }
+                    }
+                    None => {
+                        reliable_open = false;
+                        ::tracing::warn!("reliable event channel closed");
+                    }
+                },
 
                 // 一个下载任务已完成（或 panic）
                 Some(result) = tasks.next() => {
@@ -168,17 +262,20 @@ impl DownloadMonitor {
                 result = info_rx.recv() => match result {
                     Ok(info) => {
                         ::tracing::trace!(info = ?info, "monitor recv info");
-                        self.handle_download_info(
-                            info,
-                            &mut tasks,
-                            next_chunk_id,
-                            client,
-                            &writer_tx,
-                            cmd_tx,
-                            &info_tx,
-                            url,
-                            &mut multi_runtime,
-                        );
+                        if !is_reliable_event(&info) {
+                            self.handle_download_info(
+                                info,
+                                &mut tasks,
+                                next_chunk_id,
+                                client,
+                                &writer_tx,
+                                &reliable_tx,
+                                cmd_tx,
+                                &info_tx,
+                                url,
+                                &mut multi_runtime,
+                            );
+                        }
                         if self.retry_handler.has_permanent_failure() {
                             let msg = self
                                 .retry_handler
@@ -192,9 +289,13 @@ impl DownloadMonitor {
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         self.lagged_count += skipped;
                         ::tracing::warn!(skipped, total_lagged = self.lagged_count, pending_bisects = self.pending_bisects.len(), active_chunks = self.state.chunks.len(), tasks = tasks.len(), "broadcast lagged, skip events");
-                        // P0-3: Lagged reconciliation — keep broadcast, count + DownloadState对账, 不切 mpsc
+                        // 终态/拓扑事件由可靠 mpsc 交付；此处仅记录被跳过的进度消息。
                         if tasks.is_empty() && !self.state.chunks.is_empty() {
-                            ::tracing::error!(active_chunks = self.state.chunks.len(), total_lagged = self.lagged_count, "lagged reconciliation: tasks empty but state has chunks, will reconcile on next tick");
+                            ::tracing::error!(
+                                active_chunks = self.state.chunks.len(),
+                                total_lagged = self.lagged_count,
+                                "lagged progress left active state after all tasks joined; reliable terminal event invariant violated"
+                            );
                         }
                         // 暴露 lagged_count 到监控流，便于上层观测
                         self.send_monitor_update(&info_tx);
@@ -216,6 +317,7 @@ impl DownloadMonitor {
                         elapsed_secs,
                         &mut tasks,
                         &info_tx,
+                        &reliable_tx,
                         cmd_tx,
                         client,
                         &writer_tx,
@@ -243,7 +345,7 @@ impl DownloadMonitor {
     }
     /// 处理从下载块接收到的各种 `DownloadInfo` 消息。
     #[allow(clippy::too_many_arguments)]
-    #[::tracing::instrument(skip(self, tasks, next_chunk_id, client, writer_tx, cmd_tx, info_tx, url, multi_runtime), fields(info = ?info))]
+    #[::tracing::instrument(skip(self, tasks, next_chunk_id, client, writer_tx, reliable_tx, cmd_tx, info_tx, url, multi_runtime), fields(info = ?info))]
     fn handle_download_info(
         &mut self,
         info: DownloadInfo,
@@ -251,6 +353,7 @@ impl DownloadMonitor {
         next_chunk_id: &AtomicU64,
         client: &Client,
         writer_tx: &mpsc::Sender<DownloadCmd>,
+        reliable_tx: &Option<mpsc::Sender<DownloadInfo>>,
         cmd_tx: &broadcast::Sender<DownloadCmd>,
         info_tx: &broadcast::Sender<DownloadInfo>,
         url: Option<&FastStr>,
@@ -345,7 +448,7 @@ impl DownloadMonitor {
                 if let Some(lane_id) = lane_id {
                     self.lane_bindings.insert(new_id, lane_id);
                 }
-                let task = chunk_run(
+                let task = chunk_run_with_reliable(
                     new_id,
                     writer_tx.clone(),
                     cmd_tx.subscribe(),
@@ -355,6 +458,7 @@ impl DownloadMonitor {
                     new_end,
                     global,
                     per_source,
+                    reliable_tx.clone(),
                 );
                 tasks.push(tokio::spawn(task));
             }
@@ -369,6 +473,7 @@ impl DownloadMonitor {
         elapsed_secs: f64,
         tasks: &mut FuturesUnordered<JoinHandle<()>>,
         info_tx: &broadcast::Sender<DownloadInfo>,
+        reliable_tx: &Option<mpsc::Sender<DownloadInfo>>,
         cmd_tx: &broadcast::Sender<DownloadCmd>,
         client: &Client,
         writer_tx: &mpsc::Sender<DownloadCmd>,
@@ -416,40 +521,18 @@ impl DownloadMonitor {
         } else {
             self.concurrency_manager.decide_and_act(&self.state, cmd_tx);
         }
-
-        // 调度之前因 lane 容量不足而缓冲的分割区间
-        let mut drained_pending = 0usize;
-        while let Some((start, end)) = self.pending_bisects.front().copied() {
-            let Some((lane_id, rb)) = build_request(client, url, multi_runtime.as_mut()) else {
-                ::tracing::debug!(start, end, remaining = self.pending_bisects.len(), "pending_bisects still blocked");
-                break;
-            };
-            self.pending_bisects.pop_front();
-            let new_id = next_chunk_id.fetch_add(1, Ordering::SeqCst);
-            ::tracing::info!(new_id, start, end, lane_id = ?lane_id.as_ref().map(|s| s.as_str()), "drain pending_bisect");
-            // 限速：解析分源与全局
-            let per_source = lane_id.as_ref().and_then(|id| multi_runtime.as_ref().and_then(|r| r.limiter_for_lane(id.as_str())));
-            let global = multi_runtime.as_ref().and_then(|r| r.global_limiter()).or_else(|| self.global_limiter.clone());
-            if let Some(lane_id) = lane_id {
-                self.lane_bindings.insert(new_id, lane_id);
-            }
-            let task = chunk_run(
-                new_id,
-                writer_tx.clone(),
-                cmd_tx.subscribe(),
-                info_tx.clone(),
-                rb,
-                start,
-                end,
-                global,
-                per_source,
-            );
-            tasks.push(tokio::spawn(task));
-            drained_pending += 1;
-        }
-        if drained_pending > 0 {
-            ::tracing::debug!(drained = drained_pending, tasks = tasks.len(), "drained pending_bisects");
-        }
+        // pending_bisects 的 drain 是 lane 容量补位，非自适应分裂，故不限速冻结
+        let _drained_pending = self.drain_pending(
+            tasks,
+            next_chunk_id,
+            client,
+            writer_tx,
+            info_tx,
+            reliable_tx,
+            cmd_tx,
+            url,
+            multi_runtime,
+        );
 
         // 委托重试处理：处理重试队列 — P0-6: delayed 10s 单独计时，不叠加 retry 2s
         let before_retry = self.retry_handler.retry_queue_len();
@@ -488,7 +571,7 @@ impl DownloadMonitor {
             if let Some(lane_id) = lane_id {
                 self.lane_bindings.insert(chunk_to_retry.id, lane_id);
             }
-            let task = chunk_run(
+            let task = chunk_run_with_reliable(
                 chunk_to_retry.id,
                 writer_tx.clone(),
                 cmd_tx.subscribe(),
@@ -498,6 +581,7 @@ impl DownloadMonitor {
                 chunk_to_retry.end,
                 global,
                 per_source,
+                reliable_tx.clone(),
             );
             tasks.push(tokio::spawn(task));
             retried += 1;
@@ -506,11 +590,13 @@ impl DownloadMonitor {
             ::tracing::debug!(retried, deferred = deferred_retries.len(), remaining_retry = self.retry_handler.retry_queue_len(), "tick retry result");
         }
         for chunk in deferred_retries {
-            self.retry_handler.push_back_retry(chunk);
+            self.retry_handler.push_back_retry_with_backoff(chunk);
         }
 
         // 检查下载是否已全部完成
-        let done = self.are_all_tasks_done() && self.state.is_download_finished();
+        let done = tasks.is_empty()
+            && self.are_all_tasks_done()
+            && self.state.is_download_finished();
         if done {
             ::tracing::info!(
                 downloaded = self.state.total_downloaded(),
@@ -519,6 +605,54 @@ impl DownloadMonitor {
             );
         }
         done
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn drain_pending(
+        &mut self,
+        tasks: &mut FuturesUnordered<JoinHandle<()>>,
+        next_chunk_id: &AtomicU64,
+        client: &Client,
+        writer_tx: &mpsc::Sender<DownloadCmd>,
+        info_tx: &broadcast::Sender<DownloadInfo>,
+        reliable_tx: &Option<mpsc::Sender<DownloadInfo>>,
+        cmd_tx: &broadcast::Sender<DownloadCmd>,
+        url: Option<&FastStr>,
+        multi_runtime: &mut Option<MultiRuntime>,
+    ) -> usize {
+        let mut drained = 0usize;
+        while let Some((start, end)) = self.pending_bisects.front().copied() {
+            let Some((lane_id, rb)) = build_request(client, url, multi_runtime.as_mut()) else {
+                ::tracing::debug!(start, end, remaining = self.pending_bisects.len(), "pending_bisects still blocked");
+                break;
+            };
+            self.pending_bisects.pop_front();
+            let new_id = next_chunk_id.fetch_add(1, Ordering::SeqCst);
+            ::tracing::info!(new_id, start, end, lane_id = ?lane_id.as_ref().map(|s| s.as_str()), "drain pending_bisect");
+            let per_source = lane_id.as_ref().and_then(|id| multi_runtime.as_ref().and_then(|r| r.limiter_for_lane(id.as_str())));
+            let global = multi_runtime.as_ref().and_then(|r| r.global_limiter()).or_else(|| self.global_limiter.clone());
+            if let Some(lane_id) = lane_id {
+                self.lane_bindings.insert(new_id, lane_id);
+            }
+            let task = chunk_run_with_reliable(
+                new_id,
+                writer_tx.clone(),
+                cmd_tx.subscribe(),
+                info_tx.clone(),
+                rb,
+                start,
+                end,
+                global,
+                per_source,
+                reliable_tx.clone(),
+            );
+            tasks.push(tokio::spawn(task));
+            drained += 1;
+        }
+        if drained > 0 {
+            ::tracing::debug!(drained, tasks = tasks.len(), "drained pending_bisects");
+        }
+        drained
     }
 
     /// 发送聚合的监控更新信息。
@@ -534,6 +668,7 @@ impl DownloadMonitor {
             total_downloaded: self.state.total_downloaded(),
             total_speed: self.state.total_speed(),
             chunk_details,
+
         });
     }
 
@@ -543,6 +678,47 @@ impl DownloadMonitor {
             && self.state.chunks.is_empty()
             && self.retry_handler.are_all_tasks_done()
     }
+}
+
+#[cfg(feature = "rate-limit")]
+fn runtime_limiter_from_config(
+    cfg: &crate::config::RuntimeConfig,
+) -> std::result::Result<
+    Option<(std::num::NonZeroU32, Option<std::num::NonZeroU32>)>,
+    String,
+> {
+    let Some(limit) = cfg.speed_limit else {
+        return if cfg.burst.is_some() {
+            Err("burst requires speed_limit".to_owned())
+        } else {
+            Ok(None)
+        };
+    };
+    let limit = u32::try_from(limit)
+        .map_err(|_| format!("speed_limit {limit} exceeds {}", u32::MAX))
+        .and_then(|limit| {
+            std::num::NonZeroU32::new(limit)
+                .ok_or_else(|| "speed_limit must be greater than zero".to_owned())
+        })?;
+    let burst = match cfg.burst {
+        None => None,
+        Some(0) => return Err("burst must be greater than zero".to_owned()),
+        Some(burst) => Some(
+            std::num::NonZeroU32::new(u32::try_from(burst).map_err(|_| {
+                format!("burst {burst} exceeds {}", u32::MAX)
+            })?)
+            .expect("burst checked non-zero"),
+        ),
+    };
+    Ok(Some((limit, burst)))
+}
+fn is_reliable_event(info: &DownloadInfo) -> bool {
+    matches!(
+        info,
+        DownloadInfo::DownloadComplete(_)
+            | DownloadInfo::ChunkFailed { .. }
+            | DownloadInfo::ChunkBisected { .. }
+    )
 }
 
 fn build_request(
@@ -557,4 +733,36 @@ fn build_request(
 
     let url = url?;
     Some((None, client.get(url.as_str())))
+}
+
+#[cfg(all(test, feature = "rate-limit"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_config_updates_and_disables_global_limiter() {
+        let mut monitor = DownloadMonitor::new(1, 0.5, 1);
+        let limited = crate::config::RuntimeConfig {
+            workers: 2,
+            update_interval: 1.0,
+            speed_limit: Some(1024),
+            burst: Some(1024),
+        };
+
+        monitor.apply_config(&limited);
+
+        assert_eq!(monitor.update_interval, 1.0);
+        assert!(monitor.is_rate_limited);
+        let limiter = monitor.global_limiter.clone().expect("limiter configured");
+
+        monitor.apply_config(&crate::config::RuntimeConfig {
+            speed_limit: None,
+            burst: None,
+            ..limited
+        });
+
+        assert!(!monitor.is_rate_limited);
+        assert!(monitor.global_limiter.is_none());
+        assert!(!limiter.check_n(std::num::NonZeroU32::new(1).unwrap()));
+    }
 }

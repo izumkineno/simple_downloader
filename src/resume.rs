@@ -7,15 +7,89 @@
 
 use crate::types::{DownloadError, Result};
 use bitcode::{Decode, Encode};
+use std::ffi::OsStr;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 pub const DEFAULT_SEGMENT_SIZE: u64 = 64 * 1024;
 const METADATA_VERSION: u32 = 1;
 const RESUME_EXTENSION: &str = "download.bitcode";
+
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn temporary_metadata_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("resume.metadata"));
+    let mut temporary_name = file_name.to_os_string();
+    temporary_name.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    path.with_file_name(temporary_name)
+}
+
+#[cfg(windows)]
+fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let source: Vec<u16> = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe extern "system" {
+        fn MoveFileExW(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let succeeded = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if succeeded == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
 
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct SegmentRecord {
@@ -69,20 +143,48 @@ impl ResumeMetadata {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let temp_path = path.with_extension(format!("{RESUME_EXTENSION}.tmp"));
-        fs::write(&temp_path, bitcode::encode(self))?;
-        fs::rename(temp_path, path)?;
-        Ok(())
+        let temp_path = temporary_metadata_path(path);
+        let result = (|| {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)?;
+            file.write_all(&bitcode::encode(self))?;
+            file.sync_all()?;
+            atomic_replace(&temp_path, path)?;
+            sync_parent_dir(path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp_path);
+        }
+        result
     }
 
     async fn save_atomic_async(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let temp_path = path.with_extension(format!("{RESUME_EXTENSION}.tmp"));
-        tokio::fs::write(&temp_path, bitcode::encode(self)).await?;
-        tokio::fs::rename(temp_path, path).await?;
-        Ok(())
+        let temp_path = temporary_metadata_path(path);
+        let bytes = bitcode::encode(self);
+        let result = async {
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)
+                .await?;
+            file.write_all(&bytes).await?;
+            file.sync_all().await?;
+            drop(file);
+            atomic_replace(&temp_path, path)?;
+            sync_parent_dir(path)?;
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+        }
+        result
     }
 
     pub fn set_segment_hash(&mut self, segment_index: usize, hash: u64) {
@@ -135,7 +237,30 @@ impl ResumeMetadata {
                 "resume metadata segment size must not be zero".to_owned(),
             ));
         }
-        // P0-5: any shape mismatch triggers sidecar self-heal (delete + rebuild full_ranges)
+
+        let mut expected_start = 0u64;
+        for (index, segment) in self.segments.iter().enumerate() {
+            if expected_start >= file_size {
+                return Err(DownloadError::ResumeMetadata(format!(
+                    "resume metadata contains extra segment at index {index}"
+                )));
+            }
+            let expected_end = expected_start
+                .saturating_add(self.segment_size - 1)
+                .min(file_size - 1);
+            if segment.start != expected_start || segment.end != expected_end {
+                return Err(DownloadError::ResumeMetadata(format!(
+                    "resume metadata segment {index} has range {}-{}, expected {}-{}",
+                    segment.start, segment.end, expected_start, expected_end
+                )));
+            }
+            expected_start = expected_end + 1;
+        }
+        if expected_start != file_size {
+            return Err(DownloadError::ResumeMetadata(format!(
+                "resume metadata segment ledger ends at {expected_start}, expected {file_size}"
+            )));
+        }
         Ok(())
     }
 
@@ -549,5 +674,56 @@ mod tests {
         let plan = res.unwrap();
         assert!(plan.truncate_output);
         assert_eq!(plan.completed_bytes, 0);
+    }
+    #[test]
+    fn prepare_self_heals_on_malformed_segment_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out4.bin");
+        std::fs::write(&out, vec![0u8; 10]).unwrap();
+        let mut meta = ResumeMetadata::new(1024, DEFAULT_SEGMENT_SIZE);
+        meta.segments.clear();
+        let meta_path = metadata_path_for(&out);
+        meta.save_atomic(&meta_path).unwrap();
+
+        let plan = ResumePlan::prepare(&out, 1024, true).unwrap();
+
+        assert!(plan.truncate_output);
+        assert_eq!(plan.remaining_ranges, vec![(0, 1023)]);
+        assert_eq!(plan.completed_bytes, 0);
+        let rebuilt = ResumeMetadata::load(&meta_path).unwrap();
+        assert_eq!(rebuilt.segments.len(), 1);
+        assert_eq!(rebuilt.segments[0].start, 0);
+        assert_eq!(rebuilt.segments[0].end, 1023);
+    }
+
+    #[tokio::test]
+    async fn atomic_save_replaces_existing_metadata_without_temp_residue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("out.bin.download.bitcode");
+
+        let mut first = ResumeMetadata::new(1, 1);
+        first.set_segment_hash(0, 11);
+        first.save_atomic(&path).unwrap();
+
+        let mut second = ResumeMetadata::new(1, 1);
+        second.set_segment_hash(0, 22);
+        second.save_atomic(&path).unwrap();
+        assert_eq!(ResumeMetadata::load(&path).unwrap().segments[0].hash, Some(22));
+
+        let mut third = ResumeMetadata::new(1, 1);
+        third.set_segment_hash(0, 33);
+        third.save_atomic_async(&path).await.unwrap();
+
+        let mut fourth = ResumeMetadata::new(1, 1);
+        fourth.set_segment_hash(0, 44);
+        fourth.save_atomic_async(&path).await.unwrap();
+        assert_eq!(ResumeMetadata::load(&path).unwrap().segments[0].hash, Some(44));
+
+        assert!(
+            std::fs::read_dir(tmp.path())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
+        );
     }
 }

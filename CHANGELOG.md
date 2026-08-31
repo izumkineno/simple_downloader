@@ -9,7 +9,6 @@
 
 ### 新增
 
-- [ ] 下载任务队列管理（暂停/恢复/取消/查询）
 - [ ] 并行下载多个文件
 - [ ] 图形化进度展示工具
 
@@ -18,6 +17,42 @@
 - [ ] 更智能的多源调度评分（响应时间/吞吐/失败率）
 - [ ] 更完整的多代理端到端测试矩阵
 - [ ] 元数据 schema 跨版本迁移策略与可观测性增强
+
+---
+
+## [0.6.2] - 2026-08-31
+
+### 🔧 修复（R1-R2 补丁 — `feat/queue` 增量）
+
+- **R1 取消残留泄漏** `queue.rs:447-483`：`flush_pending_deletes` 对 `remove_file` 未知 `Io` 错误由 `true` 改为 `false`，`warn + retry later`，避免 `ENOSPC` 等非 `NotFound/PermissionDenied` 错误被误判成功而 `retain` 丢弃，残留文件泄漏；`PermissionDenied` 仍保留 200ms 周期重试（Windows 打开文件句柄场景）
+- **R2 限速冻结语义澄清** `monitor.rs:524`：`drain_pending` 为 lane 容量补位非自适应分裂，故不限速冻结；仅 `decide_and_act` 在 `is_rate_limited` 时冻结，注释显式说明避免下次误改
+
+---
+
+## [0.6.1] - 2026-08-31
+
+### 🔧 修复（B1-B7 一次修复 — `feat/queue` 批量）
+
+- **B1 队列取消删后复活** `queue.rs:33-40,142-215,398-483`：`QueueState` 新增 `pending_deletes`，`driver_loop` `200ms` `flush_pending_deletes` 周期重试（`PermissionDenied` 保留、`NotFound` 视为成功）；`cancel(Active)` 改为 `abort + occupied.remove + pending.push` 延迟删盘，`Queued/Paused` 仍立即删，修复 `abort` 后 `file_writer` 仍 `seek/write/flush` 重建半截文件的竞态，下次 `ResumeTargetMissing` 误报；`WARNING` 文档化“仅进程内保证，外部 `touch` 需外部锁”
+- **B2 首批调度空洞** `downloader.rs:919-934` `monitor.rs:524-533,609-655`：抽 `DownloadMonitor::drain_pending()` 供 `handle_tick` 与 `orchestrate_downloads` 复用；`pending_initial.extend` 后立即 `drain_pending` 一次，避免 `update_interval 0.5s` 空等，32 workers 仅 2 lane 时首批即打满
+- **B3 黑名单自旋** `retry.rs:236-245` `monitor.rs:591`：新增 `push_back_retry_with_backoff` 置 `failure_time=now()` 2s 退避，`deferred_retries` 统一走退避，避免全 lane `Blacklisted 30s` 时每 tick 全量扫描自旋；日志降频
+- **B6 重试泄漏** `retry.rs:242-249`：`on_download_complete` 同步 `remove retry + total`，修复 `||` 短路致 `total_attempts` 残留，长跑 10k 任务线性增长
+- **B4/B7 文档** `queue.rs:54` `downloader.rs:683`：`TaskQueue` `WARNING` 明确三重 CAS 进程内唯一性，`streaming_download` 注释 `total_size=0` 仅表“未知” `MonitorUpdate(total_size=0)` 不代表 0 字节文件
+- **B5 保留** `queue.rs:367-393` `with_suffix` 现状 `a.tar.gz → a.tar(1).gz` / `.hidden(1)` 已符合预期，测试 `with_suffix_basic` 保持不变
+
+---
+
+## [0.6.0] - 2026-08-31
+
+### ✨ 新增
+
+- **任务队列 `queue` feature（可选）** 基于 `uuid 1` 的 `TaskQueue` 进程内 FIFO 调度：`TaskQueue::with_max_concurrent(3)`（`clamp 1..64`，默认 3）、`enqueue`/`enqueue_with_workers`（per-task `workers` 与队列层独立）、`pause`/`resume`/`cancel`/`query`/`wait_all`/`queued_len`/`active_count`，`TaskId`/`TaskState`/`TaskSnapshot`/`QueueError`；两阶段 CAS 重命名（`occupied` 快照 + `try_exists` 文件/`*.download.bitcode` + 锁内 `exists` 回检，`a(N).ext` 无限递增，`windows` 大小写折叠），`JoinSet` + `AbortHandle` 驱动 `mpsc 128` + `Notify`，`Completed/Failed → Removed` 可取消删文件；`queue` 为可选特性 `queue = ["dep:uuid"]`，`[[test]] queue` 需 `queue`，`examples/with_queue.rs` 演示同名重命名/workers 隔离/pause-resume/cancel
+- **运行期配置热更新（0.5.5 合入）** `src/config.rs::SharedConfig(Arc<RwLock<RuntimeConfig>>)` + `DownloadMonitor::apply_config`，支持 `workers/update_interval` 运行时热更（`build` 后 `apply_config`），`DownloadInfo::Stable` 收敛参数调优与 `SharedConfig` 热更底座验证
+
+### 🔧 修复
+
+- **队列并发与取消** `pause(Active)` 释放槽后 `Pump` 防 FIFO 停滞、`cancel Queued` 补 `occupied.remove` 且 `drop` 后再 `remove_file` 防 `Mutex` 跨 `await`、`Completed/Failed` 清 `occupied` 防幽灵占用、`Cancelled` 仍 `pump`、`ac2_pause_resume` 800ms 稳定期 + `ac3_cancel` 允许已完成取消删文件
+- **重命名与 sidecar** `sidecar_path` `cfg(resume)` `Option`，无 `resume` 时队内重命名正确；`tests/queue` `64m` 非 `0` 限速防 `error decoding`，`metadata_path_for` 检查 `cfg(resume)`
 
 ---
 

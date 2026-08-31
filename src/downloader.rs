@@ -1,6 +1,6 @@
 //! 包含核心的 `Downloader` 结构体，是整个库的入口和总协调器。
 
-use crate::chunk::chunk_run;
+use crate::chunk::chunk_run_with_reliable;
 use crate::lane::{MultiRuntime, MultiSourceConfig};
 use crate::monitor::DownloadMonitor;
 #[cfg(feature = "resume")]
@@ -30,6 +30,7 @@ use tokio::time::interval;
 
 const MIN_PARALLEL_FILE_SIZE: u64 = 1024 * 1024; // 1 MiB：小于此值自动单线程，避免切片开销
 const CHANNEL_CAPACITY: usize = 4096; // 增大以容纳节流后 ~1.5k 进度 + 控制事件，避免 Lagged 丢 Failed/Complete
+const RELIABLE_EVENT_CAPACITY: usize = 1024;
 const DEFAULT_UPDATE_INTERVAL: f64 = 0.5;
 
 type BoxProgressFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -680,6 +681,7 @@ where
         Ok(())
     }
     #[::tracing::instrument(skip(self, client, writer_path, progress_handler), fields(url = %url, path = %writer_path))]
+    /// 未知 Content-Length 时的单流流式回退：`total_size=0` 仅表“未知”，`MonitorUpdate(total_size=0)` 不代表 0 字节文件，`progress_percent` 对 0 恒 0%。
     async fn streaming_download(
         self,
         client: Client,
@@ -822,7 +824,8 @@ where
         resume_ranges: Vec<(u64, u64)>,
         completed_bytes: u64,
     ) -> Result<()> {
-        let tasks = FuturesUnordered::new();
+        let mut tasks = FuturesUnordered::new();
+        let (reliable_tx, reliable_rx) = mpsc::channel(RELIABLE_EVENT_CAPACITY);
         let next_chunk_id = AtomicU64::new(0);
 
         let workers = if !support_ranges || workers == 1 || file_size < MIN_PARALLEL_FILE_SIZE {
@@ -894,7 +897,7 @@ where
                 initial_lanes.push((id, lane_id.clone()));
             }
             ::tracing::debug!(chunk_id = id, start_byte, end_byte, per_limited = per_source.is_some(), global_limited = global.is_some(), "spawn initial chunk");
-            let task = chunk_run(
+            let task = chunk_run_with_reliable(
                 id,
                 writer_tx.clone(),
                 self.cmd_tx.subscribe(),
@@ -904,6 +907,7 @@ where
                 end_byte,
                 global,
                 per_source,
+                Some(reliable_tx.clone()),
             );
             tasks.push(spawn(task));
         }
@@ -913,11 +917,23 @@ where
             next_id = next_chunk_id.load(std::sync::atomic::Ordering::SeqCst),
             "spawned initial tasks"
         );
-        // 将缓冲的初始区间移入 monitor 的 pending 队列，待 tick 时按容量逐步调度
+        // 将缓冲的初始区间移入 monitor 的 pending 队列，立即尝试调度一次，避免 0.5s 空洞
         monitor.pending_bisects.extend(pending_initial);
-
+        {
+            let _ = monitor.drain_pending(
+                &mut tasks,
+                &next_chunk_id,
+                &client,
+                &writer_tx,
+                &self.info_tx,
+                &Some(reliable_tx.clone()),
+                &self.cmd_tx,
+                Some(download_url),
+                &mut multi_runtime,
+            );
+        }
         monitor
-            .run(
+            .run_with_reliable(
                 self.info_tx.subscribe(),
                 self.info_tx.clone(),
                 tasks,
@@ -928,6 +944,8 @@ where
                 Some(download_url),
                 initial_lanes,
                 multi_runtime,
+                Some(reliable_tx),
+                reliable_rx,
             )
             .await?;
         Ok(())

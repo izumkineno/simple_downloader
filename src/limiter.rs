@@ -18,9 +18,10 @@ mod imp {
     };
 
     /// 字节级限速器（`governor` 封装）。
+    #[allow(clippy::type_complexity)]
     #[derive(Clone)]
     pub struct RateLimiter {
-        inner: Arc<GovLimiter<NotKeyed, InMemoryState, QuantaClock>>,
+        inner: Arc<parking_lot::RwLock<Option<Arc<GovLimiter<NotKeyed, InMemoryState, QuantaClock>>>>>,
     }
 
     impl RateLimiter {
@@ -28,25 +29,51 @@ mod imp {
         /// `bytes_per_sec`: 每秒字节数（`NonZeroU32`，`0` 需在调用方校验为 `InvalidArgument`）
         /// `burst`: 突发容量，`None` → 默认 64KiB 硬限（满足 AC3），`Some` → 显式 burst
         pub fn new(bytes_per_sec: NonZeroU32, burst: Option<NonZeroU32>) -> Self {
+            Self {
+                inner: Arc::new(parking_lot::RwLock::new(Some(Self::build(
+                    bytes_per_sec,
+                    burst,
+                )))),
+            }
+        }
+
+        fn build(
+            bytes_per_sec: NonZeroU32,
+            burst: Option<NonZeroU32>,
+        ) -> Arc<GovLimiter<NotKeyed, InMemoryState, QuantaClock>> {
             let burst_val = burst.unwrap_or_else(|| NonZeroU32::new(64 * 1024).unwrap());
             let quota = Quota::per_second(bytes_per_sec).allow_burst(burst_val);
-            let limiter = GovLimiter::direct(quota);
-            Self {
-                inner: Arc::new(limiter),
-            }
+            Arc::new(GovLimiter::direct(quota))
+        }
+
+        /// 更新限速参数。已有下载块持有的 `Arc<RateLimiter>` 也会看到新桶。
+        pub fn reconfigure(&self, bytes_per_sec: NonZeroU32, burst: Option<NonZeroU32>) {
+            *self.inner.write() = Some(Self::build(bytes_per_sec, burst));
+        }
+
+        /// 停用限速。已有下载块会在下一次批量获取时直接放行。
+        pub fn disable(&self) {
+            *self.inner.write() = None;
         }
 
         /// 批量获取 `n` 字节令牌（`n` 需 `NonZeroU32`，调用方保证 `1..=65536`）。
         /// 内部使用 `until_n_ready`，无 jitter（保证 burst=0 时瞬时 ≤1.05×）。
         pub async fn acquire(&self, n: NonZeroU32) {
-            // governor 的 `until_n_ready` 在限速未满足时会 `sleep` 到下一个 refill 周期
-            let _ = self.inner.until_n_ready(n).await;
+            // 只在等待前复制 Arc，避免跨 await 持有锁。
+            let limiter = self.inner.read().clone();
+            if let Some(limiter) = limiter {
+                // governor 的 `until_n_ready` 在限速未满足时会 `sleep` 到下一个 refill 周期
+                let _ = limiter.until_n_ready(n).await;
+            }
         }
 
         /// 尝试非阻塞获取（用于测试/观测，可选）。
         #[allow(dead_code)]
         pub fn check_n(&self, n: NonZeroU32) -> bool {
-            self.inner.check_n(n).is_ok()
+            self.inner
+                .read()
+                .as_ref()
+                .is_some_and(|limiter| limiter.check_n(n).is_ok())
         }
     }
 
@@ -69,6 +96,8 @@ mod no_impl {
         pub fn new(_: std::num::NonZeroU32, _: Option<std::num::NonZeroU32>) -> Self {
             Self
         }
+        pub fn reconfigure(&self, _: std::num::NonZeroU32, _: Option<std::num::NonZeroU32>) {}
+        pub fn disable(&self) {}
         pub async fn acquire(&self, _: std::num::NonZeroU32) {}
     }
 }

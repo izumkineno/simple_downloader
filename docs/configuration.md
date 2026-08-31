@@ -72,11 +72,11 @@ let downloader = Downloader::builder("https://example.com/file.bin", "output.bin
 
 ```toml
 # 最轻量
-simple_downloader = { version = "0.5", default-features = false }
+simple_downloader = { version = "0.6", default-features = false }
 # 常用：基础 + 断点续传 + 进度
-simple_downloader = { version = "0.5", default-features = false, features = ["resume","progress"] }
+simple_downloader = { version = "0.6", default-features = false, features = ["resume","progress"] }
 # 全功能（含限速）
-simple_downloader = { version = "0.5", default-features = false, features = ["resume","progress","multi-source","proxy","rate-limit"] }
+simple_downloader = { version = "0.6", default-features = false, features = ["resume","progress","multi-source","proxy","rate-limit"] }
 ```
 > 历史文档中 `default = [resume, progress, ...]` 与 `full` 已过时。
 
