@@ -819,7 +819,6 @@ impl MultiRuntime {
             },
         ))
     }
-
     pub fn limiter_for_lane(&self, lane_id: &str) -> Option<Arc<RateLimiter>> {
         let source_id = self.scheduler.lanes.iter().find(|e| e.candidate.lane_id.as_str() == lane_id).map(|e| e.candidate.source_id.clone())?;
         self.per_source_limiters.get(&source_id).cloned()
@@ -827,6 +826,10 @@ impl MultiRuntime {
 
     pub fn global_limiter(&self) -> Option<Arc<RateLimiter>> {
         self.global_limiter.clone()
+    }
+
+    pub fn has_rate_limit(&self) -> bool {
+        !self.per_source_limiters.is_empty() || self.global_limiter.is_some()
     }
 
     pub fn claim_request_builder(&mut self) -> Option<(FastStr, reqwest::RequestBuilder)> {

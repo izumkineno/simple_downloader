@@ -24,13 +24,13 @@ rustup update
 
 ```toml
 [dependencies]
-simple_downloader = "0.5.1"
+simple_downloader = "0.5.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
 此时可用 `Downloader::builder(url, path).download().await`，未启用 `resume/progress/multi-source/proxy`。
 
-> `simple_downloader = "0.5.1"` **不会** 默认启用任何可选功能，旧文“默认启用所有”已过时。
+> `simple_downloader = "0.5.2"` **不会** 默认启用任何可选功能，旧文“默认启用所有”已过时。
 
 ## 自定义 Feature 安装
 

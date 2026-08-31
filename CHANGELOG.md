@@ -21,6 +21,14 @@
 
 ---
 
+## [0.5.2] - 2026-08-31
+
+### 🐛 修复
+
+- **自适应冻结补齐** `per_source` 单独限速时亦冻结 `ConcurrencyManager`：`MultiRuntime::has_rate_limit()` + `DownloadMonitor::set_rate_limited`，`orchestrate` 中 `global_or_per` 任一即 `freeze`，修复 `per_source` 400KiB×2 全局 None 时误分裂
+
+---
+
 ## [0.5.1] - 2026-08-31
 
 ### 🐛 修复

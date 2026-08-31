@@ -79,6 +79,10 @@ impl DownloadMonitor {
         self
     }
 
+    pub fn set_rate_limited(&mut self, limited: bool) {
+        self.is_rate_limited = limited;
+    }
+
     /// 运行监控器的主事件循环。
     ///
     /// 这个循环会监听来自各个下载块的信息，并定期触发状态更新、并发决策和重试处理。
