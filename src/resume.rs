@@ -237,7 +237,30 @@ impl ResumeMetadata {
                 "resume metadata segment size must not be zero".to_owned(),
             ));
         }
-        // P0-5: any shape mismatch triggers sidecar self-heal (delete + rebuild full_ranges)
+
+        let mut expected_start = 0u64;
+        for (index, segment) in self.segments.iter().enumerate() {
+            if expected_start >= file_size {
+                return Err(DownloadError::ResumeMetadata(format!(
+                    "resume metadata contains extra segment at index {index}"
+                )));
+            }
+            let expected_end = expected_start
+                .saturating_add(self.segment_size - 1)
+                .min(file_size - 1);
+            if segment.start != expected_start || segment.end != expected_end {
+                return Err(DownloadError::ResumeMetadata(format!(
+                    "resume metadata segment {index} has range {}-{}, expected {}-{}",
+                    segment.start, segment.end, expected_start, expected_end
+                )));
+            }
+            expected_start = expected_end + 1;
+        }
+        if expected_start != file_size {
+            return Err(DownloadError::ResumeMetadata(format!(
+                "resume metadata segment ledger ends at {expected_start}, expected {file_size}"
+            )));
+        }
         Ok(())
     }
 
@@ -652,6 +675,27 @@ mod tests {
         assert!(plan.truncate_output);
         assert_eq!(plan.completed_bytes, 0);
     }
+    #[test]
+    fn prepare_self_heals_on_malformed_segment_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out4.bin");
+        std::fs::write(&out, vec![0u8; 10]).unwrap();
+        let mut meta = ResumeMetadata::new(1024, DEFAULT_SEGMENT_SIZE);
+        meta.segments.clear();
+        let meta_path = metadata_path_for(&out);
+        meta.save_atomic(&meta_path).unwrap();
+
+        let plan = ResumePlan::prepare(&out, 1024, true).unwrap();
+
+        assert!(plan.truncate_output);
+        assert_eq!(plan.remaining_ranges, vec![(0, 1023)]);
+        assert_eq!(plan.completed_bytes, 0);
+        let rebuilt = ResumeMetadata::load(&meta_path).unwrap();
+        assert_eq!(rebuilt.segments.len(), 1);
+        assert_eq!(rebuilt.segments[0].start, 0);
+        assert_eq!(rebuilt.segments[0].end, 1023);
+    }
+
     #[tokio::test]
     async fn atomic_save_replaces_existing_metadata_without_temp_residue() {
         let tmp = tempfile::tempdir().unwrap();
