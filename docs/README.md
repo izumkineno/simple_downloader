@@ -15,20 +15,21 @@
 - `tests/util.rs`：文件信息探测回退链路、写入任务和基础工具行为。
 - `test_server/server.py`：本地可控 Range/限速测试服务，适合集成验证与手工观察并发行为。
 
-## 二、项目概览（按当前源码校准）
+## 二、项目概览（按 0.5.4 源码校准）
 
 simple_downloader 是一个基于 Rust 与 Tokio 的异步下载库，当前实现重点在于：
 
 - `Downloader`：启动编排入口，负责 client、文件信息探测、写入任务和初始 chunk。
-- `DownloadMonitor`：运行期控制循环，持有 `DownloadState`、`ConcurrencyManager`、`RetryHandler`。
-- `chunk_run`：执行单个 byte-range 拉取、写入请求发送与事件上报。
-- `file_writer_task`：独立文件写入任务，通过有界 `mpsc` 提供背压。
+- `DownloadMonitor`：运行期控制循环，持有 `DownloadState`、`ConcurrencyManager`、`RetryHandler`，限速启用时冻结并发探测。
+- `chunk_run`：执行单个 byte-range 拉取、Range 206/Content-Range 校验、Early-EOF 门限与事件上报。
+- `file_writer_task`：独立文件写入任务，通过有界 `mpsc 128` 提供背压，0.5.4+ 流式追加（无 `set_len` 预分配，`truncate(false)`）。
+- `limiter`：`rate-limit` feature 下 `governor` 令牌桶 `1 token=1 byte`，全局/分源双桶 `tokio::join` 取 `max`，`burst` 默认 64KiB。
 
 项目当前许可证文件为仓库根目录中的 Apache License 2.0（见 `LICENSE`）。
-
 ## 三、当前验证与回归面
 
 ### 1. 自动化测试
+
 
 - `tests/concurrency.rs`
   - 无正向吞吐证据时不继续探测分片
@@ -39,11 +40,13 @@ simple_downloader 是一个基于 Rust 与 Tokio 的异步下载库，当前实�
   - `HEAD` 成功获取文件信息
   - `HEAD` 失败后回退 `GET Range: bytes=0-0`
   - 无 `Content-Range` 时回退到 `Content-Length`
-  - `file_writer_task` 的偏移写入与零填充行为
+  - `file_writer_task` 流式追加（0.5.4+ 无 `set_len`，`ENOSPC` 在 `flush` 暴露）与零填充行为已对齐
 - `tests/chunk.rs`
-  - chunk 正常下载并发送 `WriteFile` / `DownloadComplete`
-  - 请求失败后发送 `ChunkFailed`
+  - `206 Content-Range` 校验、`416 Range Not Satisfiable`、`200 仅单段降级`（P0-1）
+  - `Early-EOF` 门限与 `final_downloaded==size` 才 `DownloadComplete`（P0-2）
   - `test_chunk_bisect` 目前保留为 `#[ignore]`，说明动态分片仍主要依赖更复杂的延迟响应场景做集成验证
+- `tests/rate_limit.rs`（`--features rate-limit,multi-source`）
+  - `5MiB@1MiB/s 4-6.5s` 全局、`per_source`、`global+per_source`、`burst=0` 校验
 
 ### 2. 手工 / 集成验证
 
@@ -84,20 +87,26 @@ simple_downloader/
 │   ├── monitor.rs       # 运行时控制循环
 │   ├── concurrency.rs   # 动态分片决策
 │   ├── retry.rs         # 即时/延迟重试队列
-│   ├── chunk.rs         # 单分片下载执行
+│   ├── chunk.rs         # 单分片下载执行（P0-1 Range/Early-EOF）
 │   ├── state.rs         # 聚合下载状态
-│   ├── util.rs          # 文件信息探测、写入任务
+│   ├── util.rs          # 文件信息探测、流式写入任务（P0-4）
+│   ├── limiter.rs       # rate-limit 令牌桶（0.5.x）
+│   ├── trace.rs         # tracing 初始化门面
 │   └── types.rs         # 公共协议类型
 ├── tests/
 │   ├── chunk.rs
+│   ├── concurrency.rs
+│   ├── rate_limit.rs
 │   └── util.rs
 ├── test_server/
 │   ├── config.ini
 │   └── server.py
 ├── examples/
+│   ├── with_rate_limit.rs
+│   └── manual_multi_source_test_server.rs
 └── README.md
 ```
 
 ## 六、待实现功能（文档层摘要）
 
-当前 README 中列出的断点续传、多源多代理、速度限制和运行时动态配置仍属于未来工作；在这些能力落地前，应继续把 `DownloadMonitor` / `DownloadState` 的职责边界当作扩展基线，而不是回退到旧版状态机命名或“预创建固定 worker”这类过时实现假设。
+`0.5.4` 已落地 `rate-limit` 流式追加 + P0 6 项；`README TODO` 剩余 `断点续传 schema 演进/可观测性`、`多源智能调度/代理矩阵`、`配置灵活性/任务队列/稳定 UI 契约` 仍按 `README:79-112` 为准，本文仅做测试与结构导航，不重复总纲。
