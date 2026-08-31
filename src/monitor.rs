@@ -521,6 +521,7 @@ impl DownloadMonitor {
         } else {
             self.concurrency_manager.decide_and_act(&self.state, cmd_tx);
         }
+        // pending_bisects 的 drain 是 lane 容量补位，非自适应分裂，故不限速冻结
         let _drained_pending = self.drain_pending(
             tasks,
             next_chunk_id,

@@ -459,8 +459,8 @@ async fn flush_pending_deletes(state: &Arc<tokio::sync::Mutex<QueueState>>) {
                 false
             },
             Err(e) => {
-                ::tracing::warn!(path=%path.display(), error=%e, "pending delete failed");
-                true
+                ::tracing::warn!(path=%path.display(), error=%e, "pending delete failed, retry later");
+                false
             }
         };
         let meta_gone = if let Some(meta) = sidecar_path(path) {
