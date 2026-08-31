@@ -28,11 +28,11 @@
 //!
 //! ```toml
 //! # 最轻量：仅基础下载
-//! simple_downloader = { version = "0.3", default-features = false }
+//! simple_downloader = { version = "0.5, default-features = false }
 //! # 常用：基础 + 断点续传 + 进度
-//! simple_downloader = { version = "0.3", default-features = false, features = ["resume", "progress"] }
+//! simple_downloader = { version = "0.5, default-features = false, features = ["resume", "progress"] }
 //! # 全功能
-//! simple_downloader = { version = "0.3", default-features = false, features = ["resume", "progress", "multi-source", "proxy"] }
+//! simple_downloader = { version = "0.5, default-features = false, features = ["resume", "progress", "multi-source", "proxy"] }
 //! ```
 //!
 //! ## 快速开始
@@ -159,9 +159,14 @@ mod resume;
 pub mod retry;
 #[doc(hidden)]
 pub mod state;
+pub mod trace;
+pub mod limiter;
 mod types;
 #[doc(hidden)]
 pub mod util;
+
+pub(crate) const DEFAULT_USER_AGENT: &str =
+    concat!("simple_downloader/", env!("CARGO_PKG_VERSION"));
 
 // --- 公共 API 导出 ---
 
@@ -185,6 +190,13 @@ pub use types::{ChunkId, DownloadError, Result};
 pub mod internal {
     pub use crate::types::{DownloadCmd, DownloadInfo};
 }
+
+// 日志门面：基于 tracing 的调试/生产分级初始化，库本身不自动安装全局订阅者。
+// 二进制按需调用 `simple_downloader::trace::init_tracing()` 即可通过
+// RUST_LOG / SIMPLE_DOWNLOADER_LOG 控制级别；见 `crate::trace` 模块文档。
+// `simple_downloader::tracing` 为兼容别名，指向同一模块。
+#[doc(hidden)]
+pub use crate::trace as tracing;
 
 // 重新导出 `reqwest`，允许用户提供自定义的 `ClientBuilder`。
 pub use reqwest;

@@ -1,6 +1,6 @@
 [package]
 name = "simple_downloader"
-version = "0.3.0"
+version = "0.5.1"
 edition = "2024"
 rust-version = "1.85"
 description = "高性能异步下载器：动态并发、断点续传、多源/代理 lane 调度，基于 Tokio + reqwest"
@@ -17,7 +17,7 @@ resume = ["dep:bitcode"]
 multi-source = []
 proxy = ["multi-source"]
 progress = []
-
+rate-limit = ["dep:governor"]
 [dependencies]
 tokio = { version = "1.52.0", features = [
     "rt-multi-thread", # 启用多线程运行时，支持 tokio::spawn
@@ -32,7 +32,9 @@ bytes = "1.11.1"
 thiserror = "2.0.18"
 faststr = "0.2.34"
 bitcode = { version = "0.6.9", optional = true }
-
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+governor = { version = "0.7", optional = true }
 [dev-dependencies]
 indicatif = "0.18.4"
 tokio-test = "0.4.5"
@@ -55,3 +57,7 @@ required-features = ["multi-source", "progress"]
 [[example]]
 name = "resume_harness"
 required-features = ["resume", "multi-source"]
+
+[[example]]
+name = "with_rate_limit"
+required-features = ["rate-limit", "progress"]

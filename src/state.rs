@@ -125,11 +125,10 @@ impl DownloadState {
     }
 
     /// 将一个块标记为已完成。
-    /// 这会将其从活跃块列表中移除，并将其大小累加到 `completed_bytes`。
-    /// 使用 `size()` 而非 `downloaded_bytes` 以容忍广播节流/ Lagged 导致的最终进度丢失。
+    /// 使用真实 `downloaded_bytes` 累加，避免截断流零填充尾部却按 `size()` 多算。
     pub fn complete_chunk(&mut self, id: &ChunkId) {
         if let Some(chunk) = self.chunks.remove(id) {
-            self.completed_bytes += chunk.size();
+            self.completed_bytes += chunk.downloaded_bytes;
         }
     }
 

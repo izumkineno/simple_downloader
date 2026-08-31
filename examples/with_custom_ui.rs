@@ -162,6 +162,8 @@ async fn progress_bar_task(file_size: u64, mut info_rx: broadcast::Receiver<Down
 
 #[tokio::main]
 async fn main() {
+    // 初始化 tracing（生产默认 info，调试默认 debug；RUST_LOG 优先）
+    simple_downloader::trace::init_tracing();
     // 1. --- 配置 ---
 
     let url = "https://dlied4.myapp.com/myapp/1104466820/cos.release-40109/10040714_com.tencent.tmgp.sgame_a2480356_8.2.1.9_F0BvnI.apk";

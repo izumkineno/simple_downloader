@@ -6,3 +6,5 @@
 __pycache__
 .claude
 .agents
+.mnemon
+.agent-teams

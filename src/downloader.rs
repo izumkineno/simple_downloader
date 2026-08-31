@@ -5,17 +5,19 @@ use crate::lane::{MultiRuntime, MultiSourceConfig};
 use crate::monitor::DownloadMonitor;
 #[cfg(feature = "resume")]
 use crate::resume::ResumePlan;
-#[cfg(feature = "resume")]
 use crate::types::DownloadError;
 use crate::types::{DownloadCmd, DownloadInfo, Result};
 #[cfg(not(feature = "resume"))]
 use crate::util::file_writer_task;
 #[cfg(feature = "resume")]
 use crate::util::file_writer_task_with_resume;
-use crate::util::get_file_info;
+use crate::util::{ensure_user_agent, get_file_info};
+use crate::limiter::RateLimiter;
+use std::num::NonZeroU32;
+use std::sync::Arc;
 use faststr::FastStr;
-use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use reqwest::{Client, ClientBuilder};
 #[cfg(feature = "resume")]
 use std::path::Path;
@@ -36,6 +38,7 @@ type ProgressHandler =
 
 fn default_client_builder() -> ClientBuilder {
     ClientBuilder::new()
+        .user_agent(crate::DEFAULT_USER_AGENT)
         .pool_max_idle_per_host(32)
         .pool_idle_timeout(std::time::Duration::from_secs(90))
         .tcp_keepalive(std::time::Duration::from_secs(60))
@@ -92,6 +95,8 @@ where
     update_interval: f64,
     client_builder: F,
     resume_enabled: bool,
+    speed_limit: Option<u64>,
+    burst: Option<u64>,
 }
 
 impl DownloadBuilder {
@@ -116,6 +121,8 @@ impl DownloadBuilder {
             update_interval: DEFAULT_UPDATE_INTERVAL,
             client_builder: default_client_builder,
             resume_enabled: cfg!(feature = "resume"),
+            speed_limit: None,
+            burst: None,
         }
     }
 }
@@ -185,6 +192,8 @@ where
             update_interval: self.update_interval,
             client_builder,
             resume_enabled: self.resume_enabled,
+            speed_limit: self.speed_limit,
+            burst: self.burst,
         }
     }
 
@@ -203,6 +212,23 @@ where
         self
     }
 
+
+    /// 设置全局限速（bytes/s），仅 `rate-limit` feature 可用。
+    /// `0` 将在 `build().download().await` 时返回 `InvalidArgument`。
+    #[cfg(feature = "rate-limit")]
+    pub fn speed_limit(mut self, bytes_per_sec: u64) -> Self {
+        self.speed_limit = Some(bytes_per_sec);
+        self
+    }
+
+    /// 设置突发容量（bytes），仅 `rate-limit` feature 可用。默认 64KiB 硬限。
+    #[cfg(feature = "rate-limit")]
+    pub fn with_burst(mut self, burst_bytes: u64) -> Self {
+        self.burst = Some(burst_bytes);
+        self
+    }
+
+    /// 构建 Downloader 实例。
     /// 构建 Downloader 实例。
     pub fn build(self) -> Downloader<F> {
         let mut downloader = Downloader::new(
@@ -213,6 +239,11 @@ where
             self.client_builder,
         );
         downloader.resume_enabled = self.resume_enabled;
+        {
+            downloader.speed_limit = self.speed_limit;
+            downloader.burst = self.burst;
+            downloader.global_limiter = None;
+        }
         downloader
     }
 
@@ -269,6 +300,9 @@ where
     update_interval: f64,
     /// 是否启用自动断点续传。
     resume_enabled: bool,
+    speed_limit: Option<u64>,
+    burst: Option<u64>,
+    global_limiter: Option<Arc<RateLimiter>>,
 }
 
 impl<F> Downloader<F>
@@ -306,6 +340,9 @@ where
             info_tx,
             update_interval,
             resume_enabled: cfg!(feature = "resume"),
+            speed_limit: None,
+            burst: None,
+            global_limiter: None,
         }
     }
 
@@ -328,6 +365,9 @@ where
             cmd_tx,
             info_tx,
             resume_enabled: cfg!(feature = "resume"),
+            speed_limit: None,
+            burst: None,
+            global_limiter: None,
         }
     }
 
@@ -394,25 +434,63 @@ where
         self.run_internal(Some(progress_handler)).await
     }
 
-    async fn run_internal(self, progress_handler: Option<ProgressHandler>) -> Result<()> {
+    #[::tracing::instrument(skip(self, progress_handler), fields(mode = ?match &self.mode { DownloadMode::Single(c) => format!("single:{}", c.url), DownloadMode::Multi(c) => format!("multi:{}", c.output_path) }))]
+    async fn run_internal(mut self, progress_handler: Option<ProgressHandler>) -> Result<()> {
+        ::tracing::info!("download run_internal start");
+        if let Some(limit) = self.speed_limit {
+                if limit == 0 {
+                    return Err(DownloadError::InvalidArgument("speed_limit 0 无效，需 >0".to_string()));
+                }
+                if limit > u32::MAX as u64 {
+                    return Err(DownloadError::InvalidArgument(format!("speed_limit {} 超过 {} 需 ≤4GiB/s", limit, u32::MAX)));
+                }
+                if let Some(b) = self.burst {
+                    if b == 0 {
+                        return Err(DownloadError::InvalidArgument("burst 0 无效，需 >0".to_string()));
+                    }
+                    if b > u32::MAX as u64 {
+                        return Err(DownloadError::InvalidArgument(format!("burst {} 超过 {}", b, u32::MAX)));
+                    }
+                }
+                // 创建全局限速器
+                let burst_nz = self.burst.and_then(|b| NonZeroU32::new(b as u32)).or_else(|| NonZeroU32::new(64*1024));
+                let limit_nz = NonZeroU32::new(limit as u32).unwrap();
+                let limiter = crate::limiter::RateLimiter::new(limit_nz, burst_nz);
+                self.global_limiter = Some(std::sync::Arc::new(limiter));
+                ::tracing::info!(limit, burst = ?burst_nz, "rate-limit global limiter created");
+            } else if self.burst.is_some() {
+                return Err(DownloadError::InvalidArgument("burst 需配合 speed_limit".to_string()));
+            }
         let (file_size, support_ranges, writer_path, client, download_url, workers, multi_runtime) =
             match &self.mode {
                 DownloadMode::Single(config) => {
-                    let client = (self.client_builder)()
-                        .pool_max_idle_per_host(32)
-                        .pool_idle_timeout(Duration::from_secs(90))
-                        .tcp_keepalive(Duration::from_secs(60))
-                        .build()?;
-                    let (file_size, support_ranges) = match get_file_info(&client, &config.url).await {
-                        Ok(v) => v,
+                    ::tracing::debug!(url = %config.url, workers = config.workers, interval = self.update_interval, "probing single source");
+                    // M3-05 保留用户 pool 配置，不二次覆盖；默认值由 default_client_builder 提供
+                    let client = (self.client_builder)().build()?;
+                    let (file_size, support_ranges) = match get_file_info(&client, &config.url)
+                        .await
+                    {
+                        Ok(v) => {
+                            ::tracing::info!(size = v.0, support_ranges = v.1, url = %config.url, "probe ok");
+                            v
+                        }
                         Err(DownloadError::MissingContentLength) => {
+                            ::tracing::warn!(url = %config.url, "missing Content-Length -> streaming fallback");
                             let writer_path = config.output_path.clone();
                             let download_url = config.url.clone();
                             return self
-                                .streaming_download(client, download_url, writer_path, progress_handler)
+                                .streaming_download(
+                                    client,
+                                    download_url,
+                                    writer_path,
+                                    progress_handler,
+                                )
                                 .await;
                         }
-                        Err(e) => return Err(e),
+                        Err(e) => {
+                            ::tracing::error!(error = %e, url = %config.url, "probe failed");
+                            return Err(e);
+                        }
                     };
                     (
                         file_size,
@@ -425,30 +503,41 @@ where
                     )
                 }
                 DownloadMode::Multi(config) => {
+                    ::tracing::debug!(output = %config.output_path, workers = config.workers, sources = config.sources.len(), "probing multi sources");
                     let runtime_res = MultiRuntime::from_config(config, &self.client_builder).await;
                     let (file_size, mut runtime) = match runtime_res {
                         Ok(v) => v,
                         Err(DownloadError::NoAvailableSources)
                         | Err(DownloadError::MissingContentLength) => {
                             // 多源探测失败，回退为单流流式下载（首源）
+                            ::tracing::warn!(
+                                "multi-source probe failed, fallback to streaming with first source"
+                            );
                             if let Some(first) = config.sources.first() {
-                                let client = (self.client_builder)()
-                                    .pool_max_idle_per_host(32)
-                                    .pool_idle_timeout(Duration::from_secs(90))
-                                    .tcp_keepalive(Duration::from_secs(60))
-                                    .build()?;
+                                // M3-05 保留用户 pool 配置
+                                let client = (self.client_builder)().build()?;
                                 let writer_path = config.output_path.clone();
                                 let download_url = first.url.clone();
                                 return self
-                                    .streaming_download(client, download_url, writer_path, progress_handler)
+                                    .streaming_download(
+                                        client,
+                                        download_url,
+                                        writer_path,
+                                        progress_handler,
+                                    )
                                     .await;
                             } else {
+                                ::tracing::error!("multi-source no sources available");
                                 return Err(DownloadError::NoAvailableSources);
                             }
                         }
-                        Err(e) => return Err(e),
+                        Err(e) => {
+                            ::tracing::error!(error = %e, "multi-source probe failed");
+                            return Err(e);
+                        }
                     };
                     let support_ranges = runtime.supports_ranges;
+                    ::tracing::info!(file_size, support_ranges, "multi-source probe ok");
                     let (client, download_url) = runtime
                         .best_lane_runtime()
                         .map(|lane| (lane.client.clone(), lane.url.clone()))
@@ -476,6 +565,10 @@ where
         .await?;
         #[cfg(feature = "resume")]
         if resume_plan.completed_bytes > 0 && !support_ranges {
+            ::tracing::error!(
+                completed = resume_plan.completed_bytes,
+                "partial resume requires HTTP Range support but server does not support it"
+            );
             return Err(DownloadError::ResumeMetadata(
                 "partial resume requires HTTP Range support".to_owned(),
             ));
@@ -495,20 +588,32 @@ where
         #[cfg(not(feature = "resume"))]
         let completed_bytes = 0;
 
+        ::tracing::info!(
+            file_size,
+            support_ranges,
+            writer_path = %writer_path,
+            completed_bytes,
+            remaining_ranges = initial_ranges.len(),
+            "resume plan ready, initializing writer"
+        );
+
         #[cfg(feature = "resume")]
         let (writer_tx, writer_handle) = file_writer_task_with_resume(
-            writer_path,
+            writer_path.clone(),
             file_size,
             truncate_output,
             resume_plan.into_recorder(),
         )
         .await?;
         #[cfg(not(feature = "resume"))]
-        let (writer_tx, writer_handle) = file_writer_task(writer_path, file_size).await?;
+        let (writer_tx, writer_handle) = file_writer_task(writer_path.clone(), file_size).await?;
         let writer_shutdown_tx = writer_tx.clone();
+
+        ::tracing::debug!(writer_path = %writer_path, file_size, "writer task ready");
 
         if let Some(progress_handler) = progress_handler {
             spawn(progress_handler(file_size, self.info_tx.subscribe()));
+            ::tracing::debug!("progress handler spawned");
         }
 
         let orchestrate_result = self
@@ -525,17 +630,56 @@ where
             )
             .await;
         let _ = writer_shutdown_tx.send(DownloadCmd::TerminateAll).await;
-        let _ = writer_handle.await;
+        let writer_join = writer_handle.await;
+        let writer_result: std::result::Result<(), DownloadError> = match writer_join {
+            Ok(r) => r,
+            Err(e) => Err(DownloadError::Join(e)),
+        };
         let _ = self.cmd_tx.send(DownloadCmd::TerminateAll);
+        if let Err(ref e) = orchestrate_result {
+            ::tracing::error!(error = %e, "orchestrate_downloads failed");
+            if let Err(ref we) = writer_result {
+                ::tracing::error!(error = %we, "writer task also failed");
+            }
+        } else if let Err(ref e) = writer_result {
+            ::tracing::error!(error = %e, "writer task failed");
+        } else {
+            ::tracing::info!(writer_path = %writer_path, file_size, "orchestrate_downloads done");
+        }
         orchestrate_result?;
+        writer_result?;
         #[cfg(feature = "resume")]
         {
-            // 下载成功后清理 sidecar，避免下次启动做全量哈希校验
+            // M3-04: 下载成功后清理 sidecar，重试 3 次避免偶发 PermissionDenied/文件占用导致泄漏
             let meta_path = crate::resume::metadata_path_for(Path::new(&writer_path_string));
-            let _ = tokio::fs::remove_file(meta_path).await;
+            let mut attempts = 0;
+            loop {
+                match tokio::fs::remove_file(&meta_path).await {
+                    Ok(_) => {
+                        ::tracing::info!(path = %meta_path.display(), "resume sidecar cleaned after success");
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                        ::tracing::warn!(error = %e, path = %meta_path.display(), "failed to clean resume sidecar (permission denied, not retrying)");
+                        break;
+                    }
+                    Err(e) => {
+                        attempts += 1;
+                        if attempts >= 3 {
+                            ::tracing::error!(error = %e, path = %meta_path.display(), attempts, "failed to clean resume sidecar after 3 retries");
+                            break;
+                        }
+                        ::tracing::warn!(error = %e, path = %meta_path.display(), attempt = attempts, "failed to clean resume sidecar, retrying");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
         }
+        ::tracing::info!(writer_path = %writer_path, "download complete");
         Ok(())
     }
+    #[::tracing::instrument(skip(self, client, writer_path, progress_handler), fields(url = %url, path = %writer_path))]
     async fn streaming_download(
         self,
         client: Client,
@@ -543,6 +687,7 @@ where
         writer_path: FastStr,
         progress_handler: Option<ProgressHandler>,
     ) -> Result<()> {
+        ::tracing::info!(url = %url, path = %writer_path, "streaming_download start (unknown Content-Length, single stream)");
         // 未知 Content-Length 时的流式回退：单流顺序写入，不预分配，不支持 Range/多源
         let (writer_tx, writer_handle) = {
             #[cfg(feature = "resume")]
@@ -557,8 +702,13 @@ where
         let writer_shutdown_tx = writer_tx.clone();
         if let Some(handler) = progress_handler {
             spawn(handler(0, self.info_tx.subscribe()));
+            ::tracing::debug!("streaming progress handler spawned");
         }
-        let resp = client.get(url.as_str()).send().await?.error_for_status()?;
+        let resp = ensure_user_agent(client.get(url.as_str()))
+            .send()
+            .await?
+            .error_for_status()?;
+        ::tracing::debug!(status = %resp.status(), url = %url, "streaming GET response");
         let mut stream = resp.bytes_stream();
         let mut offset = 0u64;
         let mut total_downloaded = 0u64;
@@ -574,10 +724,25 @@ where
                         if len == 0 {
                             continue;
                         }
+                        {
+                            if let Some(ref limiter) = self.global_limiter {
+                                let len = bytes.len() as u32;
+                                if len > 0 {
+                                    let mut rem = len;
+                                    while rem > 0 {
+                                        let batch = std::cmp::min(rem, 64*1024);
+                                        let nz = NonZeroU32::new(batch).unwrap();
+                                        limiter.acquire(nz).await;
+                                        rem -= batch;
+                                    }
+                                }
+                            }
+                        }
                         writer_tx
                             .send(DownloadCmd::WriteFile { offset, data: bytes })
                             .await
                             .map_err(|_| {
+                                ::tracing::error!("streaming writer channel closed");
                                 DownloadError::Io(std::io::Error::new(
                                     std::io::ErrorKind::BrokenPipe,
                                     "writer closed",
@@ -585,6 +750,7 @@ where
                             })?;
                         offset += len;
                         total_downloaded += len;
+                        ::tracing::trace!(offset, len, total_downloaded, "streaming chunk written");
                         let _ = self.info_tx.send(DownloadInfo::ChunkProgress {
                             id: 0,
                             start_byte: 0,
@@ -592,8 +758,14 @@ where
                             downloaded: total_downloaded,
                         });
                     }
-                    Some(Err(e)) => return Err(DownloadError::Request(e)),
-                    None => break,
+                    Some(Err(e)) => {
+                        ::tracing::error!(error = %e, url = %url, "streaming request error");
+                        return Err(DownloadError::Request(e));
+                    },
+                    None => {
+                        ::tracing::info!(total_downloaded, "streaming completed (EOF)");
+                        break;
+                    },
                 },
                 _ = ticker.tick() => {
                     let elapsed = last_tick.elapsed().as_secs_f64();
@@ -604,6 +776,7 @@ where
                     };
                     last_tick = Instant::now();
                     last_downloaded = total_downloaded;
+                    ::tracing::trace!(total_downloaded, speed_kbs = speed/1024.0, "streaming tick");
                     let _ = self.info_tx.send(DownloadInfo::MonitorUpdate {
                         total_size: 0,
                         total_downloaded,
@@ -614,8 +787,16 @@ where
             }
         }
         let _ = writer_shutdown_tx.send(DownloadCmd::TerminateAll).await;
-        let _ = writer_handle.await;
+        let writer_join = writer_handle.await;
+        let writer_result: std::result::Result<(), DownloadError> = match writer_join {
+            Ok(r) => r,
+            Err(e) => Err(DownloadError::Join(e)),
+        };
         let _ = self.cmd_tx.send(DownloadCmd::TerminateAll);
+        if let Err(ref e) = writer_result {
+            ::tracing::error!(error = %e, "streaming writer task failed");
+            return Err(writer_result.unwrap_err());
+        }
         let _ = self.info_tx.send(DownloadInfo::MonitorUpdate {
             total_size: total_downloaded,
             total_downloaded,
@@ -623,11 +804,12 @@ where
             chunk_details: vec![],
         });
         let _ = self.info_tx.send(DownloadInfo::DownloadComplete(0));
+        ::tracing::info!(total_downloaded, path = %writer_path, "streaming_download complete");
         Ok(())
     }
 
-
     #[allow(clippy::too_many_arguments)]
+    #[::tracing::instrument(skip(self, writer_tx, client, multi_runtime), fields(file_size = file_size, support_ranges = support_ranges, workers = workers, completed_bytes = completed_bytes))]
     async fn orchestrate_downloads(
         &self,
         file_size: u64,
@@ -644,12 +826,30 @@ where
         let next_chunk_id = AtomicU64::new(0);
 
         let workers = if !support_ranges || workers == 1 || file_size < MIN_PARALLEL_FILE_SIZE {
+            ::tracing::info!(
+                support_ranges,
+                file_size,
+                workers,
+                "downgrade to single worker"
+            );
             1
         } else {
             workers
         };
+        ::tracing::debug!(
+            effective_workers = workers,
+            file_size,
+            support_ranges,
+            mode = if multi_runtime.is_some() {
+                "multi"
+            } else {
+                "single"
+            },
+            "effective workers"
+        );
 
         let initial_ranges = split_resume_ranges(resume_ranges, workers, multi_runtime.is_some());
+        ::tracing::debug!(initial_ranges = ?initial_ranges, "initial ranges after split");
         let mut pending_initial = Vec::new();
         let mut initial_lanes = Vec::new();
         // 预先创建 monitor 以便缓冲因 lane 容量不足而暂缓的初始区间
@@ -659,25 +859,37 @@ where
             self.update_interval,
             workers,
         );
+        {
+            // 全局限速：若多源已配置全局，则优先多源，否则用 Builder 全局
+            let global_for_monitor = multi_runtime.as_ref().and_then(|r| r.global_limiter()).or_else(|| self.global_limiter.clone());
+            monitor = monitor.with_rate_limit(global_for_monitor);
+        }
         for (start_byte, end_byte) in initial_ranges {
-            let (lane_id, rb) = if let Some(runtime) = multi_runtime.as_mut() {
+            let (lane_id_opt, rb, per_source, global) = if let Some(runtime) = multi_runtime.as_mut() {
                 match runtime.claim_request_builder() {
-                    Some((lane_id, rb)) => (Some(lane_id), rb),
+                    Some((lane_id, rb)) => {
+                        let per = runtime.limiter_for_lane(lane_id.as_str());
+                        let glob = runtime.global_limiter().or_else(|| self.global_limiter.clone());
+                        (Some(lane_id), rb, per, glob)
+                    },
                     None => {
-                        eprintln!(
-                            "[Downloader] lane 容量不足，缓冲初始区间 {start_byte}-{end_byte}"
+                        ::tracing::warn!(
+                            start_byte,
+                            end_byte,
+                            "lane capacity insufficient, buffering initial range"
                         );
                         pending_initial.push((start_byte, end_byte));
                         continue;
                     }
                 }
             } else {
-                (None, client.get(download_url.as_str()))
+                (None, client.get(download_url.as_str()), None, self.global_limiter.clone())
             };
             let id = next_chunk_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if let Some(lane_id) = lane_id {
-                initial_lanes.push((id, lane_id));
+            if let Some(ref lane_id) = lane_id_opt {
+                initial_lanes.push((id, lane_id.clone()));
             }
+            ::tracing::debug!(chunk_id = id, start_byte, end_byte, per_limited = per_source.is_some(), global_limited = global.is_some(), "spawn initial chunk");
             let task = chunk_run(
                 id,
                 writer_tx.clone(),
@@ -686,9 +898,17 @@ where
                 rb,
                 start_byte,
                 end_byte,
+                global,
+                per_source,
             );
             tasks.push(spawn(task));
         }
+        ::tracing::debug!(
+            initial_tasks = tasks.len(),
+            pending_initial = ?pending_initial,
+            next_id = next_chunk_id.load(std::sync::atomic::Ordering::SeqCst),
+            "spawned initial tasks"
+        );
         // 将缓冲的初始区间移入 monitor 的 pending 队列，待 tick 时按容量逐步调度
         monitor.pending_bisects.extend(pending_initial);
 
@@ -722,11 +942,10 @@ impl Downloader<fn() -> ClientBuilder> {
 fn split_resume_ranges(
     ranges: Vec<(u64, u64)>,
     workers: u64,
-    split_for_multi_source: bool,
+    _split_for_multi_source: bool,
 ) -> Vec<(u64, u64)> {
-    if !split_for_multi_source {
-        return ranges;
-    }
+    // M3-03 单源统一分裂：移除 multi_source 独占守卫，统一按 workers 与 support_ranges（已在 workers 降级前判断）决定分裂
+    // 保留参量兼容旧调用，实际分裂仅受 workers 与碎片阈值控制，已通过上层 workers==1 降级保证非 Range 不分裂
     let target = workers.max(1) as usize;
     let mut ranges = ranges;
 

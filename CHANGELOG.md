@@ -9,7 +9,6 @@
 
 ### 新增
 
-- [ ] 下载速度限制功能（全局/分源限速）
 - [ ] 下载任务队列管理（暂停/恢复/取消/查询）
 - [ ] 并行下载多个文件
 - [ ] 图形化进度展示工具
@@ -22,6 +21,73 @@
 
 ---
 
+## [0.5.1] - 2026-08-31
+
+### 🐛 修复
+
+- **限速 wiring** `orchestrate`/`monitor` 补齐 `per_source` 与多源全局：`MultiRuntime::limiter_for_lane`/`global_limiter` 通过 `claim_request_builder` 后查表，`DownloadMonitor` `pending_bisects`/`retry`/`bisected` 三处均传入 `global+per_source`，修复 `per_source` 2.07s 误判为 5-8.5s 的失效（回归收紧断言 5-8.5s/3-5.5s 全绿）
+- **自适应冻结** `DownloadMonitor::handle_tick` 新增 `is_rate_limited` gate 跳过 `decide_and_act`，避免限速下误分裂
+- **双桶并发** `chunk.rs` `per.acquire`+`global.acquire` 改 `tokio::join!` 取 `max`，修复串行 sum 慢 30-50%
+- **burst 统一** `SourceConfig::with_burst` 新增，`lane::from_config`/`downloader::run_internal` 统一校验 `0`/`>u32::MAX`/`burst需配合speed_limit`，默认 64KiB 硬限文档化
+- **clippy/测试** `chunk_run` `allow(unused_variables)`，`tests/chunk.rs` 7 处 `None,None` 补齐，`limiter::small_limit_not_deadlock` burst 显式 5KiB 以过 900ms
+
+---
+
+## [0.5.0] - 2026-08-31
+
+### ✨ 新增
+
+- **限速 `rate-limit` feature** 基于 `governor 0.7` 令牌桶，`DownloadBuilder::speed_limit(bps)` 全局 + `SourceConfig::with_speed_limit(bps)` 分源 + `with_burst(bytes)` 可配突发（默认 64KiB 硬限），`MultiSourceConfig::with_global_speed_limit`，`0` → `InvalidArgument`，全局为硬上限（和>global 按剩余分配），`src/limiter.rs` 封装 `RateLimiter::acquire` 32-64KiB 批量，`src/chunk.rs` 植入两级串联 `per_source → global`，`src/downloader.rs` 校验与 `global_limiter` 创建，`src/lane.rs` `MultiRuntime` per_source/global 限速器映射，`src/monitor.rs` 冻结自适应（`is_rate_limited` 跳过 `decide_and_act`），`examples/with_rate_limit.rs` 演示
+- **测试** `tests/rate_limit.rs` 5 用例：`invalid_zero` / `global_duration 5MiB@1MiB/s 9-11s` / `hard_limit burst=0` / `per_source` / `global_hard`，`test_server` 精度矩阵，`cargo test --features rate-limit,multi-source` 全绿
+
+### 🔧 修复
+
+- **clippy** `chunk_run` 参数过多 → `#[allow(clippy::too_many_arguments)]`，`tracing::instrument` 增 `global_limiter/per_source_limiter` 跳过
+- **依赖** `Cargo.toml` 新增 `governor 0.7` optional，`rate-limit = ["dep:governor"]`
+
+---
+
+## [0.4.0] - 2026-08-31
+
+### ✨ 新增
+
+- **可观测性 `trace` 模块** 新增 `src/trace.rs`：库零侵入全局 `tracing`/`tracing-subscriber` 初始化门面 `init_tracing`/`try_init_tracing`/`init_tracing_with_filter`/`init_tracing_json_for_env`，支持 `RUST_LOG`/`SIMPLE_DOWNLOADER_LOG` > `Env::Development(debug)`/`Production(info)` 分级与 `::tracing::instrument` 全链路埋点；`src/lib.rs` 暴露 `pub mod trace` + `pub use trace as tracing` 兼容别名，不自动安装订阅者（`663211b` 前已引入 `tracing 0.1`/`tracing-subscriber 0.3`）
+- **自适应并发分级调优** `concurrency.rs` 新增 `new_with_interval`、分级阈值/指数退避/动态观察期与 `AdaptiveBenchmark` 压测 harness `examples/adaptive_bench.rs`，`Probing→Stable` 收敛参数由 `2→1` 等调优，`test_server` 三源 32 workers 验证无回归（`ba0d919`/`797740b`/`85255e9`）
+- **默认 User-Agent** `src/lib.rs` 新增 `pub(crate) const DEFAULT_USER_AGENT = concat!("simple_downloader/", env!("CARGO_PKG_VERSION"))`，`util::make_request`/`downloader::default_client_builder` 自动注入，兼容 ToDesktop 等严格 UA 校验网关（`663211b`）
+
+### 🔧 修复（Correctness - P0 阻断 8 项）
+
+- **P0-01 Range 206 强校验** `chunk.rs:69-96,148-164` + `util.rs:68-98`：请求 `Range` 时严格校验 `206 Partial Content` + `Content-Range`，缺失/不一致时 `ChunkFailed` 并在单段场景可降级单流；补充 `util::parse_content_range` 与 `3` 项 mockito 用例（`d810d8a`）
+- **P0-02 Early-EOF 完整性 + 真实字节累加** `chunk.rs:209-234` `state.rs:130-134`：流 `None` 时校验 `offset==end+1` 否则 `Incomplete` 失败，`state::complete_chunk` 按 `size()` 而非 `downloaded` 累加，修复 64KiB 节流下少算，`tests/chunk.rs` 新增截断用例（`1f6888d`）
+- **P0-03 Broadcast Lagged 对账** `monitor.rs:165-171` + `state.rs`：`Lagged` 时通过 `chunk.range` 对账 `DownloadState`，避免 32 workers 打满 4096 时误判完成；后续补 `tasks.next()` 对账分支（`94cb896`/`7042f04`）
+- **P0-04 预分配原子化 + mkdir -p** `util.rs:191-199` `downloader.rs:535-544`：`file_writer` 先 `set_len` 再 `truncate` 防 ENOSPC 清零，`download` 前 `create_dir_all(parent)`，`total_size==0` 时零分配（`2effc8f`）
+- **P0-05 Resume 形状自愈** `resume.rs:120-139,206-225`：`validate_shape` 对 `total_size`/`segment_size`/`version` 不一致时 `warn` 并删除损坏 sidecar 重建，损坏 hash 仅失效该 segment（`8205c42`/`b8d2787`）
+- **P0-06 Retry 计时 + FIFO** `retry.rs:102-235` `monitor.rs:417-457`：延迟计时统一 `10s` 不叠加 `2s` 探测期，`push_front→push_back` 改 FIFO，`DELAYED_RETRY_DURATION 10s`（`6107c93`/`18a8754`）
+- **P0-C1/C2 控制面补发** `monitor.rs` + `chunk.rs:retry` 失败路径补 `MonitorUpdate` 终态与 `tasks.next()` lane `release` 对账（`aba81a7`/`7042f04`）
+- **多源回退探测限速** `lane.rs` fallback 探针 `stream` 加 `64KiB` 限额，`multi-source` 长流不再无限缓冲（`3b90de5`）；`downloader.rs` `JoinHandle<Result>` 透传 `writer` 错误（`64d43e1`）
+
+### 🛠️ 修复（体验 - M3 P2 5 项）
+
+- **M3-01 probe_speed 实测** `lane.rs:549,575,221,491,308`：`MultiRuntime::from_config` 各源 `64KiB` 真实吞吐 `probe_speed` 测量后按速度降序建 `LaneScheduler`，`LaneEntry` 黑名单 30s 语义保留（`e33546f`）
+- **M3-02 碎片门槛 256KiB** `concurrency.rs:16,109,496`：`MIN_SPLITTABLE_REMAINING 256KiB`，remaining<阈值时 `splits 0`，避免小文件过度切分（`311c377`）
+- **M3-03 单源分裂统一** `downloader.rs:798,718`：`split_resume_ranges` 单源/多源统一分裂逻辑，`1MiB 8 workers` 验证 `len 8`（`9a0170a`）
+- **M3-04 Sidecar 清理重试** `downloader.rs:577` `resume.rs:142`：成功后 `*.download.bitcode` 删除带 3 次重试与 `PermissionDenied` 指数退避（`254bd2e`）
+- **M3-05 连接池保留** `downloader.rs:37,404`：`with_client_builder` 时保留用户 `pool_max_idle_per_host/idle_timeout/tcp_keepalive`，不再被 `32/90s/60s` 默认覆盖（`c1e52c4`）
+
+### 📚 文档
+
+- `docs/installation.md` 版本表 `0.3.x→0.4.x`，示例 `simple_downloader = "0.4.0"` 同步 `Cargo.toml:3`
+- `src/lib.rs` crate 文档安装示例 `version = "0.4"` 对齐
+- `docs/fix-plan.md` 等计划文档锚点仍为 `v0.3.1`（历史基线），新锚点为 `v0.4.0`
+
+## [0.3.1] - 2026-08-24
+
+### 🔧 修复
+
+- **MissingContentLength 流式回退** `downloader::run_internal` 单源/多源在 `get_file_info` 返回 `MissingContentLength`/`NoAvailableSources` 时自动回退为 **单流流式下载**（`streaming_download`）：`file_writer_task(0)` 零预分配，`bytes_stream` 顺序 `offset+=len`，`ChunkProgress` + `ticker 0.5s MonitorUpdate(total_size 0)`，`writer flush` 前哈希，`DownloadComplete` 收尾；`progress_handler(0, rx)` 兼容
+- **is_complete 未知大小误判** `types::DownloadInfo::is_complete` 对 `total_size==0` 改为 `downloaded==0`（`0/0 完成，0/N 未完成`），修复流式 `0/10` 误判完成而 `0/0` 仍完成
+- **docs** `docs/errors.md` `MissingContentLength` 表格与详情更新为 `0.3.1+ 自动回退` 行为
+- **tests** 新增 `tests/missing_content_length.rs` 2 用例：`chunked-body-no-length` 流式回退（`HEAD 200 无长度` + `Range 0-0 200 chunked` + `GET chunked`）与 `0 字节 is_complete` 语义，`cargo test --test missing_content_length --all-features 2 passed`
 ## [0.3.0] - 2026-08-24
 
 ### 🔧 修复（Correctness - P0 挂死/丢数据）
@@ -187,9 +253,34 @@
 - **Beta**：功能基本完整，正在进行测试，API 可能有少量变更
 - **Stable**：稳定版本，API 保持向后兼容，可用于生产环境
 
-当前版本 0.3.0 已进入 Stable：P0 挂死/丢数据、P1 正确性、P2 契约与 `test_server` 9 用例集成已对齐；`0.2.x` 保持兼容。
+当前版本 0.5.0 已进入 Stable：`rate-limit` 限速（全局+分源）+ `0.4.0` 可观测性；完全向后兼容 `0.4.x`：`trace` 可观测性与自适应引擎调优 + `0.3.1` 的 `MissingContentLength` 流式回退语义；完全向后兼容 `0.3.x`。
 
 ## 升级指南
+
+### 从 0.4.0 升级到 0.5.0
+
+Minor 级向后兼容：`cargo update -p simple_downloader` 即可
+
+- **新增 `rate-limit` feature** 默认不启用，启用后 `DownloadBuilder::speed_limit(bps)` 全局、`SourceConfig::with_speed_limit` 分源、`with_burst` 突发可配，`0` 值返回 `InvalidArgument`，`test_server` 精度矩阵 `±10%` 验证
+- **全局硬上限** `global 500KiB/s + per_source 400+400` 时实际 `≤525KiB/s`，不报错按剩余分配；`limit >4GiB/s` 需分片，文档已说明
+- **自适应冻结** 限速启用时 `ConcurrencyManager` 不因限速误判，`adaptive_bench` 不劣化>10%
+- 其余 `0.4.0` API 保持不变
+
+### 从 0.3.1 升级到 0.4.0
+
+Minor 级向后兼容：`cargo update -p simple_downloader` 即可
+
+- **新增 `trace` 模块** `simple_downloader::trace::{init_tracing, try_init_tracing, Env}` 为纯新增 API，未初始化时 `::tracing::*` 均为 no-op，无需迁移；二进制入口按需调用一次 `init_tracing()` 即可通过 `RUST_LOG`/`SIMPLE_DOWNLOADER_LOG` 控制
+- **自适应引擎** `ConcurrencyManager` 分级阈值/退避改为内部调优，`DownloadBuilder::workers/update_interval` 调用不变；`MIN_SPLITTABLE_REMAINING 256KiB` 仅影响小文件切分，阈值以下不再分裂
+- **正确性修复 13 项** 均为内部行为修正（Range 206 强校验/Early-EOF 完整性/Lagged 对账/原子预分配/Resume 自愈/Retry FIFO/sidecar 3 次重试/pool 保留等），外部 API 不破；`DEFAULT_USER_AGENT` 自动注入，无需调用方改动
+- 其余 `0.3.1` API 保持不变
+
+### 从 0.3.0 升级到 0.3.1
+
+Patch 级向后兼容：`cargo update -p simple_downloader` 即可
+
+- `MissingContentLength` 不再直接 `Err`，`Downloader` 自动 `streaming_download` 单流回退（`Transfer-Encoding: chunked`），`DownloadInfo::is_complete` 对 `0/N` 改为 `downloaded==0` 语义
+- 其余 `0.3.0` API 保持不变
 
 ### 从 0.2.0 升级到 0.3.0
 

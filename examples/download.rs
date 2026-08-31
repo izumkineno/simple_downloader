@@ -1,5 +1,8 @@
 #[tokio::main]
 async fn main() {
+    // 初始化 tracing：默认 Development=debug / Production=info，可通过 RUST_LOG / SIMPLE_DOWNLOADER_LOG 覆盖
+    // 例如：RUST_LOG=simple_downloader=debug,reqwest=warn cargo run --example download
+    simple_downloader::trace::init_tracing();
     // 使用公开稳定的测试文件；如需替换为私有源，请改此 URL 与保存路径
     let url = std::env::var("DOWNLOAD_URL")
         .unwrap_or_else(|_| "https://proof.ovh.net/files/10Mio.dat".to_string());

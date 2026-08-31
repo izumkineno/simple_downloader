@@ -138,9 +138,12 @@ impl ResumeMetadata {
         Ok(())
     }
 
+    #[::tracing::instrument(skip(self, output_path), fields(file_size = self.file_size, segments = self.segments.len()))]
     fn verify_against_file(&mut self, output_path: &Path) -> Result<()> {
         let mut file = fs::File::open(output_path)?;
         let file_len = file.metadata()?.len();
+        let mut invalid = 0usize;
+        let mut verified = 0usize;
         let mut buf = Vec::new();
         for segment in &mut self.segments {
             let Some(expected_hash) = segment.hash else {
@@ -148,15 +151,21 @@ impl ResumeMetadata {
             };
             if file_len <= segment.end {
                 segment.hash = None;
+                invalid += 1;
                 continue;
             }
             buf.resize(segment.len() as usize, 0);
             file.seek(SeekFrom::Start(segment.start))?;
             file.read_exact(&mut buf)?;
             if hash_bytes(&buf) != expected_hash {
+                ::tracing::warn!(start = segment.start, end = segment.end, "resume segment hash mismatch, discarding");
                 segment.hash = None;
+                invalid += 1;
+            } else {
+                verified += 1;
             }
         }
+        ::tracing::info!(verified, invalid, file_len, "resume verify_against_file done");
         Ok(())
     }
 }
@@ -171,10 +180,12 @@ pub struct ResumePlan {
 }
 
 impl ResumePlan {
+    #[::tracing::instrument(skip(output_path), fields(path = %output_path.display(), file_size = file_size, enabled = enabled))]
     pub fn prepare(output_path: &Path, file_size: u64, enabled: bool) -> Result<Self> {
         let metadata_path = metadata_path_for(output_path);
         if !enabled {
             let _ = fs::remove_file(&metadata_path);
+            ::tracing::info!(path = %metadata_path.display(), "resume disabled, removed sidecar if existed");
             return Ok(Self {
                 metadata_path,
                 metadata: None,
@@ -186,15 +197,56 @@ impl ResumePlan {
 
         if metadata_path.exists() {
             if !output_path.exists() {
+                ::tracing::error!(path = %output_path.display(), meta = %metadata_path.display(), "resume metadata exists but target file missing");
                 return Err(DownloadError::ResumeTargetMissing(
                     output_path.to_path_buf(),
                 ));
             }
 
-            let mut metadata = ResumeMetadata::load(&metadata_path)?;
-            metadata.validate_shape(file_size)?;
+            let mut metadata = match ResumeMetadata::load(&metadata_path) {
+                Ok(m) => m,
+                Err(e) => {
+                    ::tracing::warn!(error=%e, path=%metadata_path.display(), "resume metadata corrupted, discarding sidecar and rebuilding");
+                    let _ = fs::remove_file(&metadata_path);
+                    let metadata = ResumeMetadata::new(file_size, DEFAULT_SEGMENT_SIZE);
+                    if let Err(save_err) = metadata.save_atomic(&metadata_path) {
+                        ::tracing::warn!(error=%save_err, path=%metadata_path.display(), "rebuild resume metadata save failed");
+                    }
+                    ::tracing::info!(path=%metadata_path.display(), file_size, "rebuilt resume plan after corrupted sidecar");
+                    return Ok(Self {
+                        metadata_path,
+                        metadata: Some(metadata),
+                        truncate_output: true,
+                        remaining_ranges: full_ranges(file_size),
+                        completed_bytes: 0,
+                    });
+                }
+            };
+            ::tracing::debug!(path = %metadata_path.display(), segments = metadata.segments.len(), "loaded resume metadata");
+            if let Err(e) = metadata.validate_shape(file_size) {
+                ::tracing::warn!(error=%e, path=%metadata_path.display(), "resume shape mismatch, discarding sidecar and rebuilding");
+                let _ = fs::remove_file(&metadata_path);
+                let metadata = ResumeMetadata::new(file_size, DEFAULT_SEGMENT_SIZE);
+                if let Err(save_err) = metadata.save_atomic(&metadata_path) {
+                    ::tracing::warn!(error=%save_err, path=%metadata_path.display(), "rebuild resume metadata save failed");
+                }
+                ::tracing::info!(path=%metadata_path.display(), file_size, "rebuilt resume plan after shape mismatch (full download)");
+                return Ok(Self {
+                    metadata_path,
+                    metadata: Some(metadata),
+                    truncate_output: true,
+                    remaining_ranges: full_ranges(file_size),
+                    completed_bytes: 0,
+                });
+            }
             metadata.verify_against_file(output_path)?;
             metadata.save_atomic(&metadata_path)?;
+            ::tracing::info!(
+                path = %metadata_path.display(),
+                completed = metadata.completed_bytes(),
+                remaining_ranges = metadata.remaining_ranges().len(),
+                "resume plan from existing metadata"
+            );
 
             let remaining_ranges = metadata.remaining_ranges();
             let completed_bytes = metadata.completed_bytes();
@@ -209,8 +261,11 @@ impl ResumePlan {
         let metadata = ResumeMetadata::new(file_size, DEFAULT_SEGMENT_SIZE);
         // 立即落盘，确保 <64KiB 内中断也能恢复；失败不阻断下载，仅记录错误
         if let Err(error) = metadata.save_atomic(&metadata_path) {
-            eprintln!("[Resume] 初始元数据落盘失败: {error}");
+            ::tracing::warn!(error = %error, path = %metadata_path.display(), "initial resume metadata save failed");
+        } else {
+            ::tracing::debug!(path = %metadata_path.display(), file_size, "initial resume metadata saved");
         }
+        ::tracing::info!(path = %metadata_path.display(), file_size, "new resume plan (full download)");
         Ok(Self {
             metadata_path,
             metadata: Some(metadata),
@@ -226,21 +281,31 @@ impl ResumePlan {
         file_size: u64,
         enabled: bool,
     ) -> Result<Self> {
-        tokio::task::spawn_blocking(move || Self::prepare(&output_path, file_size, enabled))
+        let path_clone = output_path.clone();
+        ::tracing::debug!(path = %path_clone.display(), file_size, enabled, "resume prepare_async start");
+        let res = tokio::task::spawn_blocking(move || Self::prepare(&output_path, file_size, enabled))
             .await
             .unwrap_or_else(|e| {
                 Err(DownloadError::ResumeMetadata(format!(
                     "resume prepare panicked: {e}"
                 )))
-            })
+            });
+        match &res {
+            Ok(plan) => ::tracing::info!(path = %path_clone.display(), completed = plan.completed_bytes, remaining = plan.remaining_ranges.len(), truncate = plan.truncate_output, "resume prepare_async done"),
+            Err(e) => ::tracing::error!(path = %path_clone.display(), error = %e, "resume prepare_async failed"),
+        }
+        res
     }
 
     pub fn into_recorder(self) -> Option<ResumeRecorder> {
+        let has_metadata = self.metadata.is_some();
+        ::tracing::debug!(has_metadata, completed = self.completed_bytes, "into_recorder");
         self.metadata
             .map(|metadata| ResumeRecorder::new(self.metadata_path, metadata))
     }
 }
 
+#[derive(Debug)]
 pub struct ResumeRecorder {
     metadata_path: PathBuf,
     metadata: ResumeMetadata,
@@ -262,6 +327,7 @@ impl ResumeRecorder {
                 }
             })
             .collect();
+        ::tracing::debug!(path = %metadata_path.display(), segments = metadata.segments.len(), completed = metadata.completed_bytes(), "ResumeRecorder created");
         Self {
             metadata_path,
             metadata,
@@ -271,6 +337,7 @@ impl ResumeRecorder {
         }
     }
 
+    #[::tracing::instrument(skip(self, file), fields(offset = offset, len = len, pending = self.pending_segments))]
     pub async fn record_write(&mut self, file: &mut File, offset: u64, len: u64) -> Result<()> {
         if len == 0 || self.metadata.file_size == 0 {
             return Ok(());
@@ -284,14 +351,18 @@ impl ResumeRecorder {
                 continue;
             }
             let segment = &self.metadata.segments[index];
-            let overlap_start = write_start.max(segment.start);
-            let overlap_end = write_end.min(segment.end);
+            let seg_start = segment.start;
+            let seg_end = segment.end;
+            let seg_len = segment.len();
+            let overlap_start = write_start.max(seg_start);
+            let overlap_end = write_end.min(seg_end);
             add_covered_range(&mut self.covered_ranges[index], overlap_start, overlap_end);
 
-            if covers_segment(&self.covered_ranges[index], segment.start, segment.end) {
-                let bytes = read_segment(file, segment.start, segment.len()).await?;
+            if covers_segment(&self.covered_ranges[index], seg_start, seg_end) {
+                let bytes = read_segment(file, seg_start, seg_len).await?;
                 self.metadata.segments[index].hash = Some(hash_bytes(&bytes));
                 newly_completed += 1;
+                ::tracing::trace!(segment = index, start = seg_start, end = seg_end, "segment completed and hashed");
             }
         }
 
@@ -299,8 +370,10 @@ impl ResumeRecorder {
             self.pending_segments += newly_completed;
             let should_flush =
                 self.pending_segments >= 16 || self.last_save.elapsed() >= Duration::from_secs(1);
+            ::tracing::debug!(newly_completed, pending = self.pending_segments, should_flush, "record_write segment progress");
             if should_flush {
                 self.metadata.save_atomic_async(&self.metadata_path).await?;
+                ::tracing::info!(pending = self.pending_segments, path = %self.metadata_path.display(), "resume metadata flushed");
                 self.pending_segments = 0;
                 self.last_save = Instant::now();
             }
@@ -311,6 +384,7 @@ impl ResumeRecorder {
     /// 强制落盘，供 writer 退出前调用以避免最后 1MiB 窗口丢失（当前 downloader 成功后会删除 sidecar，失败/中断场景下保证最多丢 16 段）
     pub async fn flush(&mut self) -> Result<()> {
         if self.pending_segments > 0 {
+            ::tracing::info!(pending = self.pending_segments, path = %self.metadata_path.display(), "resume recorder final flush");
             self.metadata.save_atomic_async(&self.metadata_path).await?;
             self.pending_segments = 0;
             self.last_save = Instant::now();
@@ -428,5 +502,51 @@ mod tests {
     fn hash_is_stable() {
         assert_eq!(hash_bytes(b"abc"), hash_bytes(b"abc"));
         assert_ne!(hash_bytes(b"abc"), hash_bytes(b"abd"));
+    }
+
+    #[test]
+    fn prepare_self_heals_on_file_size_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out.bin");
+        std::fs::write(&out, vec![0u8; 10]).unwrap();
+        let old_size = 1024 * 1024;
+        let new_size = 2 * 1024 * 1024;
+        let meta = ResumeMetadata::new(old_size, DEFAULT_SEGMENT_SIZE);
+        let meta_path = metadata_path_for(&out);
+        meta.save_atomic(&meta_path).unwrap();
+        let plan = ResumePlan::prepare(&out, new_size, true).unwrap();
+        assert!(plan.truncate_output);
+        assert_eq!(plan.remaining_ranges, vec![(0, new_size - 1)]);
+        assert_eq!(plan.completed_bytes, 0);
+        let rebuilt = ResumeMetadata::load(&meta_path).unwrap();
+        assert_eq!(rebuilt.file_size, new_size);
+    }
+
+    #[test]
+    fn prepare_self_heals_on_version_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out2.bin");
+        std::fs::write(&out, vec![0u8; 10]).unwrap();
+        let mut meta = ResumeMetadata::new(1024 * 1024, DEFAULT_SEGMENT_SIZE);
+        meta.version = 999;
+        let meta_path = metadata_path_for(&out);
+        meta.save_atomic(&meta_path).unwrap();
+        let plan = ResumePlan::prepare(&out, 1024 * 1024, true).unwrap();
+        assert!(plan.truncate_output);
+        assert_eq!(plan.completed_bytes, 0);
+    }
+
+    #[test]
+    fn prepare_self_heals_on_corrupted_bitcode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out3.bin");
+        std::fs::write(&out, vec![0u8; 10]).unwrap();
+        let meta_path = metadata_path_for(&out);
+        std::fs::write(&meta_path, b"corrupted").unwrap();
+        let res = ResumePlan::prepare(&out, 1024, true);
+        assert!(res.is_ok());
+        let plan = res.unwrap();
+        assert!(plan.truncate_output);
+        assert_eq!(plan.completed_bytes, 0);
     }
 }

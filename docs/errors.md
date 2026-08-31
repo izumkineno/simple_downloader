@@ -147,7 +147,7 @@ match result {
 
 **错误信息**：`无法从服务器响应头中获取文件大小 (Content-Length)`
 
-**行为变更（0.3.0+）**：`Downloader` 在 `HEAD` 与 `Range 0-0` 均无法获取大小时，不再直接返回 `Err(MissingContentLength)`，而是自动回退为 **单流流式下载**（`Transfer-Encoding: chunked` 场景），顺序写入、不预分配、不支持 Range/多源/断点续传，下载成功即视为完成。仅当流式 `GET` 亦失败时才透出该错误。
+**行为变更（0.3.1+）**：`Downloader` 在 `HEAD` 与 `Range 0-0` 均无法获取大小时，不再直接返回 `Err(MissingContentLength)`，而是自动回退为 **单流流式下载**（`Transfer-Encoding: chunked` 场景），顺序写入、不预分配、不支持 Range/多源/断点续传，下载成功即视为完成。仅当流式 `GET` 亦失败时才透出该错误。
 
 **可能原因**：
 - 服务器不返回 Content-Length 响应头
@@ -156,7 +156,7 @@ match result {
 - 服务器配置错误或使用了反向代理丢失了头信息
 
 **处理建议**：
-自 0.3.0 起无需特殊处理，`Downloader::builder(url, path).download().await` 会自动流式回退；如需禁用回退或自定义，可捕获该错误后自行处理：
+自 0.3.1 起无需特殊处理，`Downloader::builder(url, path).download().await` 会自动流式回退；如需禁用回退或自定义，可捕获该错误后自行处理：
 ```rust
 match Downloader::builder("https://example.com/stream", "out.bin").download().await {
     Err(simple_downloader::DownloadError::MissingContentLength) => {
@@ -167,7 +167,7 @@ match Downloader::builder("https://example.com/stream", "out.bin").download().aw
 ```
 
 **重试策略**：
-- ✅ 0.3.0+ 自动流式回退，无需重试；若仍返回该错误，说明 HEAD、Range 探测与流式 GET 均失败，需检查网络/链接
+- ✅ 0.3.1+ 自动流式回退，无需重试；若仍返回该错误，说明 HEAD、Range 探测与流式 GET 均失败，需检查网络/链接
 
 ---
 

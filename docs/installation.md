@@ -24,13 +24,13 @@ rustup update
 
 ```toml
 [dependencies]
-simple_downloader = "0.3.0"
+simple_downloader = "0.5.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
 此时可用 `Downloader::builder(url, path).download().await`，未启用 `resume/progress/multi-source/proxy`。
 
-> `simple_downloader = "0.3.0"` **不会** 默认启用任何可选功能，旧文“默认启用所有”已过时。
+> `simple_downloader = "0.5.1"` **不会** 默认启用任何可选功能，旧文“默认启用所有”已过时。
 
 ## 自定义 Feature 安装
 
@@ -45,13 +45,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 ```toml
 # 最小（仅基础）
-simple_downloader = { version = "0.3", default-features = false }
+simple_downloader = { version = "0.5", default-features = false }
 
 # 常用：基础 + 断点续传 + 进度
-simple_downloader = { version = "0.3", default-features = false, features = ["resume","progress"] }
+simple_downloader = { version = "0.5", default-features = false, features = ["resume","progress"] }
 
 # 全功能
-simple_downloader = { version = "0.3", default-features = false, features = ["resume","progress","multi-source","proxy"] }
+simple_downloader = { version = "0.5", default-features = false, features = ["resume","progress","multi-source","proxy"] }
 ```
 
 不存在 `full`/`vendored-openssl` feature，勿使用。
@@ -91,7 +91,7 @@ cargo new test_download && cd test_download
 
 ```toml
 [dependencies]
-simple_downloader = { version = "0.3", default-features = false }
+simple_downloader = { version = "0.5", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread","macros"] }
 ```
 
@@ -115,10 +115,10 @@ async fn main() {
 cargo run
 ```
 
-## 版本兼容性
-
 | simple_downloader | 最低 Rust | 关键依赖 |
 |-------------------|-----------|----------|
+| 0.5.x | 1.85 | `tokio 1.52` `reqwest 0.13` `thiserror 2` `bytes 1` `faststr 0.2` `futures-util 0.3` `bitcode 0.6` (resume) `tracing 0.1` `tracing-subscriber 0.3` |
+| 0.4.x | 1.85 | `tokio 1.52` `reqwest 0.13` `thiserror 2` `bytes 1` `faststr 0.2` `futures-util 0.3` `bitcode 0.6` (resume) `tracing 0.1` `tracing-subscriber 0.3` |
 | 0.3.x | 1.85 | `tokio 1.52` `reqwest 0.13` `thiserror 2` `bytes 1` `faststr 0.2` `futures-util 0.3` `bitcode 0.6` (resume) |
 | 0.2.x | 1.85 | 同 0.3.x，逻辑加固与测试补齐 |
 | 0.1.x | 1.85 | 同 0.2.x，API 兼容，仅性能与文档差异 |

@@ -1,11 +1,13 @@
+use crate::limiter::RateLimiter;
 use crate::types::{DownloadError, Result};
-use crate::util::get_file_info;
+use crate::util::{ensure_user_agent, get_file_info};
 use faststr::FastStr;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 #[cfg(feature = "proxy")]
 use reqwest::Proxy;
 use reqwest::{Client, ClientBuilder};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 const BLACKLIST_THRESHOLD: u32 = 3;
 const BLACKLIST_DURATION: Duration = Duration::from_secs(30);
@@ -112,6 +114,11 @@ pub struct SourceConfig {
     /// 该源绑定的代理列表（需 `proxy` feature）
     #[cfg(feature = "proxy")]
     pub proxies: Vec<ProxyConfig>,
+    /// 该源限速（bytes/s），`rate-limit` feature 生效
+    pub speed_limit: Option<u64>,
+    /// 该源突发（bytes），`rate-limit` feature 生效
+    #[cfg(feature = "rate-limit")]
+    pub burst: Option<u64>,
 }
 
 impl SourceConfig {
@@ -124,12 +131,29 @@ impl SourceConfig {
             url,
             #[cfg(feature = "proxy")]
             proxies: Vec::new(),
+            speed_limit: None,
+            #[cfg(feature = "rate-limit")]
+            burst: None,
         }
     }
 
     /// 覆盖源 `id`（用于日志/统计辨识）。
     pub fn with_id(mut self, id: impl Into<FastStr>) -> Self {
         self.id = id.into();
+        self
+    }
+
+    /// 设置该源限速（bytes/s），`rate-limit` 生效。`0` 将在下载时返回 `InvalidArgument`。
+    #[cfg(feature = "rate-limit")]
+    pub fn with_speed_limit(mut self, bytes_per_sec: u64) -> Self {
+        self.speed_limit = Some(bytes_per_sec);
+        self
+    }
+
+    /// 设置该源突发容量（bytes），`rate-limit` 生效。默认 64KiB。
+    #[cfg(feature = "rate-limit")]
+    pub fn with_burst(mut self, burst_bytes: u64) -> Self {
+        self.burst = Some(burst_bytes);
         self
     }
 
@@ -172,6 +196,10 @@ pub struct MultiSourceConfig {
     pub max_chunks_per_lane: usize,
     /// 每个源最大并发 chunk 数（`None` 不限）
     pub max_chunks_per_source: Option<usize>,
+    /// 全局限速（bytes/s），`rate-limit` 生效
+    pub global_speed_limit: Option<u64>,
+    /// 全局突发（bytes），`rate-limit` 生效
+    pub global_burst: Option<u64>,
 }
 
 impl MultiSourceConfig {
@@ -185,6 +213,8 @@ impl MultiSourceConfig {
             lane_model: LaneModel::PerSource,
             max_chunks_per_lane: 1,
             max_chunks_per_source: None,
+            global_speed_limit: None,
+            global_burst: None,
         }
     }
 
@@ -209,6 +239,20 @@ impl MultiSourceConfig {
     /// 设置每个源最大并发 chunk 数，`None` 表示不限。
     pub fn with_max_chunks_per_source(mut self, max_chunks_per_source: Option<usize>) -> Self {
         self.max_chunks_per_source = max_chunks_per_source;
+        self
+    }
+
+    /// 设置全局限速（bytes/s），`rate-limit` 生效。
+    #[cfg(feature = "rate-limit")]
+    pub fn with_global_speed_limit(mut self, bytes_per_sec: u64) -> Self {
+        self.global_speed_limit = Some(bytes_per_sec);
+        self
+    }
+
+    /// 设置全局突发（bytes），`rate-limit` 生效。
+    #[cfg(feature = "rate-limit")]
+    pub fn with_global_burst(mut self, burst_bytes: u64) -> Self {
+        self.global_burst = Some(burst_bytes);
         self
     }
 }
@@ -306,6 +350,7 @@ impl LaneScheduler {
             })
             .collect();
         lanes.sort_by(|a, b| b.candidate.probe_speed.total_cmp(&a.candidate.probe_speed));
+        ::tracing::debug!(lanes = lanes.len(), model = ?lane_model, max_workers, "LaneScheduler created");
         Self {
             lane_model,
             max_workers: max_workers.max(1),
@@ -325,8 +370,13 @@ impl LaneScheduler {
         if let Some(entry) = self.select_lane(false) {
             return Some(entry.candidate.lane_id.clone());
         }
-        self.select_lane(true)
-            .map(|entry| entry.candidate.lane_id.clone())
+        let fallback = self
+            .select_lane(true)
+            .map(|entry| entry.candidate.lane_id.clone());
+        if fallback.is_some() {
+            ::tracing::debug!("best_lane fallback to blacklisted lane");
+        }
+        fallback
     }
 
     fn decay_expired_blacklists(&mut self) {
@@ -334,6 +384,7 @@ impl LaneScheduler {
             if entry.health == LaneHealth::Blacklisted {
                 if let Some(at) = entry.blacklisted_at {
                     if at.elapsed() >= BLACKLIST_DURATION {
+                        ::tracing::info!(lane_id = %entry.candidate.lane_id, "lane blacklist expired -> Healthy");
                         entry.health = LaneHealth::Healthy;
                         entry.consecutive_failures = 0;
                         entry.blacklisted_at = None;
@@ -357,6 +408,7 @@ impl LaneScheduler {
             .find(|entry| entry.candidate.lane_id.as_str() == lane_id.as_ref())
         {
             entry.active_chunks += 1;
+            ::tracing::trace!(lane_id = %entry.candidate.lane_id, active = entry.active_chunks, "assign_chunk");
         }
     }
 
@@ -367,6 +419,7 @@ impl LaneScheduler {
             .find(|entry| entry.candidate.lane_id.as_str() == lane_id.as_ref())
         {
             entry.active_chunks = entry.active_chunks.saturating_sub(1);
+            ::tracing::trace!(lane_id = %entry.candidate.lane_id, active = entry.active_chunks, "release_chunk");
         }
     }
 
@@ -377,7 +430,9 @@ impl LaneScheduler {
             .find(|entry| entry.candidate.lane_id.as_str() == lane_id.as_ref())
         {
             entry.consecutive_failures += 1;
+            ::tracing::warn!(lane_id = %entry.candidate.lane_id, consecutive = entry.consecutive_failures, threshold = BLACKLIST_THRESHOLD, "lane failure");
             if entry.consecutive_failures >= BLACKLIST_THRESHOLD {
+                ::tracing::warn!(lane_id = %entry.candidate.lane_id, "lane blacklisted");
                 entry.health = LaneHealth::Blacklisted;
                 entry.blacklisted_at = Some(Instant::now());
             }
@@ -390,6 +445,9 @@ impl LaneScheduler {
             .iter_mut()
             .find(|entry| entry.candidate.lane_id.as_str() == lane_id.as_ref())
         {
+            if entry.consecutive_failures > 0 || entry.health != LaneHealth::Healthy {
+                ::tracing::debug!(lane_id = %entry.candidate.lane_id, "lane success -> reset health");
+            }
             entry.consecutive_failures = 0;
             entry.health = LaneHealth::Healthy;
             entry.blacklisted_at = None;
@@ -484,9 +542,12 @@ pub struct MultiRuntime {
     runtimes: HashMap<FastStr, Vec<LaneRuntime>>,
     next_runtime_index: HashMap<FastStr, usize>,
     pub supports_ranges: bool,
+    per_source_limiters: HashMap<FastStr, Arc<RateLimiter>>,
+    global_limiter: Option<Arc<RateLimiter>>,
 }
 
 impl MultiRuntime {
+    #[::tracing::instrument(skip(config, client_builder), fields(sources = config.sources.len(), workers = config.workers, path = %config.output_path))]
     pub async fn from_config<F>(
         config: &MultiSourceConfig,
         client_builder: &F,
@@ -495,6 +556,7 @@ impl MultiRuntime {
         F: Fn() -> ClientBuilder,
     {
         let expanded = expand_lanes(config, client_builder)?;
+        ::tracing::debug!(expanded = expanded.len(), "expanded lanes");
         let mut probe_futs = FuturesUnordered::new();
         for runtime in expanded {
             let url = runtime.url.clone();
@@ -512,59 +574,145 @@ impl MultiRuntime {
         let mut fallback_candidates = Vec::new();
 
         while let Some((mut runtime, res)) = probe_futs.next().await {
-            let Ok((file_size, support_ranges)) = res else {
-                continue;
-            };
-            if support_ranges {
-                if let Some(expected) = range_file_size {
-                    if expected != file_size {
-                        continue;
-                    }
-                } else {
-                    range_file_size = Some(file_size);
-                    // 若此前已收集 fallback 但文件大小不一致，清空 fallback 以避免混用
-                    if let Some(fb) = fallback_file_size {
-                        if fb != file_size {
-                            fallback_candidates.clear();
-                            fallback_runtimes.clear();
-                            fallback_file_size = None;
+            match res {
+                Ok((file_size, support_ranges)) => {
+                    ::tracing::debug!(lane_id = %runtime.lane_id, url = %runtime.url, file_size, support_ranges, "probe success");
+                    if support_ranges {
+                        if let Some(expected) = range_file_size {
+                            if expected != file_size {
+                                ::tracing::warn!(lane_id = %runtime.lane_id, expected, got = file_size, "probe file size mismatch, skipping lane");
+                                continue;
+                            }
+                        } else {
+                            range_file_size = Some(file_size);
+                            // 若此前已收集 fallback 但文件大小不一致，清空 fallback 以避免混用
+                            if let Some(fb) = fallback_file_size {
+                                if fb != file_size {
+                                    fallback_candidates.clear();
+                                    fallback_runtimes.clear();
+                                    fallback_file_size = None;
+                                }
+                            }
                         }
+                        // M3-01 实测 probe_speed：64KiB 采样替代硬编码 1.0
+                        let measured = {
+                            let start = Instant::now();
+                            let resp_res = ensure_user_agent(
+                                runtime
+                                    .client
+                                    .get(runtime.url.as_str())
+                                    .header("Range", "bytes=0-65535"),
+                            )
+                            .send()
+                            .await;
+                            match resp_res {
+                                Ok(r) => match r.bytes().await {
+                                    Ok(b) => {
+                                        let elapsed = start.elapsed().as_secs_f64().max(0.001);
+                                        let s = b.len() as f64 / elapsed;
+                                        ::tracing::info!(lane_id = %runtime.lane_id, bytes = b.len(), elapsed, speed = s, "probe_speed measured (range)");
+                                        if s > 0.0 { s } else { 1.0 }
+                                    }
+                                    Err(e) => {
+                                        ::tracing::warn!(lane_id = %runtime.lane_id, error = %e, "probe_speed bytes read failed, fallback 1.0");
+                                        1.0
+                                    }
+                                },
+                                Err(e) => {
+                                    ::tracing::warn!(lane_id = %runtime.lane_id, error = %e, "probe_speed request failed, fallback 1.0");
+                                    1.0
+                                }
+                            }
+                        };
+                        runtime.probe_speed = measured;
+                        range_candidates.push(LaneCandidate {
+                            lane_id: runtime.lane_id.clone(),
+                            source_id: runtime.source_id.clone(),
+                            proxy_id: runtime.proxy_id.clone(),
+                            probe_speed: runtime.probe_speed,
+                        });
+                        range_runtimes
+                            .entry(runtime.lane_id.clone())
+                            .or_default()
+                            .push(runtime);
+                    } else {
+                        // 非 Range 仅作为 fallback：仅在无 Range 可用时启用
+                        if range_file_size.is_some() {
+                            ::tracing::debug!(lane_id = %runtime.lane_id, "non-range lane skipped because range lanes exist");
+                            continue;
+                        }
+                        if let Some(expected) = fallback_file_size {
+                            if expected != file_size {
+                                ::tracing::warn!(lane_id = %runtime.lane_id, expected, got = file_size, "fallback size mismatch, skipping");
+                                continue;
+                            }
+                        } else {
+                            fallback_file_size = Some(file_size);
+                        }
+                        // M3-01 fallback 同样实测（无 Range 则全量采样首 64KiB，流式限长避免 OOM）
+                        let measured = {
+                            let start = Instant::now();
+                            let resp_res = ensure_user_agent(
+                                runtime
+                                    .client
+                                    .get(runtime.url.as_str())
+                                    .header("Range", "bytes=0-65535"),
+                            )
+                            .send()
+                            .await;
+                            match resp_res {
+                                Ok(r) => {
+                                    let mut stream = r.bytes_stream();
+                                    let mut total: usize = 0;
+                                    let mut stream_err: Option<String> = None;
+                                    while let Some(chunk) = stream.next().await {
+                                        match chunk {
+                                            Ok(bytes) => {
+                                                total = total.saturating_add(bytes.len());
+                                                if total >= 65535 {
+                                                    break;
+                                                }
+                                            }
+                                            Err(e) => {
+                                                stream_err = Some(e.to_string());
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    drop(stream);
+                                    if let Some(err) = stream_err {
+                                        ::tracing::warn!(lane_id = %runtime.lane_id, error = %err, "probe_speed fallback bytes failed, 1.0");
+                                        1.0
+                                    } else {
+                                        let elapsed = start.elapsed().as_secs_f64().max(0.001);
+                                        let s = total as f64 / elapsed;
+                                        ::tracing::info!(lane_id = %runtime.lane_id, bytes = total, elapsed, speed = s, "probe_speed measured (fallback)");
+                                        if s > 0.0 { s } else { 1.0 }
+                                    }
+                                }
+                                Err(e) => {
+                                    ::tracing::warn!(lane_id = %runtime.lane_id, error = %e, "probe_speed fallback request failed, 1.0");
+                                    1.0
+                                }
+                            }
+                        };
+                        runtime.probe_speed = measured;
+                        fallback_candidates.push(LaneCandidate {
+                            lane_id: runtime.lane_id.clone(),
+                            source_id: runtime.source_id.clone(),
+                            proxy_id: runtime.proxy_id.clone(),
+                            probe_speed: runtime.probe_speed,
+                        });
+                        fallback_runtimes
+                            .entry(runtime.lane_id.clone())
+                            .or_default()
+                            .push(runtime);
                     }
                 }
-                runtime.probe_speed = 1.0;
-                range_candidates.push(LaneCandidate {
-                    lane_id: runtime.lane_id.clone(),
-                    source_id: runtime.source_id.clone(),
-                    proxy_id: runtime.proxy_id.clone(),
-                    probe_speed: runtime.probe_speed,
-                });
-                range_runtimes
-                    .entry(runtime.lane_id.clone())
-                    .or_default()
-                    .push(runtime);
-            } else {
-                // 非 Range 仅作为 fallback：仅在无 Range 可用时启用
-                if range_file_size.is_some() {
+                Err(e) => {
+                    ::tracing::warn!(lane_id = %runtime.lane_id, url = %runtime.url, error = %e, "probe failed, lane skipped");
                     continue;
                 }
-                if let Some(expected) = fallback_file_size {
-                    if expected != file_size {
-                        continue;
-                    }
-                } else {
-                    fallback_file_size = Some(file_size);
-                }
-                runtime.probe_speed = 1.0;
-                fallback_candidates.push(LaneCandidate {
-                    lane_id: runtime.lane_id.clone(),
-                    source_id: runtime.source_id.clone(),
-                    proxy_id: runtime.proxy_id.clone(),
-                    probe_speed: runtime.probe_speed,
-                });
-                fallback_runtimes
-                    .entry(runtime.lane_id.clone())
-                    .or_default()
-                    .push(runtime);
             }
         }
         let (file_size, supports_ranges, runtimes, candidates) = if !range_candidates.is_empty() {
@@ -582,8 +730,16 @@ impl MultiRuntime {
                 fallback_candidates,
             )
         } else {
+            ::tracing::error!("no available sources after probe");
             return Err(DownloadError::NoAvailableSources);
         };
+
+        ::tracing::info!(
+            file_size,
+            supports_ranges,
+            lanes = candidates.len(),
+            "multi-source probe done"
+        );
 
         let scheduler = LaneScheduler::from_candidates(
             candidates,
@@ -593,6 +749,64 @@ impl MultiRuntime {
             config.max_chunks_per_source,
         );
 
+        // 限速：per_source + global（仅 rate-limit 生效，否则空）
+        #[cfg(feature = "rate-limit")]
+        let per_source_limiters: HashMap<FastStr, Arc<RateLimiter>> = {
+            let mut map: HashMap<FastStr, Arc<RateLimiter>> = HashMap::new();
+            for src in &config.sources {
+                if let Some(limit) = src.speed_limit {
+                    if limit == 0 {
+                        return Err(DownloadError::InvalidArgument(format!("source {} speed_limit 0 无效", src.id)));
+                    }
+                    if limit > u32::MAX as u64 {
+                        return Err(DownloadError::InvalidArgument(format!("source {} speed_limit {} 超过 {} 需 ≤4GiB/s", src.id, limit, u32::MAX)));
+                    }
+                    if let Some(b) = src.burst {
+                        if b == 0 {
+                            return Err(DownloadError::InvalidArgument(format!("source {} burst 0 无效", src.id)));
+                        }
+                        if b > u32::MAX as u64 {
+                            return Err(DownloadError::InvalidArgument(format!("source {} burst {} 超过 {}", src.id, b, u32::MAX)));
+                        }
+                    }
+                    let burst = src.burst.and_then(|b| std::num::NonZeroU32::new(b as u32)).or_else(|| std::num::NonZeroU32::new(64*1024));
+                    let nz = std::num::NonZeroU32::new(limit as u32).unwrap();
+                    map.insert(src.id.clone(), Arc::new(RateLimiter::new(nz, burst)));
+                } else if src.burst.is_some() {
+                    return Err(DownloadError::InvalidArgument(format!("source {} burst 需配合 speed_limit", src.id)));
+                }
+            }
+            map
+        };
+        #[cfg(not(feature = "rate-limit"))]
+        let per_source_limiters: HashMap<FastStr, Arc<RateLimiter>> = HashMap::new();
+        #[cfg(feature = "rate-limit")]
+        let global_limiter: Option<Arc<RateLimiter>> = if let Some(limit) = config.global_speed_limit {
+            if limit == 0 {
+                return Err(DownloadError::InvalidArgument("global_speed_limit 0 无效".to_string()));
+            }
+            if limit > u32::MAX as u64 {
+                return Err(DownloadError::InvalidArgument(format!("global_speed_limit {} 超过 {} 需 ≤4GiB/s", limit, u32::MAX)));
+            }
+            if let Some(b) = config.global_burst {
+                if b == 0 {
+                    return Err(DownloadError::InvalidArgument("global_burst 0 无效".to_string()));
+                }
+                if b > u32::MAX as u64 {
+                    return Err(DownloadError::InvalidArgument(format!("global_burst {} 超过 {}", b, u32::MAX)));
+                }
+            }
+            let burst = config.global_burst.and_then(|b| std::num::NonZeroU32::new(b as u32)).or_else(|| std::num::NonZeroU32::new(64*1024));
+            let nz = std::num::NonZeroU32::new(limit as u32).unwrap();
+            Some(Arc::new(RateLimiter::new(nz, burst)))
+        } else {
+            if config.global_burst.is_some() {
+                return Err(DownloadError::InvalidArgument("global_burst 需配合 global_speed_limit".to_string()));
+            }
+            None
+        };
+        #[cfg(not(feature = "rate-limit"))]
+        let global_limiter: Option<Arc<RateLimiter>> = None;
         Ok((
             file_size,
             Self {
@@ -600,14 +814,26 @@ impl MultiRuntime {
                 runtimes,
                 next_runtime_index: HashMap::new(),
                 supports_ranges,
+                per_source_limiters,
+                global_limiter,
             },
         ))
+    }
+
+    pub fn limiter_for_lane(&self, lane_id: &str) -> Option<Arc<RateLimiter>> {
+        let source_id = self.scheduler.lanes.iter().find(|e| e.candidate.lane_id.as_str() == lane_id).map(|e| e.candidate.source_id.clone())?;
+        self.per_source_limiters.get(&source_id).cloned()
+    }
+
+    pub fn global_limiter(&self) -> Option<Arc<RateLimiter>> {
+        self.global_limiter.clone()
     }
 
     pub fn claim_request_builder(&mut self) -> Option<(FastStr, reqwest::RequestBuilder)> {
         let lane_id = self.scheduler.best_lane()?;
         self.scheduler.assign_chunk(lane_id.as_str());
         let runtime = self.next_runtime(&lane_id)?;
+        ::tracing::trace!(lane_id = %lane_id, url = %runtime.url, "claim lane");
         Some((lane_id, runtime.client.get(runtime.url.as_str())))
     }
 
@@ -661,6 +887,7 @@ where
                 .pool_idle_timeout(std::time::Duration::from_secs(90))
                 .tcp_keepalive(std::time::Duration::from_secs(60))
                 .build()?;
+            ::tracing::debug!(source_id = %source.id, url = %source.url, "expand lane (no proxy)");
             runtimes.push(LaneRuntime {
                 lane_id: source.id.clone(),
                 source_id: source.id.clone(),
@@ -679,6 +906,7 @@ where
                 .pool_idle_timeout(std::time::Duration::from_secs(90))
                 .tcp_keepalive(std::time::Duration::from_secs(60))
                 .build()?;
+            ::tracing::debug!(source_id = %source.id, url = %source.url, "expand lane (source has no proxies)");
             runtimes.push(LaneRuntime {
                 lane_id: source.id.clone(),
                 source_id: source.id.clone(),
@@ -695,7 +923,7 @@ where
             let proxy_obj = match Proxy::all(proxy.url.as_str()) {
                 Ok(p) => p,
                 Err(error) => {
-                    eprintln!("[Lane] 代理 {} 解析失败: {error}, 跳过该 lane", proxy.url);
+                    ::tracing::warn!(proxy_url = %proxy.url, error = %error, "proxy parse failed, skip lane");
                     continue;
                 }
             };
@@ -708,7 +936,7 @@ where
             {
                 Ok(c) => c,
                 Err(error) => {
-                    eprintln!("[Lane] 代理 {} 构建 Client 失败: {error}, 跳过", proxy.url);
+                    ::tracing::warn!(proxy_url = %proxy.url, error = %error, "proxy client build failed, skip lane");
                     continue;
                 }
             };
@@ -718,6 +946,7 @@ where
                     FastStr::from_string(format!("{}::{}", source.id, proxy.id))
                 }
             };
+            ::tracing::debug!(lane_id = %lane_id, source_id = %source.id, proxy_id = %proxy.id, "expand lane (proxy)");
             runtimes.push(LaneRuntime {
                 lane_id,
                 source_id: source.id.clone(),
