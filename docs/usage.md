@@ -122,7 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```toml
 [dependencies]
-simple_downloader = { version = "0.3", features = ["resume"] }
+simple_downloader = { version = "0.6", features = ["resume"] }
 ```
 
 ```rust
@@ -176,7 +176,7 @@ let meta = ResumeMetadata::new(file_size, DEFAULT_SEGMENT_SIZE);
 
 ```toml
 [dependencies]
-simple_downloader = { version = "0.3", features = ["progress"] }
+simple_downloader = { version = "0.6", features = ["progress"] }
 ```
 
 `run(handler)` 将 `total_size: u64` 与 `broadcast::Receiver<DownloadInfo>` 交给调用方，调用方在独立 task 中消费事件。`DownloadInfo` 变体见 `src/types.rs:99-187`。
@@ -237,7 +237,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```toml
 [dependencies]
-simple_downloader = { version = "0.3", features = ["multi-source", "progress"] }
+simple_downloader = { version = "0.6", features = ["multi-source", "progress"] }
 ```
 
 ```rust
@@ -298,7 +298,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```toml
 [dependencies]
-simple_downloader = { version = "0.3", features = ["proxy", "progress"] }
+simple_downloader = { version = "0.6", features = ["proxy", "progress"] }
 ```
 
 ```rust

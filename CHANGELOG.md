@@ -20,6 +20,19 @@
 
 ---
 
+## [0.6.1] - 2026-08-31
+
+### 🔧 修复（B1-B7 一次修复 — `feat/queue` 批量）
+
+- **B1 队列取消删后复活** `queue.rs:33-40,142-215,398-483`：`QueueState` 新增 `pending_deletes`，`driver_loop` `200ms` `flush_pending_deletes` 周期重试（`PermissionDenied` 保留、`NotFound` 视为成功）；`cancel(Active)` 改为 `abort + occupied.remove + pending.push` 延迟删盘，`Queued/Paused` 仍立即删，修复 `abort` 后 `file_writer` 仍 `seek/write/flush` 重建半截文件的竞态，下次 `ResumeTargetMissing` 误报；`WARNING` 文档化“仅进程内保证，外部 `touch` 需外部锁”
+- **B2 首批调度空洞** `downloader.rs:919-934` `monitor.rs:524-533,609-655`：抽 `DownloadMonitor::drain_pending()` 供 `handle_tick` 与 `orchestrate_downloads` 复用；`pending_initial.extend` 后立即 `drain_pending` 一次，避免 `update_interval 0.5s` 空等，32 workers 仅 2 lane 时首批即打满
+- **B3 黑名单自旋** `retry.rs:236-245` `monitor.rs:591`：新增 `push_back_retry_with_backoff` 置 `failure_time=now()` 2s 退避，`deferred_retries` 统一走退避，避免全 lane `Blacklisted 30s` 时每 tick 全量扫描自旋；日志降频
+- **B6 重试泄漏** `retry.rs:242-249`：`on_download_complete` 同步 `remove retry + total`，修复 `||` 短路致 `total_attempts` 残留，长跑 10k 任务线性增长
+- **B4/B7 文档** `queue.rs:54` `downloader.rs:683`：`TaskQueue` `WARNING` 明确三重 CAS 进程内唯一性，`streaming_download` 注释 `total_size=0` 仅表“未知” `MonitorUpdate(total_size=0)` 不代表 0 字节文件
+- **B5 保留** `queue.rs:367-393` `with_suffix` 现状 `a.tar.gz → a.tar(1).gz` / `.hidden(1)` 已符合预期，测试 `with_suffix_basic` 保持不变
+
+---
+
 ## [0.6.0] - 2026-08-31
 
 ### ✨ 新增

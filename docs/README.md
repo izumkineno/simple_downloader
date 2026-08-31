@@ -15,14 +15,14 @@
 - `tests/util.rs`：文件信息探测回退链路、写入任务和基础工具行为。
 - `test_server/server.py`：本地可控 Range/限速测试服务，适合集成验证与手工观察并发行为。
 
-## 二、项目概览（按 0.6.0 源码校准）
+## 二、项目概览（按 0.6.1 源码校准）
 
 simple_downloader 是一个基于 Rust 与 Tokio 的异步下载库，当前实现重点在于：
 
 - `Downloader`：启动编排入口，负责 client、文件信息探测、写入任务和初始 chunk。
 - `DownloadMonitor`：运行期控制循环，持有 `DownloadState`、`ConcurrencyManager`、`RetryHandler`，限速启用时冻结并发探测。
 - `chunk_run`：执行单个 byte-range 拉取、Range 206/Content-Range 校验、Early-EOF 门限与事件上报。
-- `file_writer_task`：独立文件写入任务，通过有界 `mpsc 128` 提供背压，0.6.0 流式追加（无 `set_len` 预分配，`truncate(false)`）。
+- `file_writer_task`：独立文件写入任务，通过有界 `mpsc 128` 提供背压，0.6.1 流式追加（无 `set_len` 预分配，`truncate(false)`）。
 - `limiter`：`rate-limit` feature 下 `governor` 令牌桶 `1 token=1 byte`，全局/分源双桶 `tokio::join` 取 `max`，`burst` 默认 64KiB。
 
 项目当前许可证文件为仓库根目录中的 Apache License 2.0（见 `LICENSE`）。
