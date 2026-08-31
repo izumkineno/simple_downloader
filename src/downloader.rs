@@ -860,12 +860,11 @@ where
             workers,
         );
         {
-            // 全局限速：若多源已配置全局，则优先多源，否则用 Builder 全局；per_source 亦需冻结自适应
+            // 限速冻结：任一限速器存在即冻结自适应；全局优先多源，否则 Builder
             let global_for_monitor = multi_runtime.as_ref().and_then(|r| r.global_limiter()).or_else(|| self.global_limiter.clone());
-            let per_exists = multi_runtime.as_ref().map(|r| r.has_rate_limit()).unwrap_or(false) || self.global_limiter.is_some();
-            // has_rate_limit 已含 global，此处 per_exists 已含 global，但保留 global 限速器用于 monitor 的 global 字段
+            let is_limited = multi_runtime.as_ref().map(|r| r.has_rate_limit()).unwrap_or(false) || self.global_limiter.is_some();
             monitor = monitor.with_rate_limit(global_for_monitor);
-            if per_exists {
+            if is_limited {
                 monitor.set_rate_limited(true);
             }
         }

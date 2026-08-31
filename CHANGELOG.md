@@ -21,6 +21,19 @@
 
 ---
 
+## [0.5.3] - 2026-08-31
+
+### 📝 文档
+
+- **README** `Feature Flags` 表新增 `rate-limit` 行 + 新增 `§9 速度限制` 全局/分源/burst/自适应冻结/校验/示例，`TODO §3` 双项勾选为已落地
+- **示例** `examples/with_rate_limit.rs` 补全单源 `with_burst` + 多源 `SourceConfig::with_speed_limit/with_burst` + `with_global_speed_limit/with_global_burst` 双演示（`-- --multi`）
+
+### 🔧 杂项
+
+- **命名** `downloader::orchestrate` `per_exists` → `is_limited` 语义收敛（`has_rate_limit||builder` 任一即冻结）
+
+---
+
 ## [0.5.2] - 2026-08-31
 
 ### 🐛 修复

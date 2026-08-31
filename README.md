@@ -54,6 +54,7 @@
 | `multi-source` | 否 | 多源下载入口、lane 调度建模 |
 | `proxy` | 否 | 代理配置能力，依赖 `multi-source` |
 | `progress` | 否 | 公开 `DownloadInfo` 进度事件与 `run(...)` 进度回调接口 |
+| `rate-limit` | 否 | 全局/分源限速（`governor` 令牌桶，`burst` 可配，自适应冻结） |
 
 推荐理解方式：
 
@@ -62,8 +63,18 @@
 - **需要多源**：打开 `multi-source`
 - **需要代理**：打开 `proxy`
 - **需要 UI / 进度事件**：打开 `progress`
+- **需要限速**：打开 `rate-limit`，见下节
 
 > 完整调用形态见 [`docs/usage.md`](docs/usage.md)，`cargo doc` 见 `src/lib.rs`  crate 文档。
+
+#### 9. **速度限制（`rate-limit` feature，`0.5.x` 新增）**
+- **全局限速**：`Downloader::builder(url, path).speed_limit(bps).with_burst(bytes).download().await`，`1 token = 1 byte`，`burst` 默认 64KiB 硬限，`0` 或 `>4GiB/s` 返回 `InvalidArgument`，全局为硬上限（`per_source` 之和 > 全局时按剩余分配）
+- **分源限速**：`SourceConfig::new(url).with_speed_limit(bps).with_burst(bytes)`，`MultiSourceConfig::with_global_speed_limit/with_global_burst`，分源与全局两级串联 `tokio::join` 取 `max`，避免串行 `sum` 慢 30%
+- **自适应冻结**：限速启用时 `DownloadMonitor` 跳过 `ConcurrencyManager::decide_and_act`，避免限速被误判为带宽不足而过度分裂
+- **校验**：`speed_limit 0` / `burst 0` / `burst需配合speed_limit` / `>u32::MAX` 均 `InvalidArgument`，`cargo test --features rate-limit,multi-source --test rate_limit` 5 用例 `5MiB@1MiB/s 4-6.5s / per_source 5-8.5s / global 3-5.5s` 全绿
+- **示例**：`cargo run --features rate-limit,progress --example with_rate_limit`（单源 512KiB/s）/ `-- --multi`（多源 s1/s2 300KiB + 全局 512KiB）
+
+---
 
 ### 待实现的功能 (TODO List)
 
@@ -90,9 +101,8 @@
 -   [ ] **更完整的多代理真实集成验证**: 当前代理维度已有配置与调度模型，后续应补充真实代理链路的端到端测试矩阵。
 
 #### 3. **核心功能：速度限制 (Speed Limiting)**
--   [ ] **实现可配置的速度限制器**: 允许用户设置全局下载速度上限。在 `chunk_run` 或 `monitor` 层面引入节流（throttling）逻辑，确保总速度不超过设定值。
--   [ ] **分源 / 分代理限速策略**: 当前 `test_server` 可用于模拟不同源限速；库本身后续还应支持调用方配置全局、单源或单 lane 的下载限速策略。
-
+-   [x] **实现可配置的速度限制器**：`rate-limit` feature 已落地，`Downloader::builder(...).speed_limit(bps).with_burst(bytes)` 全局 + `SourceConfig::with_speed_limit/with_burst` 分源 + `MultiSourceConfig::with_global_speed_limit/with_global_burst`，`governor` 令牌桶 `1 token=1 byte`，`burst` 默认 64KiB，全局硬上限，`InvalidArgument` 校验，`monitor` 自适应冻结，`tokio::join` 双桶 `max`
+-   [x] **分源 / 分代理限速策略**：全局/分源/全局+分源三档已支持，`test_server` 多源异速 + `with_rate_limit` 单/多源示例 + `rate_limit` 5 用例全绿；代理 lane 已共享分源限速（`PerSourceProxy` 同源同桶）
 #### 4. **其他改进**
 -   [x] **默认 API 易用性重构（第一阶段）**: 已新增 `Downloader::builder(...).download().await` 的简化入口，不再强制默认调用方接入 progress receiver。
 -   [x] **Feature 能力裁剪（第一阶段）**: 默认模式仅保留基础多线程下载；`resume` / `multi-source` / `proxy` / `progress` 已拆为按需启用的 Cargo features。
