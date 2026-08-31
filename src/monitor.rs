@@ -83,13 +83,39 @@ impl DownloadMonitor {
         self.is_rate_limited = limited;
     }
 
-    /// 0.5.5 热更新：运行时调整并发与间隔（配置灵活性）
+    /// 运行时调整并发、间隔和全局限速配置。
     pub fn apply_config(&mut self, cfg: &crate::config::RuntimeConfig) {
         self.concurrency_manager.set_max_workers(cfg.workers);
         if cfg.update_interval > 0.0 && cfg.update_interval.is_finite() {
             self.update_interval = cfg.update_interval;
         }
-        ::tracing::info!(workers = cfg.workers, interval = self.update_interval, "monitor apply_config hot-update");
+        #[cfg(feature = "rate-limit")]
+        match runtime_limiter_from_config(cfg) {
+            Ok(Some((limit, burst))) => {
+                if let Some(limiter) = self.global_limiter.as_ref() {
+                    limiter.reconfigure(limit, burst);
+                } else {
+                    self.global_limiter = Some(Arc::new(RateLimiter::new(limit, burst)));
+                }
+                self.is_rate_limited = true;
+            }
+            Ok(None) => {
+                if let Some(limiter) = self.global_limiter.as_ref() {
+                    limiter.disable();
+                }
+                self.global_limiter = None;
+                self.is_rate_limited = false;
+            }
+            Err(error) => {
+                ::tracing::warn!(error = %error, "invalid runtime rate-limit config; keeping previous limiter");
+            }
+        }
+        ::tracing::info!(
+            workers = cfg.workers,
+            interval = self.update_interval,
+            rate_limited = self.is_rate_limited,
+            "monitor apply_config hot-update"
+        );
     }
     /// 运行监控器的主事件循环。
     ///
@@ -534,6 +560,7 @@ impl DownloadMonitor {
             total_downloaded: self.state.total_downloaded(),
             total_speed: self.state.total_speed(),
             chunk_details,
+
         });
     }
 
@@ -545,6 +572,38 @@ impl DownloadMonitor {
     }
 }
 
+#[cfg(feature = "rate-limit")]
+fn runtime_limiter_from_config(
+    cfg: &crate::config::RuntimeConfig,
+) -> std::result::Result<
+    Option<(std::num::NonZeroU32, Option<std::num::NonZeroU32>)>,
+    String,
+> {
+    let Some(limit) = cfg.speed_limit else {
+        return if cfg.burst.is_some() {
+            Err("burst requires speed_limit".to_owned())
+        } else {
+            Ok(None)
+        };
+    };
+    let limit = u32::try_from(limit)
+        .map_err(|_| format!("speed_limit {limit} exceeds {}", u32::MAX))
+        .and_then(|limit| {
+            std::num::NonZeroU32::new(limit)
+                .ok_or_else(|| "speed_limit must be greater than zero".to_owned())
+        })?;
+    let burst = match cfg.burst {
+        None => None,
+        Some(0) => return Err("burst must be greater than zero".to_owned()),
+        Some(burst) => Some(
+            std::num::NonZeroU32::new(u32::try_from(burst).map_err(|_| {
+                format!("burst {burst} exceeds {}", u32::MAX)
+            })?)
+            .expect("burst checked non-zero"),
+        ),
+    };
+    Ok(Some((limit, burst)))
+}
 fn build_request(
     client: &Client,
     url: Option<&FastStr>,
@@ -557,4 +616,36 @@ fn build_request(
 
     let url = url?;
     Some((None, client.get(url.as_str())))
+}
+
+#[cfg(all(test, feature = "rate-limit"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_config_updates_and_disables_global_limiter() {
+        let mut monitor = DownloadMonitor::new(1, 0.5, 1);
+        let limited = crate::config::RuntimeConfig {
+            workers: 2,
+            update_interval: 1.0,
+            speed_limit: Some(1024),
+            burst: Some(1024),
+        };
+
+        monitor.apply_config(&limited);
+
+        assert_eq!(monitor.update_interval, 1.0);
+        assert!(monitor.is_rate_limited);
+        let limiter = monitor.global_limiter.clone().expect("limiter configured");
+
+        monitor.apply_config(&crate::config::RuntimeConfig {
+            speed_limit: None,
+            burst: None,
+            ..limited
+        });
+
+        assert!(!monitor.is_rate_limited);
+        assert!(monitor.global_limiter.is_none());
+        assert!(!limiter.check_n(std::num::NonZeroU32::new(1).unwrap()));
+    }
 }
