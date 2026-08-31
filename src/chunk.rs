@@ -138,8 +138,26 @@ pub async fn chunk_run(
                         return;
                     }
                 }
+            } else if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+                let cr_info = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let error_msg = format!(
+                    "416 Range Not Satisfiable for Range request bytes={start_byte}-{end_byte}, Content-Range: {cr_info}, status: {status}"
+                );
+                ::tracing::error!(chunk_id = id, range = %range_header, status = %status, content_range = %cr_info, error = %error_msg, "416 not satisfiable");
+                let _ = bd_tx.send(DownloadInfo::ChunkFailed {
+                    id,
+                    start: start_byte,
+                    end,
+                    error: error_msg,
+                });
+                return;
             } else if status == reqwest::StatusCode::OK {
-                // 仅允许单段全量降级：start_byte 必须为 0
+                // 仅允许单段全量降级：start_byte 必须为 0 (P0-1 spec: workers==1 && start==0 && end==file_size-1)
+                // 此处 start==0 已保证单段起点，file_size 校验由上层保证单 chunk 时 end+1==file_size
                 if start_byte != 0 {
                     let error_msg = format!(
                         "server returned 200 OK but Range requested {start_byte}-{end_byte}, only single-segment full download (0-*) is allowed to downgrade"
