@@ -11,7 +11,7 @@
 //! - ✅ **两级重试机制**：针对网络错误和 chunk 下载失败自动重试
 //! - ✅ **灵活配置**：通过 Builder 模式自定义各种下载参数
 //!
-//! ## 功能模块（以 `Cargo.toml:6-11` 为准）
+//! ## 功能模块（以 `Cargo.toml:14-19` 为准）
 //!
 //! | Feature | 默认 | 描述 | 启用后新增 API |
 //! |---|:---:|---|---|
@@ -20,7 +20,7 @@
 //! | `progress` | ❌ | 进度事件与回调 | `DownloadInfo`, `Downloader::run()`, `DownloadBuilder::run()` |
 //! | `multi-source` | ❌ | 多源调度建模 | `MultiSourceConfig`, `SourceConfig`, `LaneModel`, `Downloader::new_multi()` |
 //! | `proxy` | ❌ | 代理 lane 建模（隐含 `multi-source`） | `ProxyConfig`, `SourceConfig::with_proxies()` |
-//!
+//! | `rate-limit` | ❌ | 全局/分源限速 `governor` 令牌桶 `1 token=1 byte` | `DownloadBuilder::speed_limit()/with_burst()`, `SourceConfig::with_speed_limit()` 等 |
 //! 完整调用形态见 [`docs/usage.md`](https://github.com/simple_downloader/docs/usage.md)（仓库内 `docs/usage.md`），
 //! 配置项见 `docs/configuration.md`，错误全表见 `docs/errors.md`。
 //!
@@ -28,11 +28,11 @@
 //!
 //! ```toml
 //! # 最轻量：仅基础下载
-//! simple_downloader = { version = "0.5, default-features = false }
+//! simple_downloader = { version = "0.5", default-features = false }
 //! # 常用：基础 + 断点续传 + 进度
-//! simple_downloader = { version = "0.5, default-features = false, features = ["resume", "progress"] }
-//! # 全功能
-//! simple_downloader = { version = "0.5, default-features = false, features = ["resume", "progress", "multi-source", "proxy"] }
+//! simple_downloader = { version = "0.5", default-features = false, features = ["resume", "progress"] }
+//! # 全功能（含限速）
+//! simple_downloader = { version = "0.5", default-features = false, features = ["resume", "progress", "multi-source", "proxy", "rate-limit"] }
 //! ```
 //!
 //! ## 快速开始
