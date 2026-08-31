@@ -521,41 +521,17 @@ impl DownloadMonitor {
         } else {
             self.concurrency_manager.decide_and_act(&self.state, cmd_tx);
         }
-
-        // 调度之前因 lane 容量不足而缓冲的分割区间
-        let mut drained_pending = 0usize;
-        while let Some((start, end)) = self.pending_bisects.front().copied() {
-            let Some((lane_id, rb)) = build_request(client, url, multi_runtime.as_mut()) else {
-                ::tracing::debug!(start, end, remaining = self.pending_bisects.len(), "pending_bisects still blocked");
-                break;
-            };
-            self.pending_bisects.pop_front();
-            let new_id = next_chunk_id.fetch_add(1, Ordering::SeqCst);
-            ::tracing::info!(new_id, start, end, lane_id = ?lane_id.as_ref().map(|s| s.as_str()), "drain pending_bisect");
-            // 限速：解析分源与全局
-            let per_source = lane_id.as_ref().and_then(|id| multi_runtime.as_ref().and_then(|r| r.limiter_for_lane(id.as_str())));
-            let global = multi_runtime.as_ref().and_then(|r| r.global_limiter()).or_else(|| self.global_limiter.clone());
-            if let Some(lane_id) = lane_id {
-                self.lane_bindings.insert(new_id, lane_id);
-            }
-            let task = chunk_run_with_reliable(
-                new_id,
-                writer_tx.clone(),
-                cmd_tx.subscribe(),
-                info_tx.clone(),
-                rb,
-                start,
-                end,
-                global,
-                per_source,
-                reliable_tx.clone(),
-            );
-            tasks.push(tokio::spawn(task));
-            drained_pending += 1;
-        }
-        if drained_pending > 0 {
-            ::tracing::debug!(drained = drained_pending, tasks = tasks.len(), "drained pending_bisects");
-        }
+        let _drained_pending = self.drain_pending(
+            tasks,
+            next_chunk_id,
+            client,
+            writer_tx,
+            info_tx,
+            reliable_tx,
+            cmd_tx,
+            url,
+            multi_runtime,
+        );
 
         // 委托重试处理：处理重试队列 — P0-6: delayed 10s 单独计时，不叠加 retry 2s
         let before_retry = self.retry_handler.retry_queue_len();
@@ -613,7 +589,7 @@ impl DownloadMonitor {
             ::tracing::debug!(retried, deferred = deferred_retries.len(), remaining_retry = self.retry_handler.retry_queue_len(), "tick retry result");
         }
         for chunk in deferred_retries {
-            self.retry_handler.push_back_retry(chunk);
+            self.retry_handler.push_back_retry_with_backoff(chunk);
         }
 
         // 检查下载是否已全部完成
@@ -628,6 +604,54 @@ impl DownloadMonitor {
             );
         }
         done
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn drain_pending(
+        &mut self,
+        tasks: &mut FuturesUnordered<JoinHandle<()>>,
+        next_chunk_id: &AtomicU64,
+        client: &Client,
+        writer_tx: &mpsc::Sender<DownloadCmd>,
+        info_tx: &broadcast::Sender<DownloadInfo>,
+        reliable_tx: &Option<mpsc::Sender<DownloadInfo>>,
+        cmd_tx: &broadcast::Sender<DownloadCmd>,
+        url: Option<&FastStr>,
+        multi_runtime: &mut Option<MultiRuntime>,
+    ) -> usize {
+        let mut drained = 0usize;
+        while let Some((start, end)) = self.pending_bisects.front().copied() {
+            let Some((lane_id, rb)) = build_request(client, url, multi_runtime.as_mut()) else {
+                ::tracing::debug!(start, end, remaining = self.pending_bisects.len(), "pending_bisects still blocked");
+                break;
+            };
+            self.pending_bisects.pop_front();
+            let new_id = next_chunk_id.fetch_add(1, Ordering::SeqCst);
+            ::tracing::info!(new_id, start, end, lane_id = ?lane_id.as_ref().map(|s| s.as_str()), "drain pending_bisect");
+            let per_source = lane_id.as_ref().and_then(|id| multi_runtime.as_ref().and_then(|r| r.limiter_for_lane(id.as_str())));
+            let global = multi_runtime.as_ref().and_then(|r| r.global_limiter()).or_else(|| self.global_limiter.clone());
+            if let Some(lane_id) = lane_id {
+                self.lane_bindings.insert(new_id, lane_id);
+            }
+            let task = chunk_run_with_reliable(
+                new_id,
+                writer_tx.clone(),
+                cmd_tx.subscribe(),
+                info_tx.clone(),
+                rb,
+                start,
+                end,
+                global,
+                per_source,
+                reliable_tx.clone(),
+            );
+            tasks.push(tokio::spawn(task));
+            drained += 1;
+        }
+        if drained > 0 {
+            ::tracing::debug!(drained, tasks = tasks.len(), "drained pending_bisects");
+        }
+        drained
     }
 
     /// 发送聚合的监控更新信息。

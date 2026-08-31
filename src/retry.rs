@@ -233,18 +233,24 @@ impl RetryHandler {
     pub(crate) fn push_front_retry(&mut self, chunk: FailedChunkInfo) {
         self.retry_queue.push_front(chunk);
     }
-
+    #[allow(dead_code)]
     pub(crate) fn push_back_retry(&mut self, chunk: FailedChunkInfo) {
         ::tracing::debug!(chunk_id = chunk.id, "push back deferred retry");
         self.retry_queue.push_back(chunk);
     }
 
+    pub(crate) fn push_back_retry_with_backoff(&mut self, mut chunk: FailedChunkInfo) {
+        chunk.failure_time = Instant::now();
+        ::tracing::debug!(chunk_id = chunk.id, "push back deferred retry with 2s backoff");
+        self.retry_queue.push_back(chunk);
+    }
+
     /// 当一个块最终下载成功时，清除其重试记录。
     pub fn on_download_complete(&mut self, id: &ChunkId) {
-        if self.retry_attempts.remove(id).is_some() || self.total_attempts.remove(id).is_some() {
+        let a = self.retry_attempts.remove(id);
+        let b = self.total_attempts.remove(id);
+        if a.is_some() || b.is_some() {
             ::tracing::debug!(chunk_id = id, "retry records cleared on complete");
-        } else {
-            self.total_attempts.remove(id);
         }
     }
 

@@ -681,6 +681,7 @@ where
         Ok(())
     }
     #[::tracing::instrument(skip(self, client, writer_path, progress_handler), fields(url = %url, path = %writer_path))]
+    /// 未知 Content-Length 时的单流流式回退：`total_size=0` 仅表“未知”，`MonitorUpdate(total_size=0)` 不代表 0 字节文件，`progress_percent` 对 0 恒 0%。
     async fn streaming_download(
         self,
         client: Client,
@@ -823,7 +824,7 @@ where
         resume_ranges: Vec<(u64, u64)>,
         completed_bytes: u64,
     ) -> Result<()> {
-        let tasks = FuturesUnordered::new();
+        let mut tasks = FuturesUnordered::new();
         let (reliable_tx, reliable_rx) = mpsc::channel(RELIABLE_EVENT_CAPACITY);
         let next_chunk_id = AtomicU64::new(0);
 
@@ -916,9 +917,21 @@ where
             next_id = next_chunk_id.load(std::sync::atomic::Ordering::SeqCst),
             "spawned initial tasks"
         );
-        // 将缓冲的初始区间移入 monitor 的 pending 队列，待 tick 时按容量逐步调度
+        // 将缓冲的初始区间移入 monitor 的 pending 队列，立即尝试调度一次，避免 0.5s 空洞
         monitor.pending_bisects.extend(pending_initial);
-
+        {
+            let _ = monitor.drain_pending(
+                &mut tasks,
+                &next_chunk_id,
+                &client,
+                &writer_tx,
+                &self.info_tx,
+                &Some(reliable_tx.clone()),
+                &self.cmd_tx,
+                Some(download_url),
+                &mut multi_runtime,
+            );
+        }
         monitor
             .run_with_reliable(
                 self.info_tx.subscribe(),

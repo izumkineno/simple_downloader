@@ -30,13 +30,13 @@ pub enum QueueError {
 
 type QueueResult<T> = Result<T, QueueError>;
 
-/// 内部状态（仅 Mutex 守卫）
 struct QueueState {
     queue: VecDeque<Task>,
     active: HashMap<TaskId, ActiveEntry>,
     all: HashMap<TaskId, Task>,
     max: u8,
     occupied: HashSet<String>,
+    pending_deletes: Vec<PathBuf>,
 }
 
 struct ActiveEntry {
@@ -53,7 +53,7 @@ enum QueueCmd {
 
 /// 任务队列（Send+Sync，仅进程内）
 ///
-/// **WARNING**: 仅进程内并发，跨进程同路径需外部文件锁
+/// **WARNING**: 仅进程内并发，跨进程同路径需外部文件锁；`enqueue` 的重命名通过 `occupied + 磁盘 exists + 侧car` 三重 CAS 保证进程内唯一，外部 `touch` 仍需调用方持有锁。
 pub struct TaskQueue {
     state: Arc<tokio::sync::Mutex<QueueState>>,
     tx: mpsc::Sender<QueueCmd>,
@@ -82,6 +82,7 @@ impl TaskQueue {
             all: HashMap::new(),
             max,
             occupied: HashSet::new(),
+            pending_deletes: Vec::new(),
         }));
         let (tx, rx) = mpsc::channel::<QueueCmd>(128);
         let notify = Arc::new(Notify::new());
@@ -206,14 +207,11 @@ impl TaskQueue {
             task.state = TaskState::Removed;
             s.all.insert(id.clone(), task);
             s.occupied.remove(&path_key(&path));
+            s.pending_deletes.push(path);
             drop(s);
-            let _ = tokio::fs::remove_file(&path).await;
-            if let Some(meta) = sidecar_path(&path) {
-                let _ = tokio::fs::remove_file(&meta).await;
-            }
             self.notify.notify_waiters();
             let _ = self.tx.send(QueueCmd::Pump).await;
-            ::tracing::info!(task_id=%id, "queue cancel active -> Removed");
+            ::tracing::info!(task_id=%id, "queue cancel active -> Removed (deferred delete)");
             return Ok(());
         }
         if let Some(pos) = s.queue.iter().position(|t| t.id == id) {
@@ -404,11 +402,19 @@ async fn driver_loop(
     notify: Arc<Notify>,
 ) {
     let mut join_set: JoinSet<(TaskId, Result<(), crate::types::DownloadError>)> = JoinSet::new();
+    let mut flush_interval = tokio::time::interval(std::time::Duration::from_millis(200));
+    flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            _ = flush_interval.tick() => {
+                flush_pending_deletes(&state).await;
+            }
             cmd = rx.recv() => {
                 match cmd {
-                    Some(QueueCmd::Pump) => pump(&state, &mut join_set).await,
+                    Some(QueueCmd::Pump) => {
+                        pump(&state, &mut join_set).await;
+                        flush_pending_deletes(&state).await;
+                    },
                     Some(QueueCmd::Shutdown) | None => {
                         ::tracing::info!("queue driver shutdown");
                         break;
@@ -420,13 +426,16 @@ async fn driver_loop(
                     Some(Ok((id, result))) => {
                         on_complete(&state, id, result, &notify).await;
                         pump(&state, &mut join_set).await;
+                        flush_pending_deletes(&state).await;
                     }
                     Some(Err(e)) if e.is_cancelled() => {
                         pump(&state, &mut join_set).await;
+                        flush_pending_deletes(&state).await;
                     }
                     Some(Err(e)) => {
                         ::tracing::warn!(error=%e, "queue join error");
                         pump(&state, &mut join_set).await;
+                        flush_pending_deletes(&state).await;
                     }
                     None => {}
                 }
@@ -434,6 +443,45 @@ async fn driver_loop(
         }
     }
 }
+
+async fn flush_pending_deletes(state: &Arc<tokio::sync::Mutex<QueueState>>) {
+    let pending: Vec<PathBuf> = { state.lock().await.pending_deletes.clone() };
+    if pending.is_empty() {
+        return;
+    }
+    let mut succeeded: Vec<PathBuf> = Vec::new();
+    for path in &pending {
+        let file_gone = match tokio::fs::remove_file(path).await {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                ::tracing::debug!(path=%path.display(), error=%e, "pending delete permission denied, retry later");
+                false
+            },
+            Err(e) => {
+                ::tracing::warn!(path=%path.display(), error=%e, "pending delete failed");
+                true
+            }
+        };
+        let meta_gone = if let Some(meta) = sidecar_path(path) {
+            match tokio::fs::remove_file(&meta).await {
+                Ok(_) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                Err(_) => false,
+            }
+        } else {
+            true
+        };
+        if file_gone && meta_gone {
+            succeeded.push(path.clone());
+        }
+    }
+    if !succeeded.is_empty() {
+        let mut s = state.lock().await;
+        s.pending_deletes.retain(|p| !succeeded.contains(p));
+    }
+}
+
 
 async fn pump(
     state: &Arc<tokio::sync::Mutex<QueueState>>,
