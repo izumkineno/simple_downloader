@@ -348,28 +348,26 @@ pub async fn chunk_run(
                 // 流结束：P0-02 完整性门，offset 必须到达 end+1 否则判 Early-EOF
                 None => {
                     ::tracing::debug!(chunk_id = id, offset, end, "stream exhausted");
-                    if offset != end.saturating_add(1) {
-                        // bisect 后 end 已缩小，此处按当前 end 判定；offset>end 视为已完成不判失败
-                        if offset <= end {
-                            let expected = end.saturating_sub(start_byte).saturating_add(1);
-                            let got = offset.saturating_sub(start_byte);
-                            let error_msg = format!(
-                                "early EOF: expected {} bytes ({}-{}), got {}",
-                                expected, start_byte, end, got
-                            );
-                            ::tracing::error!(chunk_id = id, offset, end, error = %error_msg, "early EOF");
-                            let actual = offset.saturating_sub(start_byte);
-                            if actual != last_reported {
-                                let _ = bd_tx.send(DownloadInfo::ChunkProgress { id, start_byte, end_byte: end, downloaded: actual });
-                            }
-                            let _ = bd_tx.send(DownloadInfo::ChunkFailed {
-                                id,
-                                start: offset,
-                                end,
-                                error: error_msg,
-                            });
-                            failed = true;
+                    // 仅当 offset < end+1 时判 early EOF；offset>end 视为已完成 (bisect 后 end 缩小)
+                    if offset < end.saturating_add(1) {
+                        let expected = end.saturating_sub(start_byte).saturating_add(1);
+                        let got = offset.saturating_sub(start_byte);
+                        let error_msg = format!(
+                            "early EOF: expected {} bytes ({}-{}), got {}",
+                            expected, start_byte, end, got
+                        );
+                        ::tracing::error!(chunk_id = id, offset, end, error = %error_msg, "early EOF");
+                        let actual = offset.saturating_sub(start_byte);
+                        if actual != last_reported {
+                            let _ = bd_tx.send(DownloadInfo::ChunkProgress { id, start_byte, end_byte: end, downloaded: actual });
                         }
+                        let _ = bd_tx.send(DownloadInfo::ChunkFailed {
+                            id,
+                            start: offset,
+                            end,
+                            error: error_msg,
+                        });
+                        failed = true;
                     }
                     break;
                 },
@@ -387,13 +385,15 @@ pub async fn chunk_run(
         "chunk exit"
     );
     // 收尾：若最后一段被节流未发送，补一次最终进度，避免 Monitor 统计低估
-    if !failed {
-        let final_downloaded = offset.saturating_sub(start_byte);
+    // P0-2: 仅当 !failed 且最终下载量等于区间大小时才发 DownloadComplete
+    let final_downloaded = offset.saturating_sub(start_byte);
+    let expected_size = end.saturating_sub(start_byte).saturating_add(1);
+    if !failed && final_downloaded == expected_size {
         if final_downloaded != last_reported {
             ::tracing::trace!(
                 chunk_id = id,
                 final_downloaded,
-                total = end.saturating_sub(start_byte).saturating_add(1),
+                total = expected_size,
                 "final progress補發"
             );
             let _ = bd_tx.send(DownloadInfo::ChunkProgress {
@@ -403,9 +403,22 @@ pub async fn chunk_run(
                 downloaded: final_downloaded,
             });
         }
-        // 如果没有发生失败，则广播下载完成消息
+        // 如果没有发生失败且下载量匹配，则广播下载完成消息
         ::tracing::debug!(chunk_id = id, "DownloadComplete");
         let _ = bd_tx.send(DownloadInfo::DownloadComplete(id));
+    } else if !failed {
+        // !failed 但 final_downloaded != size 说明异常，判为 early EOF 避免虚假完成
+        let error_msg = format!(
+            "early EOF on exit: expected {} bytes ({}-{}), got {}",
+            expected_size, start_byte, end, final_downloaded
+        );
+        ::tracing::error!(chunk_id = id, offset, end, final_downloaded, expected = expected_size, error = %error_msg, "exit early EOF");
+        let _ = bd_tx.send(DownloadInfo::ChunkFailed {
+            id,
+            start: offset,
+            end,
+            error: error_msg,
+        });
     } else {
         ::tracing::warn!(chunk_id = id, "chunk exit with failure");
     }

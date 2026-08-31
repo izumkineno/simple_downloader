@@ -125,10 +125,10 @@ impl DownloadState {
     }
 
     /// 将一个块标记为已完成。
-    /// 使用真实 `downloaded_bytes` 累加，避免截断流零填充尾部却按 `size()` 多算。
+    /// 使用真实 `downloaded_bytes` 累加并以 `min(size)` 防超算，避免截断流零填充尾部却按 `size()` 多算。
     pub fn complete_chunk(&mut self, id: &ChunkId) {
         if let Some(chunk) = self.chunks.remove(id) {
-            self.completed_bytes += chunk.downloaded_bytes;
+            self.completed_bytes += chunk.downloaded_bytes.min(chunk.size());
         }
     }
 
