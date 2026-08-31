@@ -59,25 +59,25 @@ let downloader = Downloader::builder("https://example.com/file.bin", "output.bin
 
 ## Feature Flags 配置
 
-以 `Cargo.toml:14-19` 为准，默认**不启用**任何可选 feature（`default = []`）：
+以 `Cargo.toml:14-20` 为准，默认**不启用**任何可选 feature（`default = []`）：
 
 | Feature | 默认 | 隐含依赖 | 说明 |
 |---------|------|----------|------|
 | `resume` | ❌ | `bitcode@0.6` | 断点续传、`*.download.bitcode`、`resume(bool)`/`with_resume` |
-| `progress` | ❌ | — | `DownloadInfo` 与 `run(handler)` 进度回调 |
+| `progress` | ❌ | — | `DownloadInfo`（`0.5.5+ #[non_exhaustive]` 稳定契约）与 `run(handler)` |
 | `multi-source` | ❌ | — | `MultiSourceConfig`/`SourceConfig`/`LaneModel`、`Downloader::new_multi` |
 | `proxy` | ❌ | `multi-source` | `ProxyConfig`、`SourceConfig::with_proxies`，支持 `http/https/socks5` |
+| `rate-limit` | ❌ | `governor@0.7` | 全局/分源限速 `governor` 令牌桶 `1 token=1 byte` |
 | `default` | ❌ | — | 仅基础单源多线程下载 `Downloader::builder().download()` |
 
 ```toml
 # 最轻量
-simple_downloader = { version = "0.3", default-features = false }
+simple_downloader = { version = "0.5", default-features = false }
 # 常用：基础 + 断点续传 + 进度
-simple_downloader = { version = "0.3", default-features = false, features = ["resume","progress"] }
-# 全功能
-simple_downloader = { version = "0.3", default-features = false, features = ["resume","progress","multi-source","proxy"] }
+simple_downloader = { version = "0.5", default-features = false, features = ["resume","progress"] }
+# 全功能（含限速）
+simple_downloader = { version = "0.5", default-features = false, features = ["resume","progress","multi-source","proxy","rate-limit"] }
 ```
-
 > 历史文档中 `default = [resume, progress, ...]` 与 `full` 已过时。
 
 ## 多源下载配置（`multi-source` feature）
@@ -185,13 +185,22 @@ Downloader::builder("https://example.com/large.bin", "output.bin")
     .build();
 ```
 
-## 配置验证
+## 运行时热更新（0.5.5 配置灵活性）
 
-当前 `Downloader` 未暴露 `workers()` getter，校验应以 `DownloadBuilder` 的构建参数或运行时 `DownloadInfo::MonitorUpdate.chunk_details`/`total_speed` 为准，勿断言 `downloader.workers()`。
+`src/config.rs::RuntimeConfig` + `DownloadMonitor::apply_config` 支持下载进行中调整：
+
+```rust
+use simple_downloader::{config::{RuntimeConfig, new_shared, apply_config}, DownloadMonitor};
+let shared = new_shared(RuntimeConfig::default().with_workers(8).with_update_interval(0.5));
+// ... monitor 创建后 ...
+apply_config(&shared, RuntimeConfig::default().with_workers(16));
+// monitor.apply_config(&shared.read());
+```
+
+可热更字段：`workers`（`ConcurrencyManager::set_max_workers`）、`update_interval`、`speed_limit/burst`（`limiter::RateLimiter::apply` 待接）。为后续 `queue pause/resume` 与 `智能评分 burst` 打前站。
+
+> `DownloadInfo` 自 `0.5.5` 标记 `#[non_exhaustive]`，新增变体/字段为兼容变更，`match` 需 `_` 分支。
 
 ## 配置最佳实践
-
-1. 优先 `Downloader::builder(url, path)` 而非 `Downloader::new`（后者仅多源 `new_multi` 必要时使用）
-2. 大文件加长 `timeout`，小文件减 `workers`
 3. 多源仅对同文件多镜像生效，需保证各源 `Content-Length` 一致
 4. 代理优先走 `NO_PROXY` 环境变量，避免硬编码密码

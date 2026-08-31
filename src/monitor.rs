@@ -83,6 +83,14 @@ impl DownloadMonitor {
         self.is_rate_limited = limited;
     }
 
+    /// 0.5.5 热更新：运行时调整并发与间隔（配置灵活性）
+    pub fn apply_config(&mut self, cfg: &crate::config::RuntimeConfig) {
+        self.concurrency_manager.set_max_workers(cfg.workers);
+        if cfg.update_interval > 0.0 && cfg.update_interval.is_finite() {
+            self.update_interval = cfg.update_interval;
+        }
+        ::tracing::info!(workers = cfg.workers, interval = self.update_interval, "monitor apply_config hot-update");
+    }
     /// 运行监控器的主事件循环。
     ///
     /// 这个循环会监听来自各个下载块的信息，并定期触发状态更新、并发决策和重试处理。

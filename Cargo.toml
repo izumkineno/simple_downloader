@@ -35,9 +35,10 @@ bitcode = { version = "0.6.9", optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 governor = { version = "0.7", optional = true }
+parking_lot = "0.12"
+
 [dev-dependencies]
 indicatif = "0.18.4"
-tokio-test = "0.4.5"
 mockito = "1.5.0"
 tempfile = "3.13.0"
 assert2 = "0.4.0"

@@ -161,6 +161,7 @@ pub mod retry;
 pub mod state;
 pub mod trace;
 pub mod limiter;
+pub mod config;
 mod types;
 #[doc(hidden)]
 pub mod util;
