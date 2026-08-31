@@ -112,16 +112,27 @@ impl TaskQueue {
     ) -> TaskId {
         let url: FastStr = url.into();
         let desired: PathBuf = output.into();
-        let final_path = self.resolve_rename(&desired).await;
-        let mut task = Task::new(url, final_path.clone(), workers.max(1));
-        task.output_path = final_path.clone();
-        let id = task.id.clone();
-        {
+        let (id, final_path) = loop {
+            let final_path = self.resolve_rename(&desired).await;
+            let mut task = Task::new(url.clone(), final_path.clone(), workers.max(1));
+            task.output_path = final_path.clone();
+            let id = task.id.clone();
             let mut s = self.state.lock().await;
-            s.occupied.insert(path_key(&final_path));
+            let key = path_key(&final_path);
+            let disk_exists = final_path.exists();
+            let sidecar_exists = sidecar_path(&final_path)
+                .as_ref()
+                .map(|path| path.exists())
+                .unwrap_or(false);
+            if s.occupied.contains(&key) || disk_exists || sidecar_exists {
+                ::tracing::debug!(candidate=%final_path.display(), "rename enqueue CAS conflict, retry");
+                continue;
+            }
+            s.occupied.insert(key);
             s.queue.push_back(task.clone());
             s.all.insert(id.clone(), task);
-        }
+            break (id, final_path);
+        };
         let _ = self.tx.send(QueueCmd::Pump).await;
         self.notify.notify_waiters();
         ::tracing::info!(task_id=%id, path=%final_path.display(), "queue enqueue");
@@ -294,7 +305,7 @@ impl TaskQueue {
     }
 
     async fn resolve_rename(&self, desired: &Path) -> PathBuf {
-        let occupied_snapshot: HashSet<String> = {
+        let mut occupied_snapshot: HashSet<String> = {
             let s = self.state.lock().await;
             s.occupied.clone()
         };
@@ -312,13 +323,16 @@ impl TaskQueue {
             };
             if !in_occupied && !disk_exists && !sidecar_exists {
                 let s = self.state.lock().await;
-                let key2 = path_key(&candidate);
-                let still_occupied = s.occupied.contains(&key2);
+                let key = path_key(&candidate);
                 let disk_sync = candidate.exists();
-                let sidecar_sync = sidecar_opt.as_ref().map(|p| p.exists()).unwrap_or(false);
-                if !still_occupied && !disk_sync && !sidecar_sync {
-                    break candidate;
+                let sidecar_sync = sidecar_opt
+                    .as_ref()
+                    .map(|p| p.exists())
+                    .unwrap_or(false);
+                if !s.occupied.contains(&key) && !disk_sync && !sidecar_sync {
+                    return candidate;
                 }
+                occupied_snapshot = s.occupied.clone();
                 ::tracing::debug!(candidate=%candidate.display(), "rename CAS conflict, retry");
             }
             n += 1;
@@ -517,5 +531,24 @@ mod tests {
         assert_eq!(with_suffix(Path::new("a.tar.gz"), 1), PathBuf::from("a.tar(1).gz"));
         assert_eq!(with_suffix(Path::new(".gitignore"), 1), PathBuf::from(".gitignore(1)"));
         assert_eq!(with_suffix(Path::new("dir/a.bin"), 1), PathBuf::from("dir/a(1).bin"));
+    }
+    #[tokio::test]
+    async fn concurrent_enqueue_assigns_unique_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let desired = dir.path().join("a.bin");
+        let queue = TaskQueue::new();
+
+        futures_util::future::join_all((0..20).map(|_| {
+            queue.enqueue("http://127.0.0.1:1/unreachable", desired.clone())
+        }))
+        .await;
+        let paths: std::collections::HashSet<_> = queue
+            .snapshot_all()
+            .await
+            .into_iter()
+            .map(|task| task.output_path)
+            .collect();
+
+        assert_eq!(paths.len(), 20);
     }
 }
