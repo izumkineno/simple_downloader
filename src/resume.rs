@@ -135,6 +135,7 @@ impl ResumeMetadata {
                 "resume metadata segment size must not be zero".to_owned(),
             ));
         }
+        // P0-5: any shape mismatch triggers sidecar self-heal (delete + rebuild full_ranges)
         Ok(())
     }
 

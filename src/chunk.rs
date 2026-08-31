@@ -248,6 +248,7 @@ pub async fn chunk_run(
                     _ => {}
                 },
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    // P0-3: keep broadcast,仅 warn skip 不退出，biased select 保控制优先
                     ::tracing::warn!(chunk_id = id, skipped, "broadcast lagged, skip control commands");
                 }
                 Err(broadcast::error::RecvError::Closed) => {

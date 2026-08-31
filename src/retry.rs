@@ -1,4 +1,5 @@
 //! 管理失败下载块的重试逻辑。
+//! P0-6: retry_queue 10×2s + delayed 10s (总量30), push_back FIFO, pop_ready扫描首个就绪防队头阻塞
 
 use crate::state::DownloadState;
 use crate::types::{ChunkId, DownloadInfo};
