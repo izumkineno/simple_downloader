@@ -184,7 +184,7 @@ impl DownloadMonitor {
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         self.lagged_count += skipped;
                         ::tracing::warn!(skipped, total_lagged = self.lagged_count, pending_bisects = self.pending_bisects.len(), active_chunks = self.state.chunks.len(), tasks = tasks.len(), "broadcast lagged, skip events");
-                        // P0-C1 轻量对账：若 tasks 已空但 state 仍有残留，说明 Complete/Failed 丢失，可能挂死，下次 tick 将尝试重试
+                        // P0-3: Lagged reconciliation — keep broadcast, count + DownloadState对账, 不切 mpsc
                         if tasks.is_empty() && !self.state.chunks.is_empty() {
                             ::tracing::error!(active_chunks = self.state.chunks.len(), total_lagged = self.lagged_count, "lagged reconciliation: tasks empty but state has chunks, will reconcile on next tick");
                         }
@@ -443,7 +443,7 @@ impl DownloadMonitor {
             ::tracing::debug!(drained = drained_pending, tasks = tasks.len(), "drained pending_bisects");
         }
 
-        // 委托重试处理：处理重试队列
+        // 委托重试处理：处理重试队列 — P0-6: delayed 10s 单独计时，不叠加 retry 2s
         let before_retry = self.retry_handler.retry_queue_len();
         let before_delayed = self.retry_handler.delayed_queue_len();
         self.retry_handler.process_queues();

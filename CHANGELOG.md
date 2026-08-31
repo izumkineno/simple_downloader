@@ -21,6 +21,19 @@
 
 ---
 
+## [0.5.4] - 2026-08-31
+
+### 🐛 修复（P0 热修复 6 项 — fix/p0-rebase）
+
+- **P0-1 Range 206 校验** `chunk.rs:69-96` `util.rs:195`：206 必带 `Content-Range` 且 `start/end` 与请求一致否则 `ChunkFailed(range mismatch)`；200 仅 `start==0` 单段全量降级否则失败；416 → `ChunkFailed(status + Content-Range)`；`parse_content_range` `pub(crate)` 大小写兼容 `bytes */total`；3 mockito 用例 sha256 断言
+- **P0-2 Early-EOF 完整性** `chunk.rs:331-393` `state.rs:129`：`bytes_stream None` 时 `offset < end+1 → ChunkFailed(early EOF)` 且 `!failed && final_downloaded==size` 才 `DownloadComplete`；`state::complete_chunk += min(downloaded_bytes, size)` 防超算；截断流 mockito 用例
+- **P0-3 Broadcast Lagged** `monitor.rs:165-171` `chunk.rs:139-145`：`Lagged(n)` 计数+`DownloadState` 对账，不切 `mpsc`；保留 `broadcast`，`PROGRESS_THROTTLE 64KiB/50ms`；Lagged 注入 32 workers 高并发测试不丢 `MonitorUpdate`
+- **P0-4 流式追加（Contrarian）** `util.rs:273-318` `downloader.rs:535-544`：移除 `set_len` 预分配，仅 `create_dir_all`；`file_writer_task` 纯流式 `mpsc 128` 追加；`ENOSPC` 直接 `DownloadError::Io` 不留空文件；`parent mkdir` 用例
+- **P0-5 Resume 自愈** `resume.rs:120-139,206` `validate_shape` 任一 `version!=1 || file_size不一致 || segment_size==0` 即删 `*.download.bitcode` 重建 `ResumeMetadata` + `full_ranges`；损坏 sidecar mockito 重建后下载成功
+- **P0-6 Retry 计时/FIFO** `retry.rs:102-235` `monitor.rs:446-502`：`retry_queue 10×2s` + `delayed 10s`（`failure_time -=2s, attempts=0` 重置，总量 30 `MAX_TOTAL_ATTEMPTS`）`push_back` 保 FIFO，`pop_ready_chunk` 扫描首个就绪防队头阻塞；计时不叠加（`delayed=10s` 单独）
+
+---
+
 ## [0.5.3] - 2026-08-31
 
 ### 📝 文档
@@ -260,6 +273,22 @@
 - `futures-util`: 异步工具，版本 0.3+
 - `serde` + `bincode`: 断点续传元数据序列化（可选）
 
+### 🔒 安全
+
+- 使用安全的文件写入方式，避免数据损坏
+- 验证 SSL 证书，防止中间人攻击
+- 不保存任何敏感信息到磁盘
+
+### 📦 依赖
+
+- `tokio`: 异步运行时，版本 1.0+
+- `reqwest`: HTTP 客户端，版本 0.11+
+- `thiserror`: 错误处理，版本 1.0+
+- `bytes`: 字节处理，版本 1.0+
+- `faststr`: 高性能字符串，版本 0.2+
+- `futures-util`: 异步工具，版本 0.3+
+- `serde` + `bincode`: 断点续传元数据序列化（可选）
+
 ## 版本说明
 
 ### 语义化版本控制
@@ -282,7 +311,7 @@
 
 Minor 级向后兼容：`cargo update -p simple_downloader` 即可
 
-- **新增 `rate-limit` feature** 默认不启用，启用后 `DownloadBuilder::speed_limit(bps)` 全局、`SourceConfig::with_speed_limit` 分源、`with_burst` 突发可配，`0` 值返回 `InvalidArgument`，`test_server` 精度矩阵 `±10%` 验证
+- **新增 `rate-limit` feature** 默认不启用，启用后 `DownloadBuilder::speed_limit(bps)` 全局、`SourceConfig::with_speed_limit(bps)` 分源、`with_burst` 突发可配，`0` 值返回 `InvalidArgument`，`test_server` 精度矩阵 `±10%` 验证
 - **全局硬上限** `global 500KiB/s + per_source 400+400` 时实际 `≤525KiB/s`，不报错按剩余分配；`limit >4GiB/s` 需分片，文档已说明
 - **自适应冻结** 限速启用时 `ConcurrencyManager` 不因限速误判，`adaptive_bench` 不劣化>10%
 - 其余 `0.4.0` API 保持不变
@@ -298,33 +327,3 @@ Minor 级向后兼容：`cargo update -p simple_downloader` 即可
 
 ### 从 0.3.0 升级到 0.3.1
 
-Patch 级向后兼容：`cargo update -p simple_downloader` 即可
-
-- `MissingContentLength` 不再直接 `Err`，`Downloader` 自动 `streaming_download` 单流回退（`Transfer-Encoding: chunked`），`DownloadInfo::is_complete` 对 `0/N` 改为 `downloaded==0` 语义
-- 其余 `0.3.0` API 保持不变
-
-### 从 0.2.0 升级到 0.3.0
-
-向后兼容，无破坏 API（新增 `supports_ranges`/`PermanentFailure`/`pending_bisects` 均为内部或新增分支）：`cargo update -p simple_downloader` 即可
-
-- `LaneScheduler::best_lane` 改 `&mut self`（`MultiRuntime` 已同步），`lane_health` 语义不变；外部直接调用需 `mut`
-- `MultiRuntime` 新增 `supports_ranges:bool` 公开字段，`from_config` 仍 `(u64,Self)` 不破
-- `DownloadInfo::is_complete` 修正 `0>=0 true`，`0 字节` 进度回调首次即完成
-- `get_file_info` 对 `501`/`4xx` 探测自动回退 `HEAD`，无需变更调用方
-- 其它：`pending_bisects`/`preserve_partial`/`blacklist 30s`/`CHANNEL 4096`/`flush` 均为内部行为优化
-
-### 从 0.1.0 升级到 0.2.0
-
-0.2.0 完全向后兼容，无破坏性 API 变更。直接 `cargo update -p simple_downloader` 即可：
-
-- 新增 `ResumePlan::prepare_async`（内部使用），原 `prepare` 保留兼容
-- `ResumeRecorder` 增 `pending_segments/last_save` 与 `flush()`，对外不暴露破坏
-- 新增 `DownloadError::PermanentFailure(String)` 变体（重试熔断），仅作为新增错误分支，现有 `match` 需补 `_` 或显式处理该分支
-- 性能行为变更：`ChunkProgress` 节流（64KiB/50ms）、`save_atomic` 16段/1s 批量、`FileWriter` 128KiB 合并、`MultiRuntime` 并行探测、`Client` 连接池注入；下载结果不变，仅更少系统调用与广播
-- 文档 `configuration.md/installation.md/best-practices.md` 修正为真实 API，无需代码迁移
-
-### 从 0.0.x 升级到 0.1.0
-
-0.1.0 是第一个公开版本，没有之前的版本，直接安装即可。
-
-### 重大变更说明
