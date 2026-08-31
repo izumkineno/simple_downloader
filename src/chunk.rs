@@ -502,12 +502,17 @@ pub(crate) async fn chunk_run_with_reliable(
                 total = expected_size,
                 "final progress補發"
             );
-            let _ = bd_tx.send(DownloadInfo::ChunkProgress {
+            // 補發的最终进度走可靠通道，避免 broadcast Lagged 丢事件导致 state.downloaded 滞后而卡住完成判定
+            let progress = DownloadInfo::ChunkProgress {
                 id,
                 start_byte,
                 end_byte: end,
                 downloaded: final_downloaded,
-            });
+            };
+            if let Some(reliable_tx) = &reliable_tx {
+                let _ = reliable_tx.send(progress.clone()).await;
+            }
+            let _ = bd_tx.send(progress);
         }
         // 如果没有发生失败且下载量匹配，则广播下载完成消息
         ::tracing::debug!(chunk_id = id, "DownloadComplete");

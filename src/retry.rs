@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 /// 每个块的最大即时重试次数。
 const MAX_RETRIES: u32 = 10;
 /// 两次即时重试之间的最小延迟。
-const RETRY_DELAY: Duration = Duration::from_secs(2);
+const RETRY_DELAY: Duration = Duration::from_secs(1);
 /// 当达到最大即时重试次数后，进入延迟重试队列的等待时间。
 const DELAYED_RETRY_DURATION: Duration = Duration::from_secs(10);
 /// 单块跨延迟周期的最大总尝试次数，超过则判永久失败避免永重试挂死。
