@@ -16,6 +16,17 @@ use tokio::sync::{broadcast, mpsc};
 /// 当一个块被分割时，分割后的每个块的大小不能小于此值。
 pub(crate) const MIN_CHUNK_SIZE: u64 = 1024 * 10; // 10 KB
 
+async fn send_terminal_event(
+    reliable_tx: &Option<mpsc::Sender<DownloadInfo>>,
+    broadcast_tx: &broadcast::Sender<DownloadInfo>,
+    info: DownloadInfo,
+) -> bool {
+    if let Some(reliable_tx) = reliable_tx {
+        let _ = reliable_tx.send(info.clone()).await;
+    }
+    broadcast_tx.send(info).is_ok()
+}
+
 fn split_range(offset: u64, end: u64) -> Option<(u64, u64)> {
     let remaining_bytes = end.saturating_sub(offset).saturating_add(1);
     if remaining_bytes < MIN_CHUNK_SIZE * 2 {
@@ -41,11 +52,38 @@ fn split_range(offset: u64, end: u64) -> Option<(u64, u64)> {
 /// - `start_byte`: 此块下载的起始字节位置。
 /// - `end_byte`: 此块下载的结束字节位置。
 #[allow(clippy::too_many_arguments, unused_variables)]
+pub async fn chunk_run(
+    id: ChunkId,
+    cmd_tx: mpsc::Sender<DownloadCmd>,
+    bd_rx: broadcast::Receiver<DownloadCmd>,
+    bd_tx: broadcast::Sender<DownloadInfo>,
+    rb: RequestBuilder,
+    start_byte: u64,
+    end_byte: u64,
+    global_limiter: Option<Arc<RateLimiter>>,
+    per_source_limiter: Option<Arc<RateLimiter>>,
+) {
+    chunk_run_with_reliable(
+        id,
+        cmd_tx,
+        bd_rx,
+        bd_tx,
+        rb,
+        start_byte,
+        end_byte,
+        global_limiter,
+        per_source_limiter,
+        None,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments, unused_variables)]
 #[::tracing::instrument(
-    skip(cmd_tx, bd_rx, bd_tx, rb, global_limiter, per_source_limiter),
+    skip(cmd_tx, bd_rx, bd_tx, rb, global_limiter, per_source_limiter, reliable_tx),
     fields(chunk_id = id, start_byte = start_byte, end_byte = end_byte, size = end_byte.saturating_sub(start_byte).saturating_add(1))
 )]
-pub async fn chunk_run(
+pub(crate) async fn chunk_run_with_reliable(
     id: ChunkId,
     cmd_tx: mpsc::Sender<DownloadCmd>,
     mut bd_rx: broadcast::Receiver<DownloadCmd>,
@@ -55,6 +93,7 @@ pub async fn chunk_run(
     end_byte: u64,
     global_limiter: Option<Arc<RateLimiter>>,
     per_source_limiter: Option<Arc<RateLimiter>>,
+    reliable_tx: Option<mpsc::Sender<DownloadInfo>>,
 ) {
     let mut end = end_byte;
     let mut offset = start_byte;
@@ -104,24 +143,34 @@ pub async fn chunk_run(
                                     "Content-Range mismatch: expected bytes {start_byte}-{end_byte}/*, got {cr_str}"
                                 );
                                 ::tracing::error!(chunk_id = id, range = %range_header, content_range = %cr_str, error = %error_msg, "range mismatch");
-                                let _ = bd_tx.send(DownloadInfo::ChunkFailed {
-                                    id,
-                                    start: start_byte,
-                                    end,
-                                    error: error_msg,
-                                });
+                                send_terminal_event(
+                                    &reliable_tx,
+                                    &bd_tx,
+                                    DownloadInfo::ChunkFailed {
+                                        id,
+                                        start: start_byte,
+                                        end,
+                                        error: error_msg,
+                                    },
+                                )
+                                .await;
                                 return;
                             }
                         } else {
                             let error_msg =
                                 format!("invalid Content-Range header for 206: {cr_str}");
                             ::tracing::error!(chunk_id = id, range = %range_header, error = %error_msg, "invalid Content-Range");
-                            let _ = bd_tx.send(DownloadInfo::ChunkFailed {
-                                id,
-                                start: start_byte,
-                                end,
-                                error: error_msg,
-                            });
+                            send_terminal_event(
+                                &reliable_tx,
+                                &bd_tx,
+                                DownloadInfo::ChunkFailed {
+                                    id,
+                                    start: start_byte,
+                                    end,
+                                    error: error_msg,
+                                },
+                            )
+                            .await;
                             return;
                         }
                     }
@@ -129,12 +178,17 @@ pub async fn chunk_run(
                         let error_msg =
                             "missing Content-Range header for 206 Partial Content".to_string();
                         ::tracing::error!(chunk_id = id, range = %range_header, error = %error_msg, "missing Content-Range");
-                        let _ = bd_tx.send(DownloadInfo::ChunkFailed {
-                            id,
-                            start: start_byte,
-                            end,
-                            error: error_msg,
-                        });
+                        send_terminal_event(
+                            &reliable_tx,
+                            &bd_tx,
+                            DownloadInfo::ChunkFailed {
+                                id,
+                                start: start_byte,
+                                end,
+                                error: error_msg,
+                            },
+                        )
+                        .await;
                         return;
                     }
                 }
@@ -148,12 +202,17 @@ pub async fn chunk_run(
                     "416 Range Not Satisfiable for Range request bytes={start_byte}-{end_byte}, Content-Range: {cr_info}, status: {status}"
                 );
                 ::tracing::error!(chunk_id = id, range = %range_header, status = %status, content_range = %cr_info, error = %error_msg, "416 not satisfiable");
-                let _ = bd_tx.send(DownloadInfo::ChunkFailed {
-                    id,
-                    start: start_byte,
-                    end,
-                    error: error_msg,
-                });
+                send_terminal_event(
+                    &reliable_tx,
+                    &bd_tx,
+                    DownloadInfo::ChunkFailed {
+                        id,
+                        start: start_byte,
+                        end,
+                        error: error_msg,
+                    },
+                )
+                .await;
                 return;
             } else if status == reqwest::StatusCode::OK {
                 // 仅允许单段全量降级：start_byte 必须为 0 (P0-1 spec: workers==1 && start==0 && end==file_size-1)
@@ -163,12 +222,17 @@ pub async fn chunk_run(
                         "server returned 200 OK but Range requested {start_byte}-{end_byte}, only single-segment full download (0-*) is allowed to downgrade"
                     );
                     ::tracing::error!(chunk_id = id, range = %range_header, status = %status, error = %error_msg, "range ignored");
-                    let _ = bd_tx.send(DownloadInfo::ChunkFailed {
-                        id,
-                        start: start_byte,
-                        end,
-                        error: error_msg,
-                    });
+                    send_terminal_event(
+                        &reliable_tx,
+                        &bd_tx,
+                        DownloadInfo::ChunkFailed {
+                            id,
+                            start: start_byte,
+                            end,
+                            error: error_msg,
+                        },
+                    )
+                    .await;
                     return;
                 }
                 ::tracing::warn!(chunk_id = id, range = %range_header, status = %status, "server ignored Range, returned 200 OK, downgrading to single-stream full download");
@@ -183,12 +247,17 @@ pub async fn chunk_run(
                     status
                 );
                 ::tracing::error!(chunk_id = id, range = %range_header, status = %status, error = %error_msg, "unexpected status");
-                let _ = bd_tx.send(DownloadInfo::ChunkFailed {
-                    id,
-                    start: start_byte,
-                    end,
-                    error: error_msg,
-                });
+                send_terminal_event(
+                    &reliable_tx,
+                    &bd_tx,
+                    DownloadInfo::ChunkFailed {
+                        id,
+                        start: start_byte,
+                        end,
+                        error: error_msg,
+                    },
+                )
+                .await;
                 return;
             }
             resp
@@ -197,12 +266,17 @@ pub async fn chunk_run(
             let error_msg = format!("{e}");
             ::tracing::error!(chunk_id = id, range = %range_header, error = %error_msg, "chunk request failed");
             // 发送块失败信息
-            let _ = bd_tx.send(DownloadInfo::ChunkFailed {
-                id,
-                start: start_byte,
-                end,
-                error: error_msg,
-            });
+            send_terminal_event(
+                &reliable_tx,
+                &bd_tx,
+                DownloadInfo::ChunkFailed {
+                    id,
+                    start: start_byte,
+                    end,
+                    error: error_msg,
+                },
+            )
+            .await;
             return;
         }
     };
@@ -226,12 +300,18 @@ pub async fn chunk_run(
                             continue;
                         };
 
-                        // 广播“块已分割”事件，通知监控器创建新任务
-                        if bd_tx.send(DownloadInfo::ChunkBisected {
-                            original_id: id,
-                            new_start: new_chunk_start,
-                            new_end: end,
-                        }).is_ok() {
+                        // 广播供 UI 观察，同时通过有界 mpsc 可靠交付给 monitor。
+                        if send_terminal_event(
+                            &reliable_tx,
+                            &bd_tx,
+                            DownloadInfo::ChunkBisected {
+                                original_id: id,
+                                new_start: new_chunk_start,
+                                new_end: end,
+                            },
+                        )
+                        .await
+                        {
                             ::tracing::info!(chunk_id = id, kept_range = format!("{offset}-{midpoint}"), new_range = format!("{new_chunk_start}-{end}"), "chunk bisected");
                             ::tracing::debug!(chunk_id = id, offset, midpoint, new_start = new_chunk_start, new_end = end, "bisected detail");
                             // 更新当前块的结束位置
@@ -304,7 +384,17 @@ pub async fn chunk_run(
                         if actual != last_reported {
                             let _ = bd_tx.send(DownloadInfo::ChunkProgress { id, start_byte, end_byte: end, downloaded: actual });
                         }
-                        let _ = bd_tx.send(DownloadInfo::ChunkFailed { id, start: offset, end, error: error_msg });
+                        send_terminal_event(
+                            &reliable_tx,
+                            &bd_tx,
+                            DownloadInfo::ChunkFailed {
+                                id,
+                                start: offset,
+                                end,
+                                error: error_msg,
+                            },
+                        )
+                        .await;
                         failed = true;
                         break;
                     }
@@ -342,7 +432,17 @@ pub async fn chunk_run(
                     if actual != last_reported {
                         let _ = bd_tx.send(DownloadInfo::ChunkProgress { id, start_byte, end_byte: end, downloaded: actual });
                     }
-                    let _ = bd_tx.send(DownloadInfo::ChunkFailed { id, start: offset, end, error: error_msg });
+                    send_terminal_event(
+                        &reliable_tx,
+                        &bd_tx,
+                        DownloadInfo::ChunkFailed {
+                            id,
+                            start: offset,
+                            end,
+                            error: error_msg,
+                        },
+                    )
+                    .await;
                     failed = true;
                     break;
                 },
@@ -362,12 +462,17 @@ pub async fn chunk_run(
                         if actual != last_reported {
                             let _ = bd_tx.send(DownloadInfo::ChunkProgress { id, start_byte, end_byte: end, downloaded: actual });
                         }
-                        let _ = bd_tx.send(DownloadInfo::ChunkFailed {
-                            id,
-                            start: offset,
-                            end,
-                            error: error_msg,
-                        });
+                        send_terminal_event(
+                            &reliable_tx,
+                            &bd_tx,
+                            DownloadInfo::ChunkFailed {
+                                id,
+                                start: offset,
+                                end,
+                                error: error_msg,
+                            },
+                        )
+                        .await;
                         failed = true;
                     }
                     break;
@@ -406,7 +511,12 @@ pub async fn chunk_run(
         }
         // 如果没有发生失败且下载量匹配，则广播下载完成消息
         ::tracing::debug!(chunk_id = id, "DownloadComplete");
-        let _ = bd_tx.send(DownloadInfo::DownloadComplete(id));
+        send_terminal_event(
+            &reliable_tx,
+            &bd_tx,
+            DownloadInfo::DownloadComplete(id),
+        )
+        .await;
     } else if !failed {
         // !failed 但 final_downloaded != size 说明异常，判为 early EOF 避免虚假完成
         let error_msg = format!(
@@ -414,12 +524,17 @@ pub async fn chunk_run(
             expected_size, start_byte, end, final_downloaded
         );
         ::tracing::error!(chunk_id = id, offset, end, final_downloaded, expected = expected_size, error = %error_msg, "exit early EOF");
-        let _ = bd_tx.send(DownloadInfo::ChunkFailed {
-            id,
-            start: offset,
-            end,
-            error: error_msg,
-        });
+        send_terminal_event(
+            &reliable_tx,
+            &bd_tx,
+            DownloadInfo::ChunkFailed {
+                id,
+                start: offset,
+                end,
+                error: error_msg,
+            },
+        )
+        .await;
     } else {
         ::tracing::warn!(chunk_id = id, "chunk exit with failure");
     }
@@ -444,5 +559,24 @@ mod tests {
         let end = (MIN_CHUNK_SIZE * 2) - 2;
 
         assert_eq!(split_range(0, end), None);
+    }
+
+    #[tokio::test]
+    async fn terminal_event_survives_broadcast_without_receivers() {
+        let (reliable_tx, mut reliable_rx) = mpsc::channel(1);
+        let reliable_tx = Some(reliable_tx);
+        let (broadcast_tx, broadcast_rx) = broadcast::channel(1);
+        drop(broadcast_rx);
+
+        assert!(!send_terminal_event(
+            &reliable_tx,
+            &broadcast_tx,
+            DownloadInfo::DownloadComplete(7),
+        )
+        .await);
+        assert!(matches!(
+            reliable_rx.recv().await,
+            Some(DownloadInfo::DownloadComplete(7))
+        ));
     }
 }
