@@ -118,7 +118,7 @@ async fn test_file_writer_task() {
     let path = temp_file.path().to_str().unwrap();
     let file_size = 100u64;
 
-    // 创建写入任务
+    // 创建写入任务 — P0-4 streaming: no preallocation, file grows on demand
     let (tx, handle) = file_writer_task(FastStr::new(path), file_size)
         .await
         .unwrap();
@@ -139,19 +139,21 @@ async fn test_file_writer_task() {
     tx.send(DownloadCmd::TerminateAll).await.unwrap();
 
     // 等待写入完成
-    handle.await.unwrap();
+    handle.await.unwrap().unwrap();
 
-    // 读取文件内容验证
+    // 读取文件内容验证 — streaming: file length is max written offset + len (15), not preallocated 100
     let mut file = fs::File::open(path).await.unwrap();
     let metadata = file.metadata().await.unwrap();
-    assert_eq!(metadata.len(), file_size);
+    // streaming: file should be at least 15 bytes (highest write), not preallocated to 100
+    assert!(metadata.len() >= 15, "streaming file should be at least 15 bytes, got {}", metadata.len());
+    assert!(metadata.len() <= file_size, "streaming file should not exceed file_size");
 
     let mut content = Vec::new();
     file.read_to_end(&mut content).await.unwrap();
 
     assert_eq!(&content[0..5], b"Hello");
     assert_eq!(&content[10..15], b"World");
-    // 中间未写入部分应该是0填充
+    // 中间未写入部分应该是0填充 (sparse hole)
     for i in 5..10 {
         assert_eq!(content[i], 0);
     }
