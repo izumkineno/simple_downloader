@@ -120,6 +120,7 @@ impl DownloadMonitor {
     /// 运行监控器的主事件循环。
     ///
     /// 这个循环会监听来自各个下载块的信息，并定期触发状态更新、并发决策和重试处理。
+    #[allow(clippy::too_many_arguments)]
     pub async fn run(
         self,
         info_rx: broadcast::Receiver<DownloadInfo>,

@@ -18,6 +18,7 @@ mod imp {
     };
 
     /// 字节级限速器（`governor` 封装）。
+    #[allow(clippy::type_complexity)]
     #[derive(Clone)]
     pub struct RateLimiter {
         inner: Arc<parking_lot::RwLock<Option<Arc<GovLimiter<NotKeyed, InMemoryState, QuantaClock>>>>>,
