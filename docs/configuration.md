@@ -68,6 +68,7 @@ let downloader = Downloader::builder("https://example.com/file.bin", "output.bin
 | `multi-source` | ❌ | — | `MultiSourceConfig`/`SourceConfig`/`LaneModel`、`Downloader::new_multi` |
 | `proxy` | ❌ | `multi-source` | `ProxyConfig`、`SourceConfig::with_proxies`，支持 `http/https/socks5` |
 | `rate-limit` | ❌ | `governor@0.7` | 全局/分源限速 `governor` 令牌桶 `1 token=1 byte` |
+| `queue` | ❌ | `uuid@1` | 任务队列 FIFO/并发/pause/resume/cancel/重命名 `TaskQueue` |
 | `default` | ❌ | — | 仅基础单源多线程下载 `Downloader::builder().download()` |
 
 ```toml
@@ -75,12 +76,13 @@ let downloader = Downloader::builder("https://example.com/file.bin", "output.bin
 simple_downloader = { version = "0.6", default-features = false }
 # 常用：基础 + 断点续传 + 进度
 simple_downloader = { version = "0.6", default-features = false, features = ["resume","progress"] }
-# 全功能（含限速）
-simple_downloader = { version = "0.6", default-features = false, features = ["resume","progress","multi-source","proxy","rate-limit"] }
+# 队列
+simple_downloader = { version = "0.6", default-features = false, features = ["queue"] }
+# 全功能（含限速与队列）
+simple_downloader = { version = "0.6", default-features = false, features = ["resume","progress","multi-source","proxy","rate-limit","queue"] }
 ```
-> 历史文档中 `default = [resume, progress, ...]` 与 `full` 已过时。
-
 ## 多源下载配置（`multi-source` feature）
+
 
 ### 构造示例（以 `docs/usage.md` §7 为准）
 

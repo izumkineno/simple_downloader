@@ -81,7 +81,6 @@ cargo run --example download
 ## 五、项目结构速览
 
 ```text
-simple_downloader/
 ├── src/
 │   ├── downloader.rs    # 顶层启动编排
 │   ├── monitor.rs       # 运行时控制循环
@@ -92,6 +91,9 @@ simple_downloader/
 │   ├── util.rs          # 文件信息探测、流式写入任务（P0-4）
 │   ├── limiter.rs       # rate-limit 令牌桶（0.5.x）
 │   ├── trace.rs         # tracing 初始化门面
+│   ├── config.rs        # 运行时热更新 RuntimeConfig
+│   ├── queue.rs         # 任务队列 FIFO/并发调度（0.6.x）
+│   ├── task.rs          # 任务句柄与快照
 │   └── types.rs         # 公共协议类型
 ├── tests/
 │   ├── chunk.rs

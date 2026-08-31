@@ -23,10 +23,17 @@ src/
   retry.rs         # 即时重试与延迟重试队列
   state.rs         # 分片状态与聚合下载状态
   types.rs         # 领域消息、错误、事件协议
-  util.rs          # 远端文件探测与文件写入任务
+  util.rs          # 远端文件探测与文件写入任务（P0-4 流式追加）
+  limiter.rs       # rate-limit 令牌桶（0.5.x 全局/分源）
+  config.rs        # 运行时热更新 RuntimeConfig（0.5.5）
+  trace.rs         # tracing 初始化门面
+  queue.rs         # 任务队列 FIFO/并发调度（0.6.x pending_deletes 延迟删）
+  task.rs          # 任务句柄与快照
 examples/
   download.rs
   with_custom_ui.rs
+  with_rate_limit.rs
+  with_queue.rs
 test_server/
   server.py        # 可控测试 HTTP 服务
 tests/
