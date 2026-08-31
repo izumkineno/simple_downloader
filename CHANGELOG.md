@@ -21,6 +21,18 @@
 
 ---
 
+## [0.5.1] - 2026-08-31
+
+### 🐛 修复
+
+- **限速 wiring** `orchestrate`/`monitor` 补齐 `per_source` 与多源全局：`MultiRuntime::limiter_for_lane`/`global_limiter` 通过 `claim_request_builder` 后查表，`DownloadMonitor` `pending_bisects`/`retry`/`bisected` 三处均传入 `global+per_source`，修复 `per_source` 2.07s 误判为 5-8.5s 的失效（回归收紧断言 5-8.5s/3-5.5s 全绿）
+- **自适应冻结** `DownloadMonitor::handle_tick` 新增 `is_rate_limited` gate 跳过 `decide_and_act`，避免限速下误分裂
+- **双桶并发** `chunk.rs` `per.acquire`+`global.acquire` 改 `tokio::join!` 取 `max`，修复串行 sum 慢 30-50%
+- **burst 统一** `SourceConfig::with_burst` 新增，`lane::from_config`/`downloader::run_internal` 统一校验 `0`/`>u32::MAX`/`burst需配合speed_limit`，默认 64KiB 硬限文档化
+- **clippy/测试** `chunk_run` `allow(unused_variables)`，`tests/chunk.rs` 7 处 `None,None` 补齐，`limiter::small_limit_not_deadlock` burst 显式 5KiB 以过 900ms
+
+---
+
 ## [0.5.0] - 2026-08-31
 
 ### ✨ 新增

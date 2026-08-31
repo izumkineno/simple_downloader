@@ -165,7 +165,7 @@ impl DownloadMonitor {
                             cmd_tx,
                             &info_tx,
                             url,
-                            multi_runtime.as_mut(),
+                            &mut multi_runtime,
                         );
                         if self.retry_handler.has_permanent_failure() {
                             let msg = self
@@ -242,7 +242,7 @@ impl DownloadMonitor {
         cmd_tx: &broadcast::Sender<DownloadCmd>,
         info_tx: &broadcast::Sender<DownloadInfo>,
         url: Option<&FastStr>,
-        multi_runtime: Option<&mut MultiRuntime>,
+        multi_runtime: &mut Option<MultiRuntime>,
     ) {
         ::tracing::trace!(
             chunks = self.state.chunks.len(),
@@ -320,13 +320,16 @@ impl DownloadMonitor {
             } => {
                 ::tracing::debug!(original_id, new_start, new_end, tasks = tasks.len(), pending = self.pending_bisects.len(), "ChunkBisected");
                 // 尝试为新区间分配 lane；若容量不足则缓冲至 pending_bisects，避免丢范围
-                let Some((lane_id, rb)) = build_request(client, url, multi_runtime) else {
+                let Some((lane_id, rb)) = build_request(client, url, multi_runtime.as_mut()) else {
                     ::tracing::warn!(new_start, new_end, "lane capacity insufficient, buffer bisected range");
                     self.pending_bisects.push_back((new_start, new_end));
                     return;
                 };
                 let new_id = next_chunk_id.fetch_add(1, Ordering::SeqCst);
                 ::tracing::info!(new_id, new_start, new_end, lane_id = ?lane_id.as_ref().map(|s| s.as_str()), "spawn bisected chunk");
+                // 限速：解析分源与全局（需在 move 前）
+                let per_source = lane_id.as_ref().and_then(|id| multi_runtime.as_ref().and_then(|r| r.limiter_for_lane(id.as_str())));
+                let global = multi_runtime.as_ref().and_then(|r| r.global_limiter()).or_else(|| self.global_limiter.clone());
                 if let Some(lane_id) = lane_id {
                     self.lane_bindings.insert(new_id, lane_id);
                 }
@@ -338,8 +341,8 @@ impl DownloadMonitor {
                     rb,
                     new_start,
                     new_end,
-                    self.global_limiter.clone(),
-                    None,
+                    global,
+                    per_source,
                 );
                 tasks.push(tokio::spawn(task));
             }
@@ -395,8 +398,12 @@ impl DownloadMonitor {
         // 发送聚合后的监控更新
         self.send_monitor_update(info_tx);
 
-        // 委托并发控制：让并发管理器决定是否需要分割块
-        self.concurrency_manager.decide_and_act(&self.state, cmd_tx);
+        // 委托并发控制：让并发管理器决定是否需要分割块（限速时冻结，避免误判）
+        if self.is_rate_limited {
+            ::tracing::debug!("rate-limited: skip decide_and_act (freeze adaptive)");
+        } else {
+            self.concurrency_manager.decide_and_act(&self.state, cmd_tx);
+        }
 
         // 调度之前因 lane 容量不足而缓冲的分割区间
         let mut drained_pending = 0usize;
@@ -408,6 +415,9 @@ impl DownloadMonitor {
             self.pending_bisects.pop_front();
             let new_id = next_chunk_id.fetch_add(1, Ordering::SeqCst);
             ::tracing::info!(new_id, start, end, lane_id = ?lane_id.as_ref().map(|s| s.as_str()), "drain pending_bisect");
+            // 限速：解析分源与全局
+            let per_source = lane_id.as_ref().and_then(|id| multi_runtime.as_ref().and_then(|r| r.limiter_for_lane(id.as_str())));
+            let global = multi_runtime.as_ref().and_then(|r| r.global_limiter()).or_else(|| self.global_limiter.clone());
             if let Some(lane_id) = lane_id {
                 self.lane_bindings.insert(new_id, lane_id);
             }
@@ -419,8 +429,8 @@ impl DownloadMonitor {
                 rb,
                 start,
                 end,
-                    self.global_limiter.clone(),
-                    None
+                global,
+                per_source,
             );
             tasks.push(tokio::spawn(task));
             drained_pending += 1;
@@ -460,6 +470,9 @@ impl DownloadMonitor {
                 status: 1, // 状态：重试中
                 message: Some(format!("正在进行第 {} 次重试", chunk_to_retry.attempts)),
             });
+            // 限速：解析分源与全局（需在 move 之前）
+            let per_source = lane_id.as_ref().and_then(|id| multi_runtime.as_ref().and_then(|r| r.limiter_for_lane(id.as_str())));
+            let global = multi_runtime.as_ref().and_then(|r| r.global_limiter()).or_else(|| self.global_limiter.clone());
             if let Some(lane_id) = lane_id {
                 self.lane_bindings.insert(chunk_to_retry.id, lane_id);
             }
@@ -471,8 +484,8 @@ impl DownloadMonitor {
                 rb,
                 chunk_to_retry.start,
                 chunk_to_retry.end,
-                    self.global_limiter.clone(),
-                    None
+                global,
+                per_source,
             );
             tasks.push(tokio::spawn(task));
             retried += 1;

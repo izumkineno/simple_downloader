@@ -448,6 +448,9 @@ where
                     if b == 0 {
                         return Err(DownloadError::InvalidArgument("burst 0 无效，需 >0".to_string()));
                     }
+                    if b > u32::MAX as u64 {
+                        return Err(DownloadError::InvalidArgument(format!("burst {} 超过 {}", b, u32::MAX)));
+                    }
                 }
                 // 创建全局限速器
                 let burst_nz = self.burst.and_then(|b| NonZeroU32::new(b as u32)).or_else(|| NonZeroU32::new(64*1024));
@@ -455,6 +458,8 @@ where
                 let limiter = crate::limiter::RateLimiter::new(limit_nz, burst_nz);
                 self.global_limiter = Some(std::sync::Arc::new(limiter));
                 ::tracing::info!(limit, burst = ?burst_nz, "rate-limit global limiter created");
+            } else if self.burst.is_some() {
+                return Err(DownloadError::InvalidArgument("burst 需配合 speed_limit".to_string()));
             }
         let (file_size, support_ranges, writer_path, client, download_url, workers, multi_runtime) =
             match &self.mode {
@@ -855,12 +860,18 @@ where
             workers,
         );
         {
-            monitor = monitor.with_rate_limit(self.global_limiter.clone());
+            // 全局限速：若多源已配置全局，则优先多源，否则用 Builder 全局
+            let global_for_monitor = multi_runtime.as_ref().and_then(|r| r.global_limiter()).or_else(|| self.global_limiter.clone());
+            monitor = monitor.with_rate_limit(global_for_monitor);
         }
         for (start_byte, end_byte) in initial_ranges {
-            let (lane_id, rb) = if let Some(runtime) = multi_runtime.as_mut() {
+            let (lane_id_opt, rb, per_source, global) = if let Some(runtime) = multi_runtime.as_mut() {
                 match runtime.claim_request_builder() {
-                    Some((lane_id, rb)) => (Some(lane_id), rb),
+                    Some((lane_id, rb)) => {
+                        let per = runtime.limiter_for_lane(lane_id.as_str());
+                        let glob = runtime.global_limiter().or_else(|| self.global_limiter.clone());
+                        (Some(lane_id), rb, per, glob)
+                    },
                     None => {
                         ::tracing::warn!(
                             start_byte,
@@ -872,13 +883,13 @@ where
                     }
                 }
             } else {
-                (None, client.get(download_url.as_str()))
+                (None, client.get(download_url.as_str()), None, self.global_limiter.clone())
             };
             let id = next_chunk_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if let Some(lane_id) = lane_id {
-                initial_lanes.push((id, lane_id));
+            if let Some(ref lane_id) = lane_id_opt {
+                initial_lanes.push((id, lane_id.clone()));
             }
-            ::tracing::debug!(chunk_id = id, start_byte, end_byte, "spawn initial chunk");
+            ::tracing::debug!(chunk_id = id, start_byte, end_byte, per_limited = per_source.is_some(), global_limited = global.is_some(), "spawn initial chunk");
             let task = chunk_run(
                 id,
                 writer_tx.clone(),
@@ -887,8 +898,8 @@ where
                 rb,
                 start_byte,
                 end_byte,
-                self.global_limiter.clone(),
-                None,
+                global,
+                per_source,
             );
             tasks.push(spawn(task));
         }

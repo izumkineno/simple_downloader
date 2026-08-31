@@ -103,7 +103,8 @@ mod tests {
 
     #[tokio::test]
     async fn small_limit_not_deadlock() {
-        let limiter = RateLimiter::new(NonZeroU32::new(5 * 1024).unwrap(), None);
+        // burst 刻意设为 5KiB（与限速一致），避免默认 64KiB burst 导致前两次 acquire 均在 burst 内而无需等待
+        let limiter = RateLimiter::new(NonZeroU32::new(5 * 1024).unwrap(), Some(NonZeroU32::new(5 * 1024).unwrap()));
         let start = Instant::now();
         limiter
             .acquire(NonZeroU32::new(5 * 1024).unwrap())

@@ -10,8 +10,8 @@ use simple_downloader::{DownloadInfo, Downloader};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 使用本地 test_server 演示更稳定，若无 test_server 则回退到 proof.ovh.net
     let url = std::env::var("TEST_URL")
-        .unwrap_or_else(|_| "https://proof.ovh.net/files/10Mio.dat".to_string());
-    let out = std::env::var("TEST_OUT").unwrap_or_else(|_| "10Mio_rate_limited.dat".to_string());
+        .unwrap_or_else(|_| "https://proof.ovh.net/files/10Mb.dat".to_string());
+    let out = std::env::var("TEST_OUT").unwrap_or_else(|_| "10Mb_rate_limited.dat".to_string());
 
     println!("下载 {} -> {} (限速 512 KiB/s, burst 64 KiB)", url, out);
 

@@ -40,7 +40,7 @@ async fn test_chunk_download_success() {
     let chunk_id: ChunkId = 1;
     let end = len - 1;
     let handle = tokio::spawn(async move {
-        chunk_run(chunk_id, cmd_tx, cmd_bd_rx, info_bd_tx.clone(), rb, 0, end).await;
+        chunk_run(chunk_id, cmd_tx, cmd_bd_rx, info_bd_tx.clone(), rb, 0, end, None, None).await;
     });
 
     // 收集写入命令
@@ -154,6 +154,8 @@ async fn test_chunk_bisect() {
             rb,
             0,
             99999,
+            None,
+            None,
         )
         .await;
     });
@@ -218,7 +220,7 @@ async fn test_chunk_200_single_segment_downgrade_allowed() {
 
     let chunk_id: ChunkId = 10;
     let handle = tokio::spawn(async move {
-        chunk_run(chunk_id, cmd_tx, cmd_bd_rx, info_bd_tx.clone(), rb, 0, 9).await;
+        chunk_run(chunk_id, cmd_tx, cmd_bd_rx, info_bd_tx.clone(), rb, 0, 9, None, None).await;
     });
 
     let mut received = Vec::new();
@@ -269,7 +271,7 @@ async fn test_chunk_200_multi_segment_rejected() {
 
     let chunk_id: ChunkId = 11;
     let handle = tokio::spawn(async move {
-        chunk_run(chunk_id, cmd_tx, cmd_bd_rx, info_bd_tx.clone(), rb, 10, 19).await;
+        chunk_run(chunk_id, cmd_tx, cmd_bd_rx, info_bd_tx.clone(), rb, 10, 19, None, None).await;
     });
 
     let mut failed = false;
@@ -313,7 +315,7 @@ async fn test_chunk_206_wrong_content_range_rejected() {
 
     let chunk_id: ChunkId = 12;
     let handle = tokio::spawn(async move {
-        chunk_run(chunk_id, cmd_tx, cmd_bd_rx, info_bd_tx.clone(), rb, 10, 19).await;
+        chunk_run(chunk_id, cmd_tx, cmd_bd_rx, info_bd_tx.clone(), rb, 10, 19, None, None).await;
     });
 
     let mut failed = false;
@@ -357,7 +359,7 @@ async fn test_chunk_early_eof_is_failed() {
 
     let chunk_id: ChunkId = 99;
     let handle = tokio::spawn(async move {
-        chunk_run(chunk_id, cmd_tx, cmd_bd_rx, info_bd_tx.clone(), rb, 0, 1023).await;
+        chunk_run(chunk_id, cmd_tx, cmd_bd_rx, info_bd_tx.clone(), rb, 0, 1023, None, None).await;
     });
 
     let mut received: Vec<u8> = Vec::new();
@@ -418,7 +420,7 @@ async fn test_chunk_request_failure() {
     // 启动chunk任务
     let chunk_id: ChunkId = 1;
     let handle = tokio::spawn(async move {
-        chunk_run(chunk_id, cmd_tx, cmd_bd_rx, info_bd_tx.clone(), rb, 0, 100).await;
+        chunk_run(chunk_id, cmd_tx, cmd_bd_rx, info_bd_tx.clone(), rb, 0, 100, None, None).await;
     });
 
     // 检查是否收到失败消息

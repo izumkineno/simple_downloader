@@ -116,6 +116,9 @@ pub struct SourceConfig {
     pub proxies: Vec<ProxyConfig>,
     /// 该源限速（bytes/s），`rate-limit` feature 生效
     pub speed_limit: Option<u64>,
+    /// 该源突发（bytes），`rate-limit` feature 生效
+    #[cfg(feature = "rate-limit")]
+    pub burst: Option<u64>,
 }
 
 impl SourceConfig {
@@ -129,6 +132,8 @@ impl SourceConfig {
             #[cfg(feature = "proxy")]
             proxies: Vec::new(),
             speed_limit: None,
+            #[cfg(feature = "rate-limit")]
+            burst: None,
         }
     }
 
@@ -142,6 +147,13 @@ impl SourceConfig {
     #[cfg(feature = "rate-limit")]
     pub fn with_speed_limit(mut self, bytes_per_sec: u64) -> Self {
         self.speed_limit = Some(bytes_per_sec);
+        self
+    }
+
+    /// 设置该源突发容量（bytes），`rate-limit` 生效。默认 64KiB。
+    #[cfg(feature = "rate-limit")]
+    pub fn with_burst(mut self, burst_bytes: u64) -> Self {
+        self.burst = Some(burst_bytes);
         self
     }
 
@@ -737,28 +749,64 @@ impl MultiRuntime {
             config.max_chunks_per_source,
         );
 
-        // 限速：per_source + global
-        let mut per_source_limiters: HashMap<FastStr, Arc<RateLimiter>> = HashMap::new();
-        for src in &config.sources {
-            if let Some(limit) = src.speed_limit {
-                if limit == 0 {
-                    return Err(DownloadError::InvalidArgument(format!("source {} speed_limit 0 无效", src.id)));
+        // 限速：per_source + global（仅 rate-limit 生效，否则空）
+        #[cfg(feature = "rate-limit")]
+        let per_source_limiters: HashMap<FastStr, Arc<RateLimiter>> = {
+            let mut map: HashMap<FastStr, Arc<RateLimiter>> = HashMap::new();
+            for src in &config.sources {
+                if let Some(limit) = src.speed_limit {
+                    if limit == 0 {
+                        return Err(DownloadError::InvalidArgument(format!("source {} speed_limit 0 无效", src.id)));
+                    }
+                    if limit > u32::MAX as u64 {
+                        return Err(DownloadError::InvalidArgument(format!("source {} speed_limit {} 超过 {} 需 ≤4GiB/s", src.id, limit, u32::MAX)));
+                    }
+                    if let Some(b) = src.burst {
+                        if b == 0 {
+                            return Err(DownloadError::InvalidArgument(format!("source {} burst 0 无效", src.id)));
+                        }
+                        if b > u32::MAX as u64 {
+                            return Err(DownloadError::InvalidArgument(format!("source {} burst {} 超过 {}", src.id, b, u32::MAX)));
+                        }
+                    }
+                    let burst = src.burst.and_then(|b| std::num::NonZeroU32::new(b as u32)).or_else(|| std::num::NonZeroU32::new(64*1024));
+                    let nz = std::num::NonZeroU32::new(limit as u32).unwrap();
+                    map.insert(src.id.clone(), Arc::new(RateLimiter::new(nz, burst)));
+                } else if src.burst.is_some() {
+                    return Err(DownloadError::InvalidArgument(format!("source {} burst 需配合 speed_limit", src.id)));
                 }
-                let burst = Some(std::num::NonZeroU32::new(64*1024).unwrap());
-                let nz = std::num::NonZeroU32::new(limit as u32).unwrap();
-                per_source_limiters.insert(src.id.clone(), Arc::new(RateLimiter::new(nz, burst)));
             }
-        }
-        let global_limiter = if let Some(limit) = config.global_speed_limit {
+            map
+        };
+        #[cfg(not(feature = "rate-limit"))]
+        let per_source_limiters: HashMap<FastStr, Arc<RateLimiter>> = HashMap::new();
+        #[cfg(feature = "rate-limit")]
+        let global_limiter: Option<Arc<RateLimiter>> = if let Some(limit) = config.global_speed_limit {
             if limit == 0 {
                 return Err(DownloadError::InvalidArgument("global_speed_limit 0 无效".to_string()));
+            }
+            if limit > u32::MAX as u64 {
+                return Err(DownloadError::InvalidArgument(format!("global_speed_limit {} 超过 {} 需 ≤4GiB/s", limit, u32::MAX)));
+            }
+            if let Some(b) = config.global_burst {
+                if b == 0 {
+                    return Err(DownloadError::InvalidArgument("global_burst 0 无效".to_string()));
+                }
+                if b > u32::MAX as u64 {
+                    return Err(DownloadError::InvalidArgument(format!("global_burst {} 超过 {}", b, u32::MAX)));
+                }
             }
             let burst = config.global_burst.and_then(|b| std::num::NonZeroU32::new(b as u32)).or_else(|| std::num::NonZeroU32::new(64*1024));
             let nz = std::num::NonZeroU32::new(limit as u32).unwrap();
             Some(Arc::new(RateLimiter::new(nz, burst)))
         } else {
+            if config.global_burst.is_some() {
+                return Err(DownloadError::InvalidArgument("global_burst 需配合 global_speed_limit".to_string()));
+            }
             None
         };
+        #[cfg(not(feature = "rate-limit"))]
+        let global_limiter: Option<Arc<RateLimiter>> = None;
         Ok((
             file_size,
             Self {

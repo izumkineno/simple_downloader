@@ -40,7 +40,7 @@ fn split_range(offset: u64, end: u64) -> Option<(u64, u64)> {
 /// - `rb`: 一个 `reqwest::RequestBuilder`，用于创建下载请求。
 /// - `start_byte`: 此块下载的起始字节位置。
 /// - `end_byte`: 此块下载的结束字节位置。
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, unused_variables)]
 #[::tracing::instrument(
     skip(cmd_tx, bd_rx, bd_tx, rb, global_limiter, per_source_limiter),
     fields(chunk_id = id, start_byte = start_byte, end_byte = end_byte, size = end_byte.saturating_sub(start_byte).saturating_add(1))
@@ -256,7 +256,7 @@ pub async fn chunk_run(
                         chunk.split_to(write_len as usize)
                     };
 
-                    // 限速：全局+分源两级串联，32-64KiB 批量，禁止 jitter
+                    // 限速：全局+分源两级串联，32-64KiB 批量，禁止 jitter — 双 limiter 并发 join 取 max
                     #[cfg(feature = "rate-limit")]
                     {
                         if write_len > 0 {
@@ -265,11 +265,13 @@ pub async fn chunk_run(
                             while remaining > 0 {
                                 let batch = std::cmp::min(remaining, 64*1024) as u32;
                                 let nz = NonZeroU32::new(batch).unwrap();
-                                if let Some(ref limiter) = per_source_limiter {
-                                    limiter.acquire(nz).await;
-                                }
-                                if let Some(ref limiter) = global_limiter {
-                                    limiter.acquire(nz).await;
+                                match (per_source_limiter.as_ref(), global_limiter.as_ref()) {
+                                    (Some(per), Some(glob)) => {
+                                        tokio::join!(per.acquire(nz), glob.acquire(nz));
+                                    }
+                                    (Some(per), None) => per.acquire(nz).await,
+                                    (None, Some(glob)) => glob.acquire(nz).await,
+                                    (None, None) => {}
                                 }
                                 remaining -= batch;
                             }

@@ -104,10 +104,9 @@ async fn per_source_limit_enforced() {
         .unwrap();
     let elapsed = start.elapsed();
     // 5MiB / 800KiB/s = 6.25s, allow 5-8s
-    // 限速实现中 multi-source per_source 暂为 best-effort，放宽断言：只要完成且 1-10s 内
     assert!(
-        elapsed >= Duration::from_millis(1000) && elapsed <= Duration::from_millis(10000),
-        "per_source elapsed {:?} not in 1-10s",
+        elapsed >= Duration::from_millis(5000) && elapsed <= Duration::from_millis(8500),
+        "per_source elapsed {:?} not in 5-8.5s",
         elapsed
     );
     let got = std::fs::read(out).unwrap();
@@ -138,10 +137,10 @@ async fn global_hard_limit_with_per_source_sum_exceeds() {
         .await
         .unwrap();
     let elapsed = start.elapsed();
-    // 2MiB / 500KiB/s = 4s, allow 3-5s
+    // 2MiB / 500KiB/s = 4s, allow 3-5.5s
     assert!(
-        elapsed >= Duration::from_millis(1000) && elapsed <= Duration::from_millis(10000),
-        "global hard elapsed {:?} not in 1-10s",
+        elapsed >= Duration::from_millis(3000) && elapsed <= Duration::from_millis(5500),
+        "global hard elapsed {:?} not in 3-5.5s",
         elapsed
     );
 }
