@@ -166,7 +166,7 @@ impl DownloadMonitor {
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        self.lagged_count += skipped as u64;
+                        self.lagged_count += skipped;
                         ::tracing::warn!(skipped, total_lagged = self.lagged_count, pending_bisects = self.pending_bisects.len(), active_chunks = self.state.chunks.len(), tasks = tasks.len(), "broadcast lagged, skip events");
                         // P0-C1 轻量对账：若 tasks 已空但 state 仍有残留，说明 Complete/Failed 丢失，可能挂死，下次 tick 将尝试重试
                         if tasks.is_empty() && !self.state.chunks.is_empty() {

@@ -228,8 +228,8 @@ impl RetryHandler {
         chunk
     }
 
+    #[allow(dead_code)]
     pub(crate) fn push_front_retry(&mut self, chunk: FailedChunkInfo) {
-        ::tracing::debug!(chunk_id = chunk.id, "push front deferred retry (deprecated, use push_back)");
         self.retry_queue.push_front(chunk);
     }
 

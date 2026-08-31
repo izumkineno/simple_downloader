@@ -79,9 +79,7 @@ pub fn try_init_tracing() -> bool {
 pub fn try_init_tracing_for_env(env: Env) -> bool {
     // EnvFilter 优先级：RUST_LOG > SIMPLE_DOWNLOADER_LOG > env default
     let filter = EnvFilter::try_from_default_env()
-        .or_else(|_| {
-            std::env::var("SIMPLE_DOWNLOADER_LOG").map(|v| EnvFilter::new(v))
-        })
+        .or_else(|_| std::env::var("SIMPLE_DOWNLOADER_LOG").map(EnvFilter::new))
         .unwrap_or_else(|_| EnvFilter::new(env.default_filter()));
 
     let fmt_layer = fmt::layer()
@@ -101,7 +99,7 @@ pub fn try_init_tracing_for_env(env: Env) -> bool {
 ///
 /// 例如 `init_tracing_with_filter("simple_downloader=trace,reqwest=warn")`。
 pub fn init_tracing_with_filter(filter: &str) -> bool {
-    let filter = EnvFilter::new(filter.to_owned());
+    let filter = EnvFilter::new(filter);
     let fmt_layer = fmt::layer()
         .with_target(true)
         .with_level(true)
@@ -113,7 +111,7 @@ pub fn init_tracing_with_filter(filter: &str) -> bool {
 /// JSON 格式初始化（适合生产采集），幂等，过滤器规则同 `init_tracing`。
 pub fn init_tracing_json_for_env(env: Env) -> bool {
     let filter = EnvFilter::try_from_default_env()
-        .or_else(|_| std::env::var("SIMPLE_DOWNLOADER_LOG").map(|v| EnvFilter::new(v)))
+        .or_else(|_| std::env::var("SIMPLE_DOWNLOADER_LOG").map(EnvFilter::new))
         .unwrap_or_else(|_| EnvFilter::new(env.default_filter()));
     let fmt_layer = fmt::layer()
         .json()
