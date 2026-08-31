@@ -20,8 +20,8 @@
 
 #### 5. **高效安全的文件 I/O**
 - **独立写入任务**: 文件写入在独立的 `file_writer_task` 异步任务中执行，避免了多线程写入的锁竞争。
-- **反压机制**: 下载任务通过**有界 `mpsc` 通道**将数据发送给写入任务。若磁盘写入慢，通道将被填满，自动减缓下载任务的数据发送速度，有效防止内存溢出（OOM）。
-- **流式追加（0.5.4+）**: 不再 `set_len` 预分配，仅 `create_dir_all` 后以 `.truncate(false)` 流式追加；`ENOSPC` 在 `write/flush` 时以 `DownloadError::Io` 暴露，不残留空洞文件，详见 `src/util.rs:file_writer_task_impl`。
+- **反压机制**: 下载任务通过**有界 `mpsc 128` 通道**将数据发送给写入任务。若磁盘写入慢，通道将被填满，自动减缓下载任务的数据发送速度，有效防止内存溢出（OOM）。
+- **流式追加（0.5.4 引入，0.6.2 校准）**: 不再 `set_len` 预分配，仅 `create_dir_all` 后以 `.truncate(false)` 流式追加；`ENOSPC` 在 `write/flush` 时以 `DownloadError::Io` 暴露，不残留空洞文件；`queue` 取消后 `pending_deletes` 延迟删（200ms 周期，`PermissionDenied` 重试，0.6.2 未知 `Io` 亦重试），详见 `src/util.rs:file_writer_task_impl` 与 `src/queue.rs:flush_pending_deletes`。
 #### 6. **高兼容性的文件信息探测**
 - **智能回退 (Fallback)**: `get_file_info` 函数优先使用 `HEAD` 请求获取文件信息。若失败或响应头不完整，则自动回退至发送 `Range: bytes=0-0` 的 `GET` 请求，通过解析 `Content-Range` 头获取总大小，显著提高了对各类服务器的兼容性。
 
@@ -51,10 +51,9 @@
 | _none_ | 是 | 基础单源多线程下载 + 更简洁的默认 API |
 | `resume` | 否 | 断点续传、sidecar 元数据、恢复相关 API |
 | `multi-source` | 否 | 多源下载入口、lane 调度建模 |
-| `proxy` | 否 | 代理配置能力，依赖 `multi-source` |
-| `progress` | 否 | 公开 `DownloadInfo` 进度事件与 `run(...)` 进度回调接口 |
-| `rate-limit` | 否 | 全局/分源限速（`governor` 令牌桶，`burst` 可配，自适应冻结） |
-| `queue` | 否 | 任务队列 FIFO/并发调度/pause/resume/cancel/重命名（`uuid`） |
+| `progress` | 否 | 公开 `DownloadInfo` 进度事件与 `run(...)` 进度回调接口（0.5.5 `#[non_exhaustive]`） |
+| `rate-limit` | 否 | 全局/分源限速（`governor` 令牌桶，`burst` 可配，自适应冻结，0.5.x 新增，0.6.x 校准 `join max`） |
+| `queue` | 否 | 任务队列 FIFO/并发调度/pause/resume/cancel/重命名（`uuid`，0.6.0 新增，0.6.1 200ms drain + 0.6.2 重试） |
 推荐理解方式：
 
 - **默认模式**：`Downloader::builder(...).download().await`
@@ -67,7 +66,8 @@
 
 > 完整调用形态见 [`docs/usage.md`](docs/usage.md)，`cargo doc` 见 `src/lib.rs`  crate 文档。
 
-#### 9. **速度限制（`rate-limit` feature，`0.5.x` 新增）**
+#### 9. **速度限制（`rate-limit` feature，0.5.x 新增，0.6.x 自适应冻结校准）**
+
 - **全局限速**：`Downloader::builder(url, path).speed_limit(bps).with_burst(bytes).download().await`，`1 token = 1 byte`，`burst` 默认 64KiB 硬限，`0` 或 `>4GiB/s` 返回 `InvalidArgument`，全局为硬上限（`per_source` 之和 > 全局时按剩余分配）
 - **分源限速**：`SourceConfig::new(url).with_speed_limit(bps).with_burst(bytes)`，`MultiSourceConfig::with_global_speed_limit/with_global_burst`，分源与全局两级串联 `tokio::join` 取 `max`，避免串行 `sum` 慢 30%
 - **自适应冻结**：限速启用时 `DownloadMonitor` 跳过 `ConcurrencyManager::decide_and_act`，避免限速被误判为带宽不足而过度分裂
@@ -87,9 +87,8 @@
 -   [x] **缺文件 fail-stop**: sidecar 存在但目标文件不存在时会直接报错停止，不会静默重下。
 -   [x] **单源 / 多源恢复**: 已覆盖 `Downloader::new(...)` 与 `Downloader::new_multi(...)` 的恢复路径。
 -   [x] **进程级恢复测试**: 已补充单源控制台中断恢复、多源 kill / 崩溃式终止恢复的集成测试。
--   [ ] **元数据 schema 演进策略**: 当前已带版本号，但后续仍可补充更完整的跨版本迁移 / 兼容策略。
--   [ ] **可观测性增强**: 后续可补充更清晰的“本次恢复复用了哪些 segment / 哪些 segment 被判定失效”的日志或事件。
-
+-   [ ] **元数据 schema 演进策略（0.6.0 已带 version=1，待跨版本迁移）**: 当前仅单版本校验与自愈重建，后续补跨版本迁移与兼容表。
+-   [ ] **可观测性增强（待 0.7）**: 补充“复用/失效 segment”日志与 `DownloadInfo` 事件，当前 `tracing` 仅 info 级。
 #### 2. **核心功能：多源多代理下载 (Multi-Source Downloading)**
 -   [x] **支持多个 URL 下载同一个文件**: 通过 `MultiSourceConfig::with_sources(...)` 配置一组镜像 URL，并使用 `Downloader::new_multi(...)` 启动多源下载。
 -   [x] **支持源 / 代理 lane 建模**: 通过 `SourceConfig::with_proxies(...)`、`LaneModel::PerSource` / `LaneModel::PerSourceProxy` 表达多源多代理调度维度。
@@ -97,8 +96,8 @@
 -   [x] **无效源跳过与基础失败隔离**: 已有测试覆盖无效源跳过；lane 连续失败后可被黑名单隔离。
 -   [x] **repo-native `test_server` 集成测试**: 已用多个不同限速的本地服务器覆盖 fast/slow、三源异构、invalid + valid 等真实 Range 下载场景。
 -   [x] **手工观察示例**: `cargo run --features multi-source,progress --example manual_multi_source_test_server` 会生成 500 MiB 测试文件，启动 fast=16m / slow=2m 两个本地源，并实时刷新总进度、速度和源侧 stats 摘要。
--   [ ] **更智能的源调度评分**: 当前调度仍是基础 lane 选择与失败隔离；后续应引入响应时间、历史吞吐、失败率等动态评分，为每个块选择更优源。
--   [ ] **更完整的多代理真实集成验证**: 当前代理维度已有配置与调度模型，后续应补充真实代理链路的端到端测试矩阵。
+-   [ ] **更智能的源调度评分（0.6.0 基础隔离已落地，待 0.7 动态评分）**: 当前仅 lane 选择与失败隔离，后续引入响应时间/历史吞吐/失败率动态评分选最优源。
+-   [ ] **更完整的多代理真实集成验证（0.6.0 模型已落地，待端到端矩阵）**: 代理维度已有调度模型，待补真实代理链路端到端测试矩阵。
 
 #### 3. **核心功能：速度限制 (Speed Limiting)**
 -   [x] **实现可配置的速度限制器**：`rate-limit` feature 已落地，`Downloader::builder(...).speed_limit(bps).with_burst(bytes)` 全局 + `SourceConfig::with_speed_limit/with_burst` 分源 + `MultiSourceConfig::with_global_speed_limit/with_global_burst`，`governor` 令牌桶 `1 token=1 byte`，`burst` 默认 64KiB，全局硬上限，`InvalidArgument` 校验，`monitor` 自适应冻结，`tokio::join` 双桶 `max`
@@ -107,74 +106,32 @@
 -   [x] **默认 API 易用性重构（第一阶段）**: 已新增 `Downloader::builder(...).download().await` 的简化入口，不再强制默认调用方接入 progress receiver。
 -   [x] **Feature 能力裁剪（第一阶段）**: 默认模式仅保留基础多线程下载；`resume` / `multi-source` / `proxy` / `progress` 已拆为按需启用的 Cargo features。
 -   [x] **配置热更新（0.6.0）**: `SharedConfig` 热更底座 `RuntimeConfig`（`workers`/`update_interval`）支持运行时 `apply_config`，`DownloadMonitor` 动态生效
--   [x] **任务队列 API（0.6.0 `queue` feature）**: `TaskQueue::with_max_concurrent(3)`（`1..64` clamp）+ `enqueue`/`enqueue_with_workers`（两层并发独立）、`pause`/`resume`/`cancel`/`query`/`wait_all`，`TaskId/TaskState/TaskSnapshot/QueueError`，`examples/with_queue.rs` 演示重命名/隔离
--   [ ] **更稳定的 UI 对接层**: 将 `DownloadInfo` 事件语义整理成面向 UI 的稳定契约，并补充字段兼容性说明。
+-   [x] **任务队列 API（0.6.0 `queue` feature，0.6.1 200ms drain + 0.6.2 未知 Io 重试）**: `TaskQueue::with_max_concurrent(3)`（`1..64` clamp）+ `enqueue`/`enqueue_with_workers`（两层并发独立）、`pause`/`resume`/`cancel`/`query`/`wait_all`，`TaskId/TaskState/TaskSnapshot/QueueError`，`examples/with_queue.rs` 演示重命名/隔离，`pending_deletes` 延迟删
+-   [ ] **更稳定的 UI 对接层（0.5.5 `#[non_exhaustive]` 已打底，待稳定契约）**: 将 `DownloadInfo` 事件语义整理成面向 UI 的稳定契约，并补充字段兼容性说明。
 
+#### 示例（权威调用形态见 `docs/usage.md`）
 
+```rust
+use simple_downloader::Downloader;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    Downloader::builder("https://proof.ovh.net/files/10Mio.dat", "10Mio.dat")
+        .workers(16).download().await?;
+    Ok(())
+}
+```
+更多场景：`docs/usage.md#3 Builder 全景`；恢复/多源/限速/队列完整示例见 `examples/`：
+`cargo run --features progress --example with_custom_ui` |
+`cargo run --features multi-source,progress --example manual_multi_source_test_server`（500 MiB 双源 16m/2m） |
+`cargo run --features queue --example with_queue` |
+`cargo run --features rate-limit,progress --example with_rate_limit`
 
-#### 示例
-
-##### 断点续传 / 进程级恢复验证
-
-当前仓库已经内置下列恢复测试：
-
+验证：
 ```bash
 cargo test --features resume,multi-source --test resume -- --nocapture --test-threads=1
 cargo test --features resume,multi-source --test process_resume -- --nocapture --test-threads=1
 ```
-
-其中：
-
-- `tests/resume.rs` 主要覆盖恢复元数据、损坏 segment、缺文件 fail-stop、单源 / 多源恢复与显式禁用恢复；
-- `tests/process_resume.rs` 主要覆盖**真实子进程级**的中断恢复：
-  - 单源：控制台中断后恢复；
-  - 多源：子进程被 kill / 崩溃式终止后恢复。
-
-##### 多源手工观察示例
-
-如果想观察多源下载、不同源限速以及实时进度刷新，可运行：
-
-```bash
-cargo run --features multi-source,progress --example manual_multi_source_test_server
-```
-
-该示例会：
-
-- 在系统临时目录生成一个 500 MiB 的确定性测试文件；
-- 自动启动两个 repo-native `test_server/server.py` 实例；
-- 将 fast 源限速为 `16m`，slow 源限速为 `2m`；
-- 使用 `Downloader::new_multi(...)` 对两个本地源执行真实多源下载；
-- 在终端中持续刷新总进度、总速度和 fast / slow 源侧 `/__stats__` 摘要；
-- 下载完成后做字节级一致性校验，并确认两个源都参与了 Range 请求。
-
-注意：示例中的源侧 stats 只用于观察参与度，不是精确的 per-source 吞吐率统计。
-
-##### 基础单源用法
-
-```rust
-use simple_downloader::Downloader;
-
-#[tokio::main]
-async fn main() {
-    // 示例使用公开测试文件；生产环境替换为实际 URL 即可
-    match Downloader::builder(
-        "https://proof.ovh.net/files/10Mio.dat",
-        "10Mio.dat",
-    )
-    .workers(16)
-    .download()
-    .await {
-        Ok(_) => println!("下载成功！"),
-        Err(e) => eprintln!("下载失败: {}", e),
-    }
-}
-```
-
-##### 开启进度事件（`progress` feature）
-
-```bash
-cargo run --features progress --example with_custom_ui
-```
+（`tests/resume` 覆盖元数据/损坏/缺文件；`process_resume` 覆盖单源中断与多源 kill 恢复，详见 `docs/README.md#三`）
 
 #### 架构概览
 
