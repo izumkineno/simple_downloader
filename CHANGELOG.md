@@ -20,6 +20,15 @@
 
 ---
 
+## [0.6.2] - 2026-08-31
+
+### 🔧 修复（R1-R2 补丁 — `feat/queue` 增量）
+
+- **R1 取消残留泄漏** `queue.rs:447-483`：`flush_pending_deletes` 对 `remove_file` 未知 `Io` 错误由 `true` 改为 `false`，`warn + retry later`，避免 `ENOSPC` 等非 `NotFound/PermissionDenied` 错误被误判成功而 `retain` 丢弃，残留文件泄漏；`PermissionDenied` 仍保留 200ms 周期重试（Windows 打开文件句柄场景）
+- **R2 限速冻结语义澄清** `monitor.rs:524`：`drain_pending` 为 lane 容量补位非自适应分裂，故不限速冻结；仅 `decide_and_act` 在 `is_rate_limited` 时冻结，注释显式说明避免下次误改
+
+---
+
 ## [0.6.1] - 2026-08-31
 
 ### 🔧 修复（B1-B7 一次修复 — `feat/queue` 批量）
