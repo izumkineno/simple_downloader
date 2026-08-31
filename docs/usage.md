@@ -209,6 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     DownloadInfo::ChunkBisected { original_id, new_start, new_end } => {}
                     DownloadInfo::ChunkStatusChanged { id, status, message } => {}
                     DownloadInfo::DownloadComplete(id) => {}
+                    _ => {} // 0.5.5+ #[non_exhaustive] 新增变体 minor 兼容
                 }
             }
         })
@@ -219,18 +220,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 完整 UI 示例：`examples/with_custom_ui.rs`（`indicatif::MultiProgress` 多进度条）、`examples/test_server_smart_schedule.rs`。
 
-`DownloadInfo` 快捷方法：
+`DownloadInfo` 快捷方法（**稳定契约**，非 `MonitorUpdate` 固定返回 `0/false`，见 `src/types.rs:DownloadInfo` 顶层文档）：
 
-| 方法 | 适用变体 | 说明 |
-|---|---|---|
-| `progress_percent() -> f64` | `MonitorUpdate` | `0.0~100.0` |
-| `speed_mbps() -> f64` | `MonitorUpdate` | `total_speed / 1MiB` |
-| `downloaded_bytes() -> u64` | `MonitorUpdate` | `total_downloaded` |
-| `total_bytes() -> u64` | `MonitorUpdate` | `total_size` |
-| `is_complete() -> bool` | `MonitorUpdate` | `total_downloaded >= total_size` |
+| 方法 | 适用变体 | 说明 | 兼容 |
+|---|---|---|---|
+| `progress_percent() -> f64` | `MonitorUpdate` | `0.0~100.0`，`total_size==0` 时 `0.0` | stable |
+| `speed_mbps() -> f64` | `MonitorUpdate` | `total_speed / 1MiB`（EMA，限速后观测值） | stable |
+| `downloaded_bytes() -> u64` | `MonitorUpdate` | `total_downloaded` | stable |
+| `total_bytes() -> u64` | `MonitorUpdate` | `total_size`，`0` 表示未知或 0 字节文件 | stable |
+| `is_complete() -> bool` | `MonitorUpdate` | `total_downloaded >= total_size`；`0/0 true，0/N false`（流式以 `DownloadComplete` 为准） | stable |
+
+**UI 稳定契约（0.6.2+，SemVer Minor 兼容）**：
+- `#[non_exhaustive]` 自 `0.5.5`：新增变体为 minor，`match` 必须含 `_` 分支；示例已含 `_`（`DownloadComplete` 后的 `..`）。
+- `MonitorUpdate` 新增字段为 minor：旧代码用 `..` 忽略即可。
+- `total_size==0` 仅两种语义：`is_complete()==true` 为 0 字节文件，否则为未知大小流式（`progress_percent 0.0` 时 UI 显示 `--`）。
+- `chunk_details` 第 5 元 `status_u8`：`0 下载中/1 重试中/2 等待重试/3 延迟重试/4 已完成/5 失败`，新增码为 minor，与 `ChunkStatusChanged.status` 一致。
+- `ChunkFailed.error` 为人类可读，透传即可，不作分支依赖；`ChunkBisected/ChunkStatusChanged/DownloadComplete` 为通知类，UI 可忽略，仅 `MonitorUpdate` 为聚合权威。
 
 > 回调内避免阻塞/耗时 IO，必要时通过 `mpsc` 转发到其他任务（见 `docs/best-practices.md:132-151`）。
-
 ---
 
 ## 7. 场景四：多源下载（`multi-source`）

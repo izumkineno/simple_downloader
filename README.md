@@ -107,8 +107,7 @@
 -   [x] **Feature 能力裁剪（第一阶段）**: 默认模式仅保留基础多线程下载；`resume` / `multi-source` / `proxy` / `progress` 已拆为按需启用的 Cargo features。
 -   [x] **配置热更新（0.6.0）**: `SharedConfig` 热更底座 `RuntimeConfig`（`workers`/`update_interval`）支持运行时 `apply_config`，`DownloadMonitor` 动态生效
 -   [x] **任务队列 API（0.6.0 `queue` feature，0.6.1 200ms drain + 0.6.2 未知 Io 重试）**: `TaskQueue::with_max_concurrent(3)`（`1..64` clamp）+ `enqueue`/`enqueue_with_workers`（两层并发独立）、`pause`/`resume`/`cancel`/`query`/`wait_all`，`TaskId/TaskState/TaskSnapshot/QueueError`，`examples/with_queue.rs` 演示重命名/隔离，`pending_deletes` 延迟删
--   [ ] **更稳定的 UI 对接层（0.5.5 `#[non_exhaustive]` 已打底，待稳定契约）**: 将 `DownloadInfo` 事件语义整理成面向 UI 的稳定契约，并补充字段兼容性说明。
-
+-   [x] **更稳定的 UI 对接层（0.6.2 `DownloadInfo` 稳定契约）**: `#[non_exhaustive]` + `MonitorUpdate` 字段/状态码 + `progress_percent/speed_mbps/downloaded_bytes/total_bytes/is_complete` 稳定行为（非 `MonitorUpdate` 返回 0/false），UI 仅依赖 `MonitorUpdate` 聚合，新增变体/字段为 minor，详见 `src/types.rs:DownloadInfo` 与 `docs/usage.md#6`
 #### 示例（权威调用形态见 `docs/usage.md`）
 
 ```rust

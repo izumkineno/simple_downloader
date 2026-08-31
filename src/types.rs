@@ -100,7 +100,30 @@ pub enum DownloadCmd {
     TerminateAll,
 }
 
-/// 下载进度和状态信息。
+/// 下载进度和状态信息 — 面向 UI 的稳定契约（0.6.2+）。
+///
+/// ### 稳定性保证（SemVer Minor 兼容）
+/// - `#[non_exhaustive]` 自 `0.5.5` 起：新增变体为 **minor** 兼容变更，`match` 必须含 `_` 分支。
+/// - `MonitorUpdate` 新增字段亦为 **minor**：旧代码忽略即可，读取请用 `..`。
+/// - 现有变体与现有字段的语义 **patch 内不变**（见下表），删除/重命名/改类型仅在 **major**。
+/// - 辅助方法 `progress_percent/speed_mbps/downloaded_bytes/total_bytes/is_complete` 的
+///   “非 MonitorUpdate 返回 0/false” 亦为稳定行为。
+///
+/// ### UI 应依赖的最小稳定集
+/// | 能力 | 稳定来源 | 说明 |
+/// |---|---|---|
+/// | 总进度/速度 | `MonitorUpdate { total_size, total_downloaded, total_speed }` + `progress_percent()` | `total_size==0` 表示“未知大小流式”或“0 字节文件”，后者 `is_complete()==true`，前者 `false`（由 `DownloadComplete` 终局判定） |
+/// | 已下载/总量 | `downloaded_bytes()/total_bytes()` | 非 `MonitorUpdate` 返回 0 |
+/// | 是否完成 | `is_complete()` | 仅 `MonitorUpdate` 有效；流式下载完成以 `DownloadComplete` 为准 |
+/// | 细粒度块 | `chunk_details: Vec<(id, size, downloaded, speed, status_u8)>` | `status_u8` 见下，新增状态码为 minor |
+///
+/// ### 字段与状态码契约
+/// - `MonitorUpdate.total_size`：`0` 仅两种含义，`is_complete()` 已区分；UI 展示时 `0` 建议显示 `--` 而非 `0%`。
+/// - `total_speed`：`bytes/s` 的 EMA 平滑值，`speed_mbps()` 已除 `1MiB`，限速下为限速后观测值。
+/// - `chunk_details[].4 status_u8`：`0 下载中/1 重试中/2 等待重试/3 延迟重试/4 已完成/5 失败`，与 `ChunkStatusChanged.status` 一致，新增码为 minor。
+/// - `ChunkProgress { id, start_byte, end_byte, downloaded }`：`downloaded` 为该块已落盘字节，非增量。
+/// - `ChunkFailed { id, start, end, error }`：`error` 为人类可读，UI 透传即可，不作 `match` 分支依赖。
+/// - `ChunkBisected/DownloadComplete/ChunkStatusChanged`：通知类，UI 可忽略，仅 `MonitorUpdate` 为聚合权威。
 ///
 /// 当使用 `run()` 方法启动下载时，可以通过接收器获取此类型的消息，
 /// 实时监控下载进度和状态变化。
@@ -196,9 +219,10 @@ pub enum DownloadInfo {
 }
 
 impl DownloadInfo {
-    /// 获取下载进度百分比（0.0 ~ 100.0）。
+    /// 获取下载进度百分比（0.0 ~ 100.0）— 稳定契约。
     ///
-    /// 仅对 `MonitorUpdate` 变体有效，其他变体返回 0.0。
+    /// 仅对 `MonitorUpdate` 变体有效，其他变体返回 `0.0`（稳定行为，UI 可对任意 `DownloadInfo` 安全调用）。
+    /// `total_size==0` 时返回 `0.0`，0 字节文件请用 `is_complete()` 判定。
     pub fn progress_percent(&self) -> f64 {
         match self {
             DownloadInfo::MonitorUpdate {
@@ -216,9 +240,9 @@ impl DownloadInfo {
         }
     }
 
-    /// 获取下载速度（MB/秒）。
+    /// 获取下载速度（MB/秒）— 稳定契约。
     ///
-    /// 仅对 `MonitorUpdate` 变体有效，其他变体返回 0.0。
+    /// 仅对 `MonitorUpdate` 变体有效，其他变体返回 `0.0`。
     pub fn speed_mbps(&self) -> f64 {
         match self {
             DownloadInfo::MonitorUpdate { total_speed, .. } => *total_speed / (1024.0 * 1024.0),
@@ -226,9 +250,9 @@ impl DownloadInfo {
         }
     }
 
-    /// 获取已下载的字节数。
+    /// 获取已下载的字节数 — 稳定契约。
     ///
-    /// 仅对 `MonitorUpdate` 变体有效，其他变体返回 0。
+    /// 仅对 `MonitorUpdate` 变体有效，其他变体返回 `0`。
     pub fn downloaded_bytes(&self) -> u64 {
         match self {
             DownloadInfo::MonitorUpdate {
@@ -238,9 +262,9 @@ impl DownloadInfo {
         }
     }
 
-    /// 获取文件总大小（字节）。
+    /// 获取文件总大小（字节）— 稳定契约。
     ///
-    /// 仅对 `MonitorUpdate` 变体有效，其他变体返回 0。
+    /// 仅对 `MonitorUpdate` 变体有效，其他变体返回 `0`。`0` 的语义见顶层契约。
     pub fn total_bytes(&self) -> u64 {
         match self {
             DownloadInfo::MonitorUpdate { total_size, .. } => *total_size,
@@ -248,9 +272,9 @@ impl DownloadInfo {
         }
     }
 
-    /// 检查下载是否已完成。
+    /// 检查下载是否已完成 — 稳定契约。
     ///
-    /// 仅对 `MonitorUpdate` 变体有效，其他变体返回 false。
+    /// 仅对 `MonitorUpdate` 变体有效，其他变体返回 `false`。`0/0` 完成、`0/N` 未完成（流式由 `DownloadComplete` 终局）。
     pub fn is_complete(&self) -> bool {
         match self {
             DownloadInfo::MonitorUpdate {
