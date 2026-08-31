@@ -236,7 +236,7 @@ pub(crate) fn parse_content_range(header: &str) -> Option<(u64, u64, u64)> {
 ///
 /// # 参数
 /// - `filepath`: 文件的保存路径。
-/// - `size`: 文件的总大小，用于预分配文件空间。
+/// - `size`: 文件总大小，仅用于日志，不用于预分配文件空间。
 ///
 /// # 返回
 /// 一个 `mpsc::Sender<DownloadCmd>`，其他任务可以通过它发送 `WriteFile` 命令。
@@ -295,7 +295,7 @@ async fn file_writer_task_impl(
         .read(true)
         .write(true)
         .create(true)
-        .truncate(false)
+        .truncate(truncate)
         .open(&*filepath)
         .await?;
     ::tracing::info!(path = %filepath, size, truncate, "output file ready (streaming, no preallocation)");
@@ -455,3 +455,60 @@ async fn file_writer_task_impl(
 
     Ok((tx, writer_handle))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    #[tokio::test]
+    async fn writer_truncate_true_removes_stale_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.bin");
+        tokio::fs::write(&path, b"stale tail").await.unwrap();
+
+        let (tx, handle) = file_writer_task(
+            FastStr::from(path.to_string_lossy().to_string()),
+            3,
+        )
+        .await
+        .unwrap();
+        tx.send(DownloadCmd::WriteFile {
+            offset: 0,
+            data: Bytes::from_static(b"new"),
+        })
+        .await
+        .unwrap();
+        tx.send(DownloadCmd::TerminateAll).await.unwrap();
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"new");
+    }
+    #[cfg(feature = "resume")]
+    #[tokio::test]
+    async fn writer_truncate_false_preserves_existing_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resume.bin");
+        tokio::fs::write(&path, b"old tail").await.unwrap();
+
+        let (tx, handle) = file_writer_task_with_resume(
+            FastStr::from(path.to_string_lossy().to_string()),
+            3,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        tx.send(DownloadCmd::WriteFile {
+            offset: 0,
+            data: Bytes::from_static(b"new"),
+        })
+        .await
+        .unwrap();
+        tx.send(DownloadCmd::TerminateAll).await.unwrap();
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"new tail");
+    }
+}
+
