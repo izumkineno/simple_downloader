@@ -104,6 +104,15 @@ impl ConcurrencyManager {
         }
     }
 
+    /// 0.5.5 热更新：运行时调整最大并发（配置灵活性）
+    pub fn set_max_workers(&mut self, workers: u64) {
+        let w = workers.max(1);
+        if w != self.max_workers {
+            ::tracing::info!(old = self.max_workers, new = w, "concurrency max_workers hot-update");
+            self.max_workers = w;
+        }
+    }
+
     /// 按文件大小自适应的最小剩余时间阈值（大文件更激进，小文件保持保守）。
     /// 修复前 1.5/2.0/2.5/3.5/5.0 仍导致 S2/S5 零分裂（est 0.31s/1.05s <阈值），修复后更激进以允许大中文件及早探测。
     fn adaptive_remaining_threshold(total_file_size: u64) -> f64 {

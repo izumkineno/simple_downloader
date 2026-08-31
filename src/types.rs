@@ -104,9 +104,10 @@ pub enum DownloadCmd {
 ///
 /// 当使用 `run()` 方法启动下载时，可以通过接收器获取此类型的消息，
 /// 实时监控下载进度和状态变化。
+/// `0.5.5+` 标记 `#[non_exhaustive]`，新增变体/字段为兼容变更，调用方需 `_` 分支。
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum DownloadInfo {
-    /// 单个下载块的进度更新。
     ///
     /// 当某个下载块接收到新的数据时，会发送此消息。
     ChunkProgress {

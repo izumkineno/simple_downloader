@@ -300,6 +300,7 @@ async fn render_progress(
                 }
             }
             DownloadInfo::ChunkProgress { .. } => {}
+            _ => {}
         }
     }
 
