@@ -107,6 +107,28 @@ impl RetryHandler {
         }
         // 从活跃的块列表中移除该块
         state.chunks.remove(&id);
+        // 本地 I/O 击穿（writer 死亡）不该走 30 次漫长重试：一次即永久失败，避免卡死 100%
+        let is_local_io_failure = error.contains("写入通道已关闭")
+            || error.contains("writer closed")
+            || error.contains("BrokenPipe")
+            || error.contains("os error 5");
+        if is_local_io_failure {
+            ::tracing::error!(chunk_id = id, error = %error, "local writer I/O failure, permanent without retry");
+            let _ = info_tx.send(DownloadInfo::ChunkStatusChanged {
+                id,
+                status: 5,
+                message: Some(format!("本地写入失败，终止重试: {error}")),
+            });
+            self.permanent_failures.push(FailedChunkInfo {
+                id,
+                start,
+                end,
+                failure_time: Instant::now(),
+                attempts: *self.total_attempts.get(&id).unwrap_or(&0) + 1,
+            });
+            self.retry_attempts.remove(&id);
+            return;
+        }
         // 跨周期总计数，超过阈值判永久失败
         let total = self.total_attempts.entry(id).or_insert(0);
         *total += 1;

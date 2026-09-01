@@ -5,6 +5,7 @@ use crate::concurrency::ConcurrencyManager;
 use crate::lane::MultiRuntime;
 use crate::limiter::RateLimiter;
 use crate::retry::RetryHandler;
+use crate::speed::SpeedEstimator;
 use crate::state::{ChunkState, DownloadState};
 use crate::types::{ChunkId, DownloadCmd, DownloadInfo};
 use faststr::FastStr;
@@ -19,7 +20,7 @@ use tokio::task::JoinHandle;
 use tokio::time::interval;
 
 /// 用于速度计算的平滑因子，0.30 更快响应新建连接的带宽变化，利于探测增益
-const SMOOTHING_FACTOR: f64 = 0.10;
+const SMOOTHING_FACTOR: f64 = 0.30;
 
 /// 下载监控器，充当状态、重试和并发管理的协调器。
 pub struct DownloadMonitor {
@@ -39,6 +40,9 @@ pub struct DownloadMonitor {
     lagged_count: u64,
     is_rate_limited: bool,
     global_limiter: Option<Arc<RateLimiter>>,
+    /// 全局速度：主流滑动窗口（aria2 10s/curl环形缓冲 5-10s）替代 EMA，避免冷启动滞后
+    global_estimator: SpeedEstimator,
+    last_global_bytes: u64,
 }
 
 impl DownloadMonitor {
@@ -73,6 +77,8 @@ impl DownloadMonitor {
             lagged_count: 0,
             is_rate_limited: false,
             global_limiter: None,
+            global_estimator: SpeedEstimator::new(std::time::Duration::from_secs(5)),
+            last_global_bytes: completed_bytes,
         }
     }
 
@@ -515,8 +521,14 @@ impl DownloadMonitor {
         }
         let elapsed_secs = elapsed_secs.max(0.05);
 
-        // 委托状态更新：计算每个块的速度
+        // 委托状态更新：仅正常下载中(status==0)的块计速，排除重试/等待等非正常线程
         for chunk in self.state.chunks.values_mut() {
+            if chunk.status != 0 {
+                if chunk.speed != 0.0 {
+                    chunk.speed = 0.0;
+                }
+                continue;
+            }
             let before = chunk.speed;
             chunk.update_speed(elapsed_secs, SMOOTHING_FACTOR);
             ::tracing::trace!(
@@ -529,11 +541,18 @@ impl DownloadMonitor {
                 "chunk speed update"
             );
         }
+        // 全局速度：滑动窗口（aria2 10s窗口/curl环形缓冲 5-10s），替代EMA，贴近系统任务管理器
+        let total_now = self.state.total_downloaded();
+        let now = Instant::now();
+        self.global_estimator.observe(total_now, now);
+        let global_speed = self.global_estimator.speed(now);
+        self.last_global_bytes = total_now;
         ::tracing::trace!(
             elapsed_secs,
-            downloaded = self.state.total_downloaded(),
+            downloaded = total_now,
             total = self.state.total_file_size,
-            speed_kbs = self.state.total_speed() / 1024.0,
+            chunk_sum_kbs = self.state.total_speed() / 1024.0,
+            global_kbs = global_speed / 1024.0,
             active = self.state.chunks.len(),
             pending_bisects = self.pending_bisects.len(),
             retry_q = self.retry_handler.retry_queue_len(),
@@ -541,8 +560,9 @@ impl DownloadMonitor {
             tasks = tasks.len(),
             "monitor tick"
         );
-        // 发送聚合后的监控更新
+        // 发送聚合后的监控更新（global_speed(window) 为权威 total_speed，chunk_sum 仅作对比日志）
         self.send_monitor_update(info_tx);
+
 
         // 委托并发控制：让并发管理器决定是否需要分割块（限速时冻结，避免误判）
         if self.is_rate_limited {
@@ -711,15 +731,26 @@ impl DownloadMonitor {
     }
 
     /// 发送聚合的监控更新信息。
-    fn send_monitor_update(&self, info_tx: &broadcast::Sender<DownloadInfo>) {
+    fn send_monitor_update(&mut self, info_tx: &broadcast::Sender<DownloadInfo>) {
         let chunk_details = self
             .state
             .chunks
             .values()
             .map(|c| (c.id, c.size(), c.downloaded_bytes, c.speed, c.status))
             .collect();
-        // 全局限幅：避免多块 Lagged 补发叠加导致瞬时 total 突增至数 GiB/s
-        let total_speed = self.state.total_speed().min(600.0 * 1024.0 * 1024.0);
+        // 主流滑动窗口（aria2 10s/curl 5-10s）为权威总速，2 GiB上界防极端堆叠
+        // 全部重试/无活跃块时窗口仍含旧窗口均值，会虚高卡大速度；此时按主流（aria2/curl 0速）直接归零
+        let now = Instant::now();
+        let window_speed = self.global_estimator.speed(now);
+        let per_sum = self.state.total_speed();
+        let chosen_raw = if self.state.normal_chunk_count() == 0 {
+            0.0
+        } else if window_speed > 0.0 {
+            window_speed
+        } else {
+            per_sum
+        };
+        let total_speed = chosen_raw.min(2.0 * 1024.0 * 1024.0 * 1024.0);
         let _ = info_tx.send(DownloadInfo::MonitorUpdate {
             total_size: self.state.total_file_size,
             total_downloaded: self.state.total_downloaded(),

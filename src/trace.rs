@@ -85,6 +85,7 @@ pub fn try_init_tracing_for_env(env: Env) -> bool {
     let fmt_layer = fmt::layer()
         .with_target(true)
         .with_level(true)
+        .with_file(true)
         .with_line_number(true)
         .with_thread_ids(false)
         .with_thread_names(false);
@@ -103,6 +104,7 @@ pub fn init_tracing_with_filter(filter: &str) -> bool {
     let fmt_layer = fmt::layer()
         .with_target(true)
         .with_level(true)
+        .with_file(true)
         .with_line_number(true);
     let subscriber = tracing_subscriber::registry().with(filter).with(fmt_layer);
     ::tracing::subscriber::set_global_default(subscriber).is_ok()

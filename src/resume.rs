@@ -459,6 +459,8 @@ pub struct ResumeRecorder {
     covered_ranges: Vec<Vec<(u64, u64)>>,
     pending_segments: usize,
     last_save: Instant,
+    /// 末次落盘内容摘要（aria2 `lastDigest_` 对齐），未变化时跳过原子写入以降低 Windows 杀软锁争用
+    last_digest: Option<u64>,
 }
 
 impl ResumeRecorder {
@@ -475,12 +477,14 @@ impl ResumeRecorder {
             })
             .collect();
         ::tracing::debug!(path = %metadata_path.display(), segments = metadata.segments.len(), completed = metadata.completed_bytes(), "ResumeRecorder created");
+        let last_digest = Some(hash_bytes(&bitcode::encode(&metadata)));
         Self {
             metadata_path,
             metadata,
             covered_ranges,
             pending_segments: 0,
             last_save: Instant::now(),
+            last_digest,
         }
     }
 
@@ -529,17 +533,18 @@ impl ResumeRecorder {
             self.pending_segments += newly_completed;
             let should_flush =
                 self.pending_segments >= 16 || self.last_save.elapsed() >= Duration::from_secs(1);
-            ::tracing::debug!(
-                newly_completed,
-                pending = self.pending_segments,
-                should_flush,
-                "record_write segment progress"
-            );
             if should_flush {
-                self.metadata.save_atomic_async(&self.metadata_path).await?;
-                ::tracing::debug!(pending = self.pending_segments, path = %self.metadata_path.display(), "resume metadata flushed");
-                self.pending_segments = 0;
-                self.last_save = Instant::now();
+                let cur_digest = hash_bytes(&bitcode::encode(&self.metadata));
+                if self.last_digest == Some(cur_digest) {
+                    ::tracing::trace!(pending = self.pending_segments, "resume metadata digest unchanged, skip flush (aria2 dedup)");
+                    self.pending_segments = 0;
+                    self.last_save = Instant::now();
+                } else {
+                    self.metadata.save_atomic_async(&self.metadata_path).await?;
+                    self.last_digest = Some(cur_digest);
+                    self.pending_segments = 0;
+                    self.last_save = Instant::now();
+                }
             }
         }
         Ok(())
@@ -548,8 +553,16 @@ impl ResumeRecorder {
     /// 强制落盘，供 writer 退出前调用以避免最后 1MiB 窗口丢失（当前 downloader 成功后会删除 sidecar，失败/中断场景下保证最多丢 16 段）
     pub async fn flush(&mut self) -> Result<()> {
         if self.pending_segments > 0 {
+            let cur_digest = hash_bytes(&bitcode::encode(&self.metadata));
+            if self.last_digest == Some(cur_digest) {
+                ::tracing::trace!(pending = self.pending_segments, "resume metadata digest unchanged, skip final flush");
+                self.pending_segments = 0;
+                self.last_save = Instant::now();
+                return Ok(());
+            }
             ::tracing::debug!(pending = self.pending_segments, path = %self.metadata_path.display(), "resume recorder final flush");
             self.metadata.save_atomic_async(&self.metadata_path).await?;
+            self.last_digest = Some(cur_digest);
             self.pending_segments = 0;
             self.last_save = Instant::now();
         }

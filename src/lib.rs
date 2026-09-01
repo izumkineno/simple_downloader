@@ -158,6 +158,8 @@ pub mod queue;
 mod resume;
 pub mod retry;
 #[doc(hidden)]
+pub mod speed;
+#[doc(hidden)]
 pub mod state;
 #[cfg(feature = "queue")]
 pub mod task;
@@ -167,7 +169,6 @@ mod types;
 pub mod util;
 pub(crate) const DEFAULT_USER_AGENT: &str =
     concat!("simple_downloader/", env!("CARGO_PKG_VERSION"));
-
 // 导出核心的 `Downloader`，它是用户的主要入口点。
 pub use downloader::{DownloadBuilder, Downloader};
 #[cfg(feature = "proxy")]

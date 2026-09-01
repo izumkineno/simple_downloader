@@ -163,11 +163,20 @@ async fn progress_bar_task(file_size: u64, mut info_rx: broadcast::Receiver<Down
 #[tokio::main]
 async fn main() {
     // 初始化 tracing（生产默认 info，调试默认 debug；RUST_LOG 优先）
-    // simple_downloader::trace::init_tracing();
+    simple_downloader::trace::init_tracing();
+
+    // 创建 tmp 文件夹
+    let tmp_dir = std::path::Path::new("tmp");
+    if !tmp_dir.exists() {
+        std::fs::create_dir_all(tmp_dir).expect("无法创建 tmp 文件夹");
+    }
     // 1. --- 配置 ---
 
-    let url = "https://www.modelscope.cn/models/Tencent-Hunyuan/Hy-MT2-1.8B-GGUF/resolve/master/Hy-MT2-1.8B-Q6_K.gguf";
-    let output_path = "Hy-MT2-1.8B-Q6_K.gguf";
+    let url = "https://download.jetbrains.com/go/goland-2026.2.1.1.exe";
+    let output_path = "./tmp/goland-2026.2.1.1.exe";
+
+    // let url = "https://www.modelscope.cn/models/Tencent-Hunyuan/Hy-MT2-1.8B-GGUF/resolve/master/Hy-MT2-1.8B-Q6_K.gguf";
+    // let output_path = "./tmp/Hy-MT2-1.8B-Q6_K.gguf";
 
     let workers = 16; // 最大并发数
     let update_interval = 0.2; // 更新间隔为 0.2 秒

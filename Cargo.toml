@@ -1,6 +1,6 @@
 [package]
 name = "simple_downloader"
-version = "0.6.6"
+version = "0.6.7"
 edition = "2024"
 rust-version = "1.85"
 description = "高性能异步下载器：动态并发、断点续传、多源/代理 lane 调度，基于 Tokio + reqwest"
@@ -47,7 +47,7 @@ assert2 = "0.4.0"
 
 [[example]]
 name = "with_custom_ui"
-required-features = ["progress"]
+required-features = ["progress", "resume"]
 
 [[example]]
 name = "test_server_smart_schedule"

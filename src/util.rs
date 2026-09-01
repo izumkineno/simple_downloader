@@ -345,14 +345,23 @@ async fn file_writer_task_impl(
                             break;
                         }
                         #[cfg(feature = "resume")]
-                        if let Some(recorder) = resume_recorder.as_mut()
-                            && let Err(e) = recorder
-                                .record_write(&mut file, p_off, p_buf.len() as u64)
-                                .await
-                        {
-                            ::tracing::error!(error = %e, offset = p_off, "resume metadata update failed");
-                            writer_err = Some(e);
-                            break;
+                        if let Some(recorder) = resume_recorder.as_mut() {
+                            let mut last_err: Option<crate::types::DownloadError> = None;
+                            for attempt in 0..3 {
+                                match recorder.record_write(&mut file, p_off, p_buf.len() as u64).await {
+                                    Ok(()) => { last_err = None; break; }
+                                    Err(e) => {
+                                        last_err = Some(e);
+                                        if attempt < 2 {
+                                            ::tracing::warn!(error = %last_err.as_ref().unwrap(), offset = p_off, attempt = attempt + 1, "resume metadata update failed, retrying");
+                                            tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt as u64 + 1))).await;
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(e) = last_err {
+                                ::tracing::warn!(error = %e, offset = p_off, "resume metadata persistent failure, degrade (data already flushed)");
+                            }
                         }
                         ::tracing::trace!(
                             offset = p_off,
@@ -376,13 +385,23 @@ async fn file_writer_task_impl(
                             writer_err = Some(DownloadError::Io(e));
                         } else {
                             #[cfg(feature = "resume")]
-                            if let Some(recorder) = resume_recorder.as_mut()
-                                && let Err(e) = recorder
-                                    .record_write(&mut file, p_off, p_buf.len() as u64)
-                                    .await
-                            {
-                                ::tracing::error!(error = %e, offset = p_off, "resume metadata update failed on TerminateAll");
-                                writer_err = Some(e);
+                            if let Some(recorder) = resume_recorder.as_mut() {
+                                let mut last_err: Option<crate::types::DownloadError> = None;
+                                for attempt in 0..3 {
+                                    match recorder.record_write(&mut file, p_off, p_buf.len() as u64).await {
+                                        Ok(()) => { last_err = None; break; }
+                                        Err(e) => {
+                                            last_err = Some(e);
+                                            if attempt < 2 {
+                                                ::tracing::warn!(error = %last_err.as_ref().unwrap(), offset = p_off, attempt = attempt + 1, "resume metadata update failed on TerminateAll, retrying");
+                                                tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt as u64 + 1))).await;
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(e) = last_err {
+                                    ::tracing::warn!(error = %e, offset = p_off, "resume metadata persistent failure on TerminateAll, degrade");
+                                }
                             }
                             if writer_err.is_none() {
                                 ::tracing::trace!(
@@ -417,13 +436,23 @@ async fn file_writer_task_impl(
                     writer_err = Some(DownloadError::Io(e));
                 } else {
                     #[cfg(feature = "resume")]
-                    if let Some(recorder) = resume_recorder.as_mut()
-                        && let Err(e) = recorder
-                            .record_write(&mut file, p_off, p_buf.len() as u64)
-                            .await
-                    {
-                        ::tracing::error!(error = %e, offset = p_off, "resume metadata update failed on channel close");
-                        writer_err = Some(e);
+                    if let Some(recorder) = resume_recorder.as_mut() {
+                        let mut last_err: Option<crate::types::DownloadError> = None;
+                        for attempt in 0..3 {
+                            match recorder.record_write(&mut file, p_off, p_buf.len() as u64).await {
+                                Ok(()) => { last_err = None; break; }
+                                Err(e) => {
+                                    last_err = Some(e);
+                                    if attempt < 2 {
+                                        ::tracing::warn!(error = %last_err.as_ref().unwrap(), offset = p_off, attempt = attempt + 1, "resume metadata update failed on channel close, retrying");
+                                        tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt as u64 + 1))).await;
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(e) = last_err {
+                            ::tracing::warn!(error = %e, offset = p_off, "resume metadata persistent failure on channel close, degrade");
+                        }
                     }
                 }
             }
@@ -436,11 +465,21 @@ async fn file_writer_task_impl(
         }
         #[cfg(feature = "resume")]
         if let Some(recorder) = resume_recorder.as_mut() {
-            if let Err(e) = recorder.flush().await {
-                ::tracing::error!(error = %e, "resume recorder final flush failed");
-                if writer_err.is_none() {
-                    writer_err = Some(e);
+            let mut last_err: Option<crate::types::DownloadError> = None;
+            for attempt in 0..3 {
+                match recorder.flush().await {
+                    Ok(()) => { last_err = None; break; }
+                    Err(e) => {
+                        last_err = Some(e);
+                        if attempt < 2 {
+                            ::tracing::warn!(error = %last_err.as_ref().unwrap(), attempt = attempt + 1, "resume recorder final flush failed, retrying");
+                            tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt as u64 + 1))).await;
+                        }
+                    }
                 }
+            }
+            if let Some(e) = last_err {
+                ::tracing::warn!(error = %e, "resume recorder final flush persistent failure, degrade");
             } else {
                 ::tracing::debug!("resume recorder flushed on writer exit");
             }
