@@ -15,6 +15,14 @@
 
 ---
 
+## [0.6.5] - 2026-09-01
+
+### 🐛 修复（日志刷屏 + 稀疏写入 + 速度二次收敛 — with_custom_ui 复现）
+
+- **日志刷屏** `resume::record_write` `INFO`→`DEBUG`（`resume metadata flushed`/`final flush` 每1MiB一次，600M/1.47G下刷屏600/1475条，`paste-1/2`），`cargo run --example with_custom_ui` 不再刷屏
+- **稀疏写入 77% 故障** `resume::record_write` `read_segment` `UnexpectedEof` 时 `debug!` 并 `continue` 延期哈希，避免 `streaming` 无预分配下 `seek 1.2G` 后 `read 64KiB` 越界使 `writer` 设置 `writer_err` 退出，`chunk 0` 循环 `文件写入通道已关闭` 10次 `retry` 卡死；`save_atomic_async` 前 `remove_file(temp)` 防 `AlreadyExists`
+- **速度二次收敛** `SMOOTHING 0.30→0.15` + 首采样 `instant*0.15` 平滑、`MAX_SINGLE 350→200 MiB/s`、`total_speed` 限 `600 MiB/s`、`elapsed` 仅下界 `max(0.05)`（上界 clamp 2.0 在 writer 阻塞5s时反而放大 instant），`with_custom_ui 16 workers` 在首块 `46M/0.2s` 完成时 `90M→45M` 不再突增至 `407M`
+
 ## [0.6.4] - 2026-09-01
 
 ### 🐛 修复（卡100% + 恶性速度突增 — 0.3→0.6.3 回归）

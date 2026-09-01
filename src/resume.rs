@@ -144,6 +144,7 @@ impl ResumeMetadata {
             fs::create_dir_all(parent)?;
         }
         let temp_path = temporary_metadata_path(path);
+        let _ = fs::remove_file(&temp_path);
         let result = (|| {
             let mut file = fs::OpenOptions::new()
                 .write(true)
@@ -167,6 +168,8 @@ impl ResumeMetadata {
         }
         let temp_path = temporary_metadata_path(path);
         let bytes = bitcode::encode(self);
+        // 清理残留 temp，避免 create_new AlreadyExists 导致 writer 退出（77% 故障）
+        let _ = tokio::fs::remove_file(&temp_path).await;
         let result = async {
             let mut file = tokio::fs::OpenOptions::new()
                 .write(true)
@@ -503,7 +506,14 @@ impl ResumeRecorder {
             add_covered_range(&mut self.covered_ranges[index], overlap_start, overlap_end);
 
             if covers_segment(&self.covered_ranges[index], seg_start, seg_end) {
-                let bytes = read_segment(file, seg_start, seg_len).await?;
+                let bytes = match read_segment(file, seg_start, seg_len).await {
+                    Ok(b) => b,
+                    Err(crate::types::DownloadError::Io(ref io_err)) if io_err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        ::tracing::debug!(segment = index, start = seg_start, end = seg_end, error = %io_err, "segment not yet fully grown, defer hash");
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
                 self.metadata.segments[index].hash = Some(hash_bytes(&bytes));
                 newly_completed += 1;
                 ::tracing::trace!(
@@ -527,7 +537,7 @@ impl ResumeRecorder {
             );
             if should_flush {
                 self.metadata.save_atomic_async(&self.metadata_path).await?;
-                ::tracing::info!(pending = self.pending_segments, path = %self.metadata_path.display(), "resume metadata flushed");
+                ::tracing::debug!(pending = self.pending_segments, path = %self.metadata_path.display(), "resume metadata flushed");
                 self.pending_segments = 0;
                 self.last_save = Instant::now();
             }
@@ -538,7 +548,7 @@ impl ResumeRecorder {
     /// 强制落盘，供 writer 退出前调用以避免最后 1MiB 窗口丢失（当前 downloader 成功后会删除 sidecar，失败/中断场景下保证最多丢 16 段）
     pub async fn flush(&mut self) -> Result<()> {
         if self.pending_segments > 0 {
-            ::tracing::info!(pending = self.pending_segments, path = %self.metadata_path.display(), "resume recorder final flush");
+            ::tracing::debug!(pending = self.pending_segments, path = %self.metadata_path.display(), "resume recorder final flush");
             self.metadata.save_atomic_async(&self.metadata_path).await?;
             self.pending_segments = 0;
             self.last_save = Instant::now();

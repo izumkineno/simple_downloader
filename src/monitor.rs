@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use tokio::time::interval;
 
 /// 用于速度计算的平滑因子，0.30 更快响应新建连接的带宽变化，利于探测增益
-const SMOOTHING_FACTOR: f64 = 0.30;
+const SMOOTHING_FACTOR: f64 = 0.15;
 
 /// 下载监控器，充当状态、重试和并发管理的协调器。
 pub struct DownloadMonitor {
@@ -508,7 +508,7 @@ impl DownloadMonitor {
             ::tracing::trace!(elapsed_secs, "tick skip elapsed<0.05 guard恶性突增");
             return false;
         }
-        let elapsed_secs = elapsed_secs.clamp(0.05, 2.0);
+        let elapsed_secs = elapsed_secs.max(0.05);
 
         // 委托状态更新：计算每个块的速度
         for chunk in self.state.chunks.values_mut() {
@@ -713,10 +713,12 @@ impl DownloadMonitor {
             .values()
             .map(|c| (c.id, c.size(), c.downloaded_bytes, c.speed, c.status))
             .collect();
+        // 全局限幅：避免多块 Lagged 补发叠加导致瞬时 total 突增至数 GiB/s
+        let total_speed = self.state.total_speed().min(600.0 * 1024.0 * 1024.0);
         let _ = info_tx.send(DownloadInfo::MonitorUpdate {
             total_size: self.state.total_file_size,
             total_downloaded: self.state.total_downloaded(),
-            total_speed: self.state.total_speed(),
+            total_speed,
             chunk_details,
         });
     }

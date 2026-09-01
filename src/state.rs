@@ -82,7 +82,7 @@ impl ChunkState {
         if !elapsed_secs.is_finite() || elapsed_secs < 0.05 {
             return;
         }
-        let elapsed = elapsed_secs.clamp(0.05, 2.0);
+        let elapsed = elapsed_secs.max(0.05);
         let newly_downloaded = self
             .downloaded_bytes
             .saturating_sub(self.last_sampled_bytes);
@@ -91,12 +91,13 @@ impl ChunkState {
             return;
         }
         let mut instantaneous_speed = newly_downloaded as f64 / elapsed;
-        const MAX_SINGLE_CHUNK_BPS: f64 = 1024.0 * 1024.0 * 1024.0;
+        const MAX_SINGLE_CHUNK_BPS: f64 = 200.0 * 1024.0 * 1024.0;
         if instantaneous_speed > MAX_SINGLE_CHUNK_BPS {
             instantaneous_speed = MAX_SINGLE_CHUNK_BPS;
         }
         if self.speed == 0.0 {
-            self.speed = instantaneous_speed;
+            // 首采样同样平滑，避免首个 46M/0.2s 瞬时 230M 直接污染 total
+            self.speed = instantaneous_speed * smoothing_factor;
         } else {
             self.speed =
                 (instantaneous_speed * smoothing_factor) + (self.speed * (1.0 - smoothing_factor));
