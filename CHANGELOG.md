@@ -7,13 +7,26 @@
 
 ## [Unreleased]
 
-### 待规划（与 `README TODO` 一致，已扣除 0.6.3 已发项）
+### 待规划（与 `README TODO` 一致，已扣除 0.6.4 已发项）
 
 - [ ] 更智能的多源调度评分（`probe_speed 64KiB` 排序+黑名单 `3/30s` 已落地，`EWMA` 动态评分待 0.7）
 - [ ] 更完整的多代理端到端测试矩阵（`PerSourceProxy` 模型已落地）
 - [ ] 元数据 `version=1` 跨版本迁移策略与可观测性（`validate_shape` 自愈重建已落地，复用/失效 `segment` 事件待 0.7）
 
 ---
+
+## [0.6.4] - 2026-09-01
+
+### 🐛 修复（卡100% + 恶性速度突增 — 0.3→0.6.3 回归）
+
+- **卡100%** `state::complete_chunk` 回 `size()`（`Early-EOF` 已拦截截断，不会虚计）+ `state::preserve_partial_exact` 取 `ChunkFailed.start - chunk.start_byte` 精确值 + `chunk.rs` 3处失败`Progress`改 `reliable+broadcast` 双通道 + `exit early EOF`前补发；`monitor::handle_tick` + `state::update_speed` 加 `elapsed<0.05` guard 与 `clamp(0.05,2.0)`，`total_downloaded` 不再因 Lagged/节流漏64KiB而卡99%
+- **速度突增** `state::update_speed` 加 `tiny elapsed` 忽略、`MAX 1GiB/s cap`、`zero delta` 短路，`monitor::handle_tick` 同步 guard，`SMOOTHING 0.30` 下仍稳定，`examples/speed_guard_demo` 验证
+- **Abort 孤儿** `chunk::terminated` 标志 + `reliable.is_closed()` 检测，`TerminateAll/Closed` 静默退出不发 `Failed`，`smodeltrans` 的 `handle.abort()` 不再刷 `early EOF` 日志风暴
+
+### ✅ 测试与示例
+
+- `src/state` 5 用例、`src/chunk` 2 用例、`src/monitor` 1 用例、`tests/regression_card_and_speed` 3 集成用例（高并发8×256KiB/2MiB、 tiny elapsed、高速5×2MiB）全绿（`cargo test --all-features 39+3`）
+- `examples/regression_high_concurrency.rs`（state 模拟 600M/8 完成）+ `examples/speed_guard_demo.rs`（tiny/巨大/zero 三档）可 `cargo run --example`
 
 ## [0.6.3] - 2026-09-01
 

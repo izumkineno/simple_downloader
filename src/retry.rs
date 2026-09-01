@@ -98,10 +98,15 @@ impl RetryHandler {
         );
 
         // 保留已下载前缀，避免 total_downloaded 瞬时回落
-        state.preserve_partial(&id);
+        // 使用 ChunkFailed 携带的 start(offset) 精确计算已下载，避免依赖 broadcast 节流后的 stale downloaded_bytes
+        if let Some(chunk) = state.chunks.get(&id) {
+            let exact = start.saturating_sub(chunk.start_byte);
+            state.preserve_partial_exact(&id, exact);
+        } else {
+            state.preserve_partial(&id);
+        }
         // 从活跃的块列表中移除该块
         state.chunks.remove(&id);
-
         // 跨周期总计数，超过阈值判永久失败
         let total = self.total_attempts.entry(id).or_insert(0);
         *total += 1;

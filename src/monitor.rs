@@ -504,10 +504,11 @@ impl DownloadMonitor {
         multi_runtime: &mut Option<MultiRuntime>,
         next_chunk_id: &AtomicU64,
     ) -> bool {
-        if elapsed_secs <= 0.0 {
-            ::tracing::trace!("tick skip elapsed<=0");
+        if !elapsed_secs.is_finite() || elapsed_secs < 0.05 {
+            ::tracing::trace!(elapsed_secs, "tick skip elapsed<0.05 guard恶性突增");
             return false;
         }
+        let elapsed_secs = elapsed_secs.clamp(0.05, 2.0);
 
         // 委托状态更新：计算每个块的速度
         for chunk in self.state.chunks.values_mut() {
@@ -809,5 +810,37 @@ mod tests {
         assert!(!monitor.is_rate_limited);
         assert!(monitor.global_limiter.is_none());
         assert!(!limiter.check_n(std::num::NonZeroU32::new(1).unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use tokio::sync::{broadcast, mpsc};
+    use futures_util::stream::FuturesUnordered;
+    use std::sync::atomic::AtomicU64;
+
+    #[tokio::test]
+    async fn tick_guard_ignores_tiny_elapsed() {
+        // 验证 handle_tick 对极小 elapsed 的 guard，避免速度突增
+        let mut monitor = DownloadMonitor::new(1000, 0.5, 1);
+        // 插入一个块并设置已下载
+        monitor.state.chunks.insert(1, crate::state::ChunkState::new(1, 0, 999));
+        monitor.state.chunks.get_mut(&1).unwrap().update_downloaded(100);
+        let mut tasks = FuturesUnordered::new();
+        let (info_tx, _) = broadcast::channel(10);
+        let (cmd_tx, _) = broadcast::channel(10);
+        let client = reqwest::Client::new();
+        let (writer_tx, _) = mpsc::channel(10);
+        let next_id = AtomicU64::new(2);
+        // elapsed 0.001 应被 guard 忽略，返回 false 且不更新 speed
+        let before_speed = monitor.state.chunks.get(&1).unwrap().speed;
+        let done = monitor.handle_tick(0.001, &mut tasks, &info_tx, &None, &cmd_tx, &client, &writer_tx, None, &mut None, &next_id);
+        assert!(!done);
+        assert_eq!(monitor.state.chunks.get(&1).unwrap().speed, before_speed);
+        // 正常 elapsed 应更新
+        let done2 = monitor.handle_tick(0.5, &mut tasks, &info_tx, &None, &cmd_tx, &client, &writer_tx, None, &mut None, &next_id);
+        assert!(!done2);
+        assert!(monitor.state.chunks.get(&1).unwrap().speed > 0.0);
     }
 }

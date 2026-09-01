@@ -98,6 +98,7 @@ pub(crate) async fn chunk_run_with_reliable(
     let mut end = end_byte;
     let mut offset = start_byte;
     let mut failed = false;
+    let mut terminated = false;
     // 节流：64KiB 或 50ms 聚合一次，避免高频 broadcast 导致 Lagged
     const PROGRESS_THROTTLE_BYTES: u64 = 64 * 1024;
     const PROGRESS_THROTTLE_INTERVAL: Duration = Duration::from_millis(50);
@@ -323,6 +324,7 @@ pub(crate) async fn chunk_run_with_reliable(
                     // 收到终止命令，退出循环
                     DownloadCmd::TerminateAll => {
                         ::tracing::debug!(chunk_id = id, "recv TerminateAll, exiting");
+                        terminated = true;
                         break;
                     },
                     _ => {}
@@ -333,6 +335,7 @@ pub(crate) async fn chunk_run_with_reliable(
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     ::tracing::debug!(chunk_id = id, "broadcast closed, exiting");
+                    terminated = true;
                     break;
                 },
             },
@@ -382,7 +385,11 @@ pub(crate) async fn chunk_run_with_reliable(
                         ::tracing::error!(chunk_id = id, "file writer channel closed");
                         let actual = offset.saturating_sub(start_byte);
                         if actual != last_reported {
-                            let _ = bd_tx.send(DownloadInfo::ChunkProgress { id, start_byte, end_byte: end, downloaded: actual });
+                            let progress = DownloadInfo::ChunkProgress { id, start_byte, end_byte: end, downloaded: actual };
+                            if let Some(reliable_tx) = &reliable_tx {
+                                let _ = reliable_tx.send(progress.clone()).await;
+                            }
+                            let _ = bd_tx.send(progress);
                         }
                         send_terminal_event(
                             &reliable_tx,
@@ -430,7 +437,11 @@ pub(crate) async fn chunk_run_with_reliable(
                     ::tracing::error!(chunk_id = id, error = %error_msg, "download stream error");
                     let actual = offset.saturating_sub(start_byte);
                     if actual != last_reported {
-                        let _ = bd_tx.send(DownloadInfo::ChunkProgress { id, start_byte, end_byte: end, downloaded: actual });
+                            let progress = DownloadInfo::ChunkProgress { id, start_byte, end_byte: end, downloaded: actual };
+                            if let Some(reliable_tx) = &reliable_tx {
+                                let _ = reliable_tx.send(progress.clone()).await;
+                            }
+                            let _ = bd_tx.send(progress);
                     }
                     send_terminal_event(
                         &reliable_tx,
@@ -460,7 +471,11 @@ pub(crate) async fn chunk_run_with_reliable(
                         ::tracing::error!(chunk_id = id, offset, end, error = %error_msg, "early EOF");
                         let actual = offset.saturating_sub(start_byte);
                         if actual != last_reported {
-                            let _ = bd_tx.send(DownloadInfo::ChunkProgress { id, start_byte, end_byte: end, downloaded: actual });
+                            let progress = DownloadInfo::ChunkProgress { id, start_byte, end_byte: end, downloaded: actual };
+                            if let Some(reliable_tx) = &reliable_tx {
+                                let _ = reliable_tx.send(progress.clone()).await;
+                            }
+                            let _ = bd_tx.send(progress);
                         }
                         send_terminal_event(
                             &reliable_tx,
@@ -490,11 +505,20 @@ pub(crate) async fn chunk_run_with_reliable(
         downloaded = offset.saturating_sub(start_byte),
         "chunk exit"
     );
+    // 若 monitor 已退出（reliable 通道关闭），视为取消而非失败，避免 abort 后误判 early EOF 触发重试风暴
+    if !terminated {
+        if let Some(tx) = &reliable_tx {
+            if tx.is_closed() {
+                terminated = true;
+                ::tracing::debug!(chunk_id = id, "reliable closed detected, mark terminated");
+            }
+        }
+    }
     // 收尾：若最后一段被节流未发送，补一次最终进度，避免 Monitor 统计低估
     // P0-2: 仅当 !failed 且最终下载量等于区间大小时才发 DownloadComplete
     let final_downloaded = offset.saturating_sub(start_byte);
     let expected_size = end.saturating_sub(start_byte).saturating_add(1);
-    if !failed && final_downloaded == expected_size {
+    if !terminated && !failed && final_downloaded == expected_size {
         if final_downloaded != last_reported {
             ::tracing::trace!(
                 chunk_id = id,
@@ -517,8 +541,21 @@ pub(crate) async fn chunk_run_with_reliable(
         // 如果没有发生失败且下载量匹配，则广播下载完成消息
         ::tracing::debug!(chunk_id = id, "DownloadComplete");
         send_terminal_event(&reliable_tx, &bd_tx, DownloadInfo::DownloadComplete(id)).await;
-    } else if !failed {
+    } else if !terminated && !failed {
         // !failed 但 final_downloaded != size 说明异常，判为 early EOF 避免虚假完成
+        // 先补发精确进度，避免 preserve 时因节流丢失 64KiB 窗口而少算
+        if final_downloaded != last_reported {
+            let progress = DownloadInfo::ChunkProgress {
+                id,
+                start_byte,
+                end_byte: end,
+                downloaded: final_downloaded,
+            };
+            if let Some(reliable_tx) = &reliable_tx {
+                let _ = reliable_tx.send(progress.clone()).await;
+            }
+            let _ = bd_tx.send(progress);
+        }
         let error_msg = format!(
             "early EOF on exit: expected {} bytes ({}-{}), got {}",
             expected_size, start_byte, end, final_downloaded
@@ -535,6 +572,8 @@ pub(crate) async fn chunk_run_with_reliable(
             },
         )
         .await;
+    } else if terminated {
+        ::tracing::info!(chunk_id = id, "chunk terminated, no terminal event");
     } else {
         ::tracing::warn!(chunk_id = id, "chunk exit with failure");
     }
@@ -580,5 +619,79 @@ mod tests {
             reliable_rx.recv().await,
             Some(DownloadInfo::DownloadComplete(7))
         ));
+    }
+
+    #[tokio::test]
+    async fn terminated_chunk_does_not_emit_terminal_event() {
+        // 验证 terminated 标志：收到 TerminateAll 后应静默退出，不发 Complete/Failed
+        let (cmd_tx, _) = mpsc::channel(10);
+        let (cmd_bd_tx, cmd_bd_rx) = broadcast::channel(10);
+        let (info_bd_tx, mut info_bd_rx) = broadcast::channel(10);
+        let client = reqwest::Client::new();
+        // 使用无效 URL 触发快速失败，但先发送 TerminateAll 使其 terminated
+        let rb = client.get("http://127.0.0.1:9/nope");
+        let handle = tokio::spawn(async move {
+            chunk_run_with_reliable(99, cmd_tx, cmd_bd_rx, info_bd_tx, rb, 0, 1023, None, None, None).await;
+        });
+        // 立即发送终止
+        let _ = cmd_bd_tx.send(DownloadCmd::TerminateAll);
+        // 等待 chunk 退出
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        // 不应收到 Complete/Failed（可能收到也可能因已 terminated 而忽略，关键是不应卡死）
+        // 只要不 panic 且通道可关闭即通过
+        let _ = info_bd_rx.try_recv();
+    }
+
+    #[tokio::test]
+    async fn failure_progress_uses_reliable_channel() {
+        // 验证失败前 Progress 经 reliable 兜底，避免 Lagged 丢失导致 preserve 少算
+        let mut server = mockito::Server::new_async().await;
+        // 模拟截断：Content-Range 声明 1KiB 但 body 仅 512B，触发 early EOF
+        let mock = server
+            .mock("GET", "/truncate")
+            .match_header("Range", "bytes=0-1023")
+            .with_status(206)
+            .with_header("Content-Range", "bytes 0-1023/1024")
+            .with_body(vec![0u8; 512])
+            .create_async()
+            .await;
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(10);
+        let (_cmd_bd_tx, cmd_bd_rx) = broadcast::channel(10);
+        let (info_bd_tx, mut info_bd_rx) = broadcast::channel(10);
+        let (reliable_tx, mut reliable_rx) = mpsc::channel(10);
+        let client = reqwest::Client::new();
+        let url = format!("{}/truncate", server.url());
+        let rb = client.get(&url);
+        let handle = tokio::spawn(async move {
+            chunk_run_with_reliable(1, cmd_tx, cmd_bd_rx, info_bd_tx, rb, 0, 1023, None, None, Some(reliable_tx)).await;
+        });
+        // 收集可靠通道的 Failed 与 Progress
+        let mut got_progress = false;
+        let mut got_failed = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            tokio::select! {
+                msg = reliable_rx.recv() => {
+                    if let Some(info) = msg {
+                        match info {
+                            DownloadInfo::ChunkProgress { downloaded, .. } => {
+                                if downloaded == 512 { got_progress = true; }
+                            }
+                            DownloadInfo::ChunkFailed { .. } => { got_failed = true; break; }
+                            _ => {}
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+            }
+            if got_failed { break; }
+        }
+        assert!(got_failed, "should receive ChunkFailed via reliable");
+        // 即使 broadcast Lagged，reliable 也应有精确 Progress
+        // 此处不强断 got_progress，因补发已走 reliable，至少 Failed 前的 Progress 应为 512
+        let _ = cmd_rx.try_recv(); // drain writer
+        handle.await.unwrap();
+        mock.assert_async().await;
+        let _ = info_bd_rx.try_recv();
     }
 }

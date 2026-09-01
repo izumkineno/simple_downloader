@@ -77,17 +77,27 @@ impl ChunkState {
     }
 
     /// 根据新下载的字节数和经过的时间来更新速度。
-    /// 使用指数移动平均法（EMA）进行平滑处理。
+    /// 使用指数移动平均法（EMA）进行平滑处理，并防护 `elapsed` 过小导致的瞬时速度突增。
     pub fn update_speed(&mut self, elapsed_secs: f64, smoothing_factor: f64) {
+        if !elapsed_secs.is_finite() || elapsed_secs < 0.05 {
+            return;
+        }
+        let elapsed = elapsed_secs.clamp(0.05, 2.0);
         let newly_downloaded = self
             .downloaded_bytes
             .saturating_sub(self.last_sampled_bytes);
-        let instantaneous_speed = newly_downloaded as f64 / elapsed_secs;
+        if newly_downloaded == 0 {
+            self.last_sampled_bytes = self.downloaded_bytes;
+            return;
+        }
+        let mut instantaneous_speed = newly_downloaded as f64 / elapsed;
+        const MAX_SINGLE_CHUNK_BPS: f64 = 1024.0 * 1024.0 * 1024.0;
+        if instantaneous_speed > MAX_SINGLE_CHUNK_BPS {
+            instantaneous_speed = MAX_SINGLE_CHUNK_BPS;
+        }
         if self.speed == 0.0 {
-            // 第一次计算速度时，直接使用瞬时速度
             self.speed = instantaneous_speed;
         } else {
-            // 使用平滑算法更新速度
             self.speed =
                 (instantaneous_speed * smoothing_factor) + (self.speed * (1.0 - smoothing_factor));
         }
@@ -125,17 +135,31 @@ impl DownloadState {
     }
 
     /// 将一个块标记为已完成。
-    /// 使用真实 `downloaded_bytes` 累加并以 `min(size)` 防超算，避免截断流零填充尾部却按 `size()` 多算。
+    /// P0-02 完整性门已保证仅当 `offset == end+1` 才发送 `DownloadComplete`，此时 `downloaded == size`。
+    /// 为容忍 `broadcast Lagged` 导致最终 `ChunkProgress` 丢失，使用 `size()` 精确累加，避免 `total_downloaded` 低估而卡 100%。
+    /// 截断流已在 chunk 侧判为 `ChunkFailed` 不会走到此分支，故不会误算零填充。
     pub fn complete_chunk(&mut self, id: &ChunkId) {
         if let Some(chunk) = self.chunks.remove(id) {
-            self.completed_bytes += chunk.downloaded_bytes.min(chunk.size());
+            self.completed_bytes += chunk.size();
         }
     }
 
     /// 失败时保留已下载的前缀，避免 total_downloaded 回落导致剩余时间误判。
+    /// 调用方需保证在发送 `ChunkFailed` 前已通过 `ChunkProgress` 将 `downloaded` 精确落入 `state`，
+    /// 若存在 Lagged 丢失，调用方可传入 `exact_downloaded` 兜底。
     pub(crate) fn preserve_partial(&mut self, id: &ChunkId) {
         if let Some(chunk) = self.chunks.get(id) {
             self.completed_bytes += chunk.downloaded_bytes;
+        }
+    }
+
+    /// 失败时带精确进度兜底的保留，避免节流 64KiB 窗口丢失导致 progress 回退 0.5s 卡顿。
+    pub(crate) fn preserve_partial_exact(&mut self, id: &ChunkId, exact_downloaded: u64) {
+        if let Some(chunk) = self.chunks.get(id) {
+            let best = chunk.downloaded_bytes.max(exact_downloaded.min(chunk.size()));
+            self.completed_bytes += best;
+        } else {
+            self.completed_bytes = self.completed_bytes.saturating_add(exact_downloaded);
         }
     }
 
@@ -159,5 +183,72 @@ impl DownloadState {
     /// 检查下载是否已完成。
     pub fn is_download_finished(&self) -> bool {
         self.total_downloaded() >= self.total_file_size
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn regression_card_complete_uses_size_not_stale_downloaded() {
+        // 卡100%回归：broadcast Lagged 导致 ChunkProgress 丢失，state 中 downloaded 仍为 0，
+        // complete_chunk 必须按 size() 累加而非 stale downloaded，否则 is_finished 永假
+        let mut state = DownloadState::with_completed(1000, 0);
+        let chunk_id = 1;
+        // 模拟已插入但未更新进度的块
+        state.chunks.insert(chunk_id, ChunkState::new(chunk_id, 0, 999));
+        // 不更新 downloaded（保持 0 模拟 Lagged 丢失 final Progress）
+        state.complete_chunk(&chunk_id);
+        assert_eq!(state.completed_bytes, 1000, "should use size() not stale 0");
+        assert!(state.is_download_finished(), "should be finished after size add");
+        assert_eq!(state.total_downloaded(), 1000);
+    }
+
+    #[test]
+    fn regression_preserve_exact_avoids_throttle_gap() {
+        // 节流 64KiB 窗口：失败时 state.downloaded 滞后，preserve 需用精确 offset
+        let mut state = DownloadState::with_completed(1000, 0);
+        let chunk_id = 2;
+        let mut chunk = ChunkState::new(chunk_id, 0, 999);
+        chunk.update_downloaded(400); // stale，实际已下载 600
+        state.chunks.insert(chunk_id, chunk);
+        state.preserve_partial_exact(&chunk_id, 600);
+        // 应取 max(stale 400, exact 600) =600
+        assert_eq!(state.completed_bytes, 600);
+        // 模拟 retry handler 移除 chunk 后，total 应为精确值
+        state.chunks.remove(&chunk_id);
+        assert_eq!(state.total_downloaded(), 600);
+    }
+    #[test]
+    fn regression_speed_guard_tiny_elapsed() {
+        let mut chunk = ChunkState::new(1, 0, 9999);
+        chunk.update_downloaded(100 * 1024);
+        // 极小 elapsed 0.001s 来自 interval 补偿突发，应被 guard 忽略，speed 保持 0
+        chunk.update_speed(0.001, 0.30);
+        assert_eq!(chunk.speed, 0.0, "tiny elapsed should be ignored");
+        // 正常 0.5s 应计算
+        chunk.update_speed(0.5, 0.30);
+        assert!(chunk.speed > 0.0 && chunk.speed < 1_000_000_000.0);
+    }
+
+    #[test]
+    fn regression_speed_cap() {
+        let mut chunk = ChunkState::new(1, 0, 10_000_000);
+        // 模拟 Lagged 补发巨大 delta：2GiB 在 0.5s 内
+        chunk.update_downloaded(2 * 1024 * 1024 * 1024);
+        chunk.update_speed(0.5, 0.30);
+        assert!(chunk.speed <= 1024.0 * 1024.0 * 1024.0 + 1.0, "should be capped at 1GiB/s");
+    }
+
+    #[test]
+    fn regression_speed_zero_delta_no_spike() {
+        let mut chunk = ChunkState::new(1, 0, 1000);
+        chunk.update_downloaded(100);
+        chunk.update_speed(0.5, 0.30);
+        let speed1 = chunk.speed;
+        // 无新数据时不应突变，last_sampled 更新后 speed 保持
+        chunk.update_speed(0.5, 0.30);
+        assert_eq!(chunk.speed, speed1, "zero delta should not change speed");
     }
 }
