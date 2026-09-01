@@ -15,21 +15,22 @@
 - `tests/util.rs`：文件信息探测回退链路、写入任务和基础工具行为。
 - `test_server/server.py`：本地可控 Range/限速测试服务，适合集成验证与手工观察并发行为。
 
-## 二、项目概览（按 0.6.2 源码校准）
+## 二、项目概览（按 0.6.2 源码 + `b4fcadf`/`eef24ea` 两补丁校准）
 
 simple_downloader 是一个基于 Rust 与 Tokio 的异步下载库，当前实现重点在于：
 
-- `Downloader`：启动编排入口，负责 client、文件信息探测、写入任务和初始 chunk。
-- `DownloadMonitor`：运行期控制循环，持有 `DownloadState`、`ConcurrencyManager`、`RetryHandler`，限速启用时冻结并发探测。
-- `chunk_run`：执行单个 byte-range 拉取、Range 206/Content-Range 校验、Early-EOF 门限与事件上报。
-- `file_writer_task`：独立文件写入任务，通过有界 `mpsc 128` 提供背压，0.6.2 流式追加（无 `set_len` 预分配，`truncate(false)`）。
-- `limiter`：`rate-limit` feature 下 `governor` 令牌桶 `1 token=1 byte`，全局/分源双桶 `tokio::join` 取 `max`，`burst` 默认 64KiB。
+- `Downloader`：`DownloadBuilder` 流式编排入口，负责 `Client`（`pool 32/90s/60s + UA`）、`get_file_info` 三级回退探测、`ResumePlan` + 写入任务和初始 `remaining_ranges` 分片。
+- `DownloadMonitor`：运行期控制循环，持有 `DownloadState`、`ConcurrencyManager`、`RetryHandler`，`is_rate_limited` 时冻结 `decide_and_act`（`drain_pending` 容量补位除外），`reliable mpsc` 兜底终局事件。
+- `chunk_run_with_reliable`：单 `byte-range` 拉取、`206/Content-Range` 强校验、`Early-EOF` 门限、`send_terminal_event` 经 `broadcast 4096` + `reliable mpsc 1` 上报，`PROGRESS_THROTTLE 64KiB/50ms` 限频，`governor` 双桶 `join max` 32-64KiB 批量。
+- `file_writer_task_impl`：独立写入任务，有界 `mpsc 128` 背压，`0.5.4+` 流式追加（无 `set_len` 预分配，`create_dir_all` + `truncate(false)`，`ENOSPC` 在 `write/flush` 以 `DownloadError::Io` 透传；`truncate(true)` 仅 resume 覆盖场景）。
+- `limiter`：`rate-limit` feature 下 `governor` 令牌桶 `1 token=1 byte`，全局/分源双桶 `tokio::join` 取 `max`，`burst` 默认 `64KiB`，`RateLimiter::reconfigure/disable` 支持 `apply_config` 热更全局限速。
+- `queue`：`queue` feature 下 `TaskQueue` FIFO 调度，`JoinSet+AbortHandle` 驱动，`with_max_concurrent 1..64`，`pending_deletes 200ms` 延迟删（`PermissionDenied/未知Io重试`），`with_suffix` `a.tar(1).gz` 与三重 CAS 重命名。
 
-项目当前许可证文件为仓库根目录中的 Apache License 2.0（见 `LICENSE`）。
 ## 三、当前验证与回归面
 
 ### 1. 自动化测试
 
+`cargo test --all-features` 31 passed（`cargo clippy --all-features -D warnings` 绿）：
 
 - `tests/concurrency.rs`
   - 无正向吞吐证据时不继续探测分片
@@ -38,35 +39,49 @@ simple_downloader 是一个基于 Rust 与 Tokio 的异步下载库，当前实�
   - 补位目标按“剩余可分片工作量”而不是原始区间尺寸选择
 - `tests/util.rs`
   - `HEAD` 成功获取文件信息
-  - `HEAD` 失败后回退 `GET Range: bytes=0-0`
-  - 无 `Content-Range` 时回退到 `Content-Length`
-  - `file_writer_task` 流式追加（0.5.4+ 无 `set_len`，`ENOSPC` 在 `flush` 暴露）与零填充行为已对齐
+  - `HEAD` 失败后回退 `GET Range: bytes=0-0` 解析 `Content-Range`
+  - 无 `Content-Range` 时回退到 `Content-Length`，`416` 与 `bytes */total` 兼容
+  - `file_writer_task_impl` 流式追加（`0.5.4+` 无 `set_len`，`ENOSPC` 在 `flush` 暴露）与 `truncate(true/false)` 尾部语义
 - `tests/chunk.rs`
-  - `206 Content-Range` 校验、`416 Range Not Satisfiable`、`200 仅单段降级`（P0-1）
-  - `Early-EOF` 门限与 `final_downloaded==size` 才 `DownloadComplete`（P0-2）
-  - `test_chunk_bisect` 目前保留为 `#[ignore]`，说明动态分片仍主要依赖更复杂的延迟响应场景做集成验证
-- `tests/rate_limit.rs`（`--features rate-limit,multi-source`）
-  - `5MiB@1MiB/s 4-6.5s` 全局、`per_source`、`global+per_source`、`burst=0` 校验
+  - `206 Content-Range` 强校验、`416 Range Not Satisfiable`、`200 仅单段降级`（P0-1）及 `parse_content_range` 大小写兼容
+  - `Early-EOF` 门限与 `final_downloaded==size` 才 `DownloadComplete` + `terminal_event` 经 `reliable` 兜底不丢（`b4fcadf`）
+  - `split_range` `MIN_CHUNK_SIZE 10KiB` 边界与 `PROGRESS_THROTTLE 64KiB/50ms` 限频
+  - `test_chunk_bisect` 仍 `#[ignore]`，动态分片由 `concurrency` 集成验证
+- `tests/rate_limit.rs`（`--features rate-limit,multi-source` 5 用例）
+  - `invalid_zero/burst_zero_hard` 校验、`5MiB@1MiB/s 4-6.5s` 全局、`per_source 5-8.5s`、`global+per_source 3-5.5s`
+- `queue` 集成（`--features queue` `cargo test --test queue`）
+  - `TaskQueue::with_max_concurrent` FIFO/pause/resume/cancel/重命名 三重 CAS + `pending_deletes 200ms` 延迟删
+  - `concurrent_enqueue_assigns_unique_paths` 17 并发同名全唯一，无覆盖
+- `resume` 单元（`src/resume.rs`）
+  - `hash_is_stable`/`prepare_self_heals_on_version/size/malformed`/`atomic_save`/`truncate_tail`
+- `monitor` 热更（`src/monitor.rs:apply_config_updates_and_disables_global_limiter`）
+  - `workers/interval` 切换与 `global limiter reconfigure/disable` 热更已验证
 
 ### 2. 手工 / 集成验证
 
 `test_server/server.py` 支持：
 
-- Range 请求
-- 全局 / 单连接限速
-- 配置热更新
-- 下载进度与连接状态观察
-
-这使它适合验证 `ConcurrencyManager` 的动态分片决策是否符合预期，而不仅是验证单个单元测试断言。
+- Range 请求与 `Content-Range` 校验
+- 全局 / 单连接限速（供 `rate-limit` 精度矩阵）
+- 500 MiB 多源手工观察（`examples/manual_multi_source_test_server.rs` fast 16m/slow 2m）
+- 断点续传进程级 kill 恢复（`tests/process_resume.rs` + `examples/resume_harness.rs`）
+- 队列隔离示例（`examples/with_queue.rs` 同名 `a(N).ext` 演进）
+- 智能调度观察（`examples/test_server_smart_schedule.rs` 与 `adaptive_bench.rs`）
 
 ## 四、推荐验证命令
 
-在仓库根目录运行：
+在仓库根目录运行（以 `Cargo.toml:3 0.6.2` 为准，`b4fcadf`/`eef24ea` 两补丁已在 `master` 未发版）：
 
 ```bash
 cargo fmt --check
-cargo check
-cargo test
+cargo clippy --all-features -D warnings
+cargo test --all-features
+# 细分
+cargo test --all-features -- --nocapture --test-threads=1
+cargo test --features rate-limit,multi-source --test rate_limit -- --nocapture
+cargo test --features queue --test queue -- --nocapture
+cargo test --features resume,multi-source --test resume -- --nocapture --test-threads=1
+cargo test --features resume,multi-source --test process_resume -- --nocapture --test-threads=1
 ```
 
 如果要观察本地服务端行为，可额外启动：
@@ -74,6 +89,12 @@ cargo test
 ```bash
 python test_server/server.py
 cargo run --example download
+cargo run --features progress --example with_custom_ui
+cargo run --features rate-limit,progress --example with_rate_limit
+cargo run --features rate-limit,progress --example with_rate_limit -- --multi
+cargo run --features multi-source,progress --example manual_multi_source_test_server
+cargo run --features queue --example with_queue
+cargo run --features progress --example test_server_smart_schedule
 ```
 
 若需要理解这些验证对应到哪些运行时路径，请对照 [`architecture.md`](./architecture.md) 中的“源码映射”和“运行时时序图”章节。
@@ -82,33 +103,42 @@ cargo run --example download
 
 ```text
 ├── src/
-│   ├── downloader.rs    # 顶层启动编排
-│   ├── monitor.rs       # 运行时控制循环
-│   ├── concurrency.rs   # 动态分片决策
-│   ├── retry.rs         # 即时/延迟重试队列
-│   ├── chunk.rs         # 单分片下载执行（P0-1 Range/Early-EOF）
-│   ├── state.rs         # 聚合下载状态
-│   ├── util.rs          # 文件信息探测、流式写入任务（P0-4）
-│   ├── limiter.rs       # rate-limit 令牌桶（0.5.x）
-│   ├── trace.rs         # tracing 初始化门面
-│   ├── config.rs        # 运行时热更新 RuntimeConfig
-│   ├── queue.rs         # 任务队列 FIFO/并发调度（0.6.x）
-│   ├── task.rs          # 任务句柄与快照
-│   └── types.rs         # 公共协议类型
+│   ├── downloader.rs    # 顶层启动编排（DownloadBuilder/orchestrate_downloads/streaming_download）
+│   ├── monitor.rs       # 运行时控制循环（run_with_reliable/apply_config/drain_pending）
+│   ├── concurrency.rs   # 动态分片决策（Probing/Stable, 256KiB 阈值）
+│   ├── retry.rs         # 即时/延迟重试队列（1s/10s/30总量 FIFO）
+│   ├── chunk.rs         # 单分片下载执行（206/Early-EOF/reliable terminal）
+│   ├── state.rs         # 聚合下载状态（EMA 0.30）
+│   ├── util.rs          # 文件信息探测、流式写入任务（P0-4, truncate 分支）
+│   ├── limiter.rs       # rate-limit 令牌桶（governor 双桶 join max）
+│   ├── trace.rs         # tracing 初始化门面（RUST_LOG/SIMPLE_DOWNLOADER_LOG）
+│   ├── config.rs        # 运行时热更新 RuntimeConfig（workers/interval/global limiter）
+│   ├── queue.rs         # 任务队列 FIFO/并发调度（pending_deletes 200ms）
+│   ├── task.rs          # 任务句柄与快照（TaskId/TaskState/TaskSnapshot）
+│   └── types.rs         # 公共协议类型（DownloadInfo #[non_exhaustive] 稳定契约）
 ├── tests/
 │   ├── chunk.rs
 │   ├── concurrency.rs
 │   ├── rate_limit.rs
-│   └── util.rs
+│   ├── util.rs
+│   ├── queue.rs
+│   ├── resume.rs
+│   ├── process_resume.rs
+│   └── multi_source.rs
 ├── test_server/
 │   ├── config.ini
 │   └── server.py
 ├── examples/
+│   ├── download.rs
+│   ├── with_custom_ui.rs
 │   ├── with_rate_limit.rs
-│   └── manual_multi_source_test_server.rs
+│   ├── with_queue.rs
+│   ├── test_server_smart_schedule.rs
+│   ├── manual_multi_source_test_server.rs
+│   ├── adaptive_bench.rs
+│   └── resume_harness.rs
 └── README.md
 ```
-
 ## 六、待实现功能（文档层摘要）
 
-`0.5.4` 已落地 `rate-limit` 流式追加 + P0 6 项；`README TODO` 剩余 `断点续传 schema 演进/可观测性`、`多源智能调度/代理矩阵`、`配置灵活性/任务队列/稳定 UI 契约` 仍按 `README:79-112` 为准，本文仅做测试与结构导航，不重复总纲。
+以 `README:79-112 TODO` 为准，`0.6.2+2` 已交付 `rate-limit 双桶/自适应冻结/可靠终局/队列延迟删/DownloadInfo 稳定契约`；剩余 `断点续传 schema 跨版本迁移（version=1 自愈已落地，迁移表待 0.7）`、`多源智能评分（probe_speed 排序+黑名单 3/30s 已落地，EWMA 动态评分待 0.7）`、`多代理端到端矩阵`、`可观测性（tracing info 已落地，复用/失效 segment 事件待 0.7）`。

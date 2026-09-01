@@ -72,10 +72,20 @@ async fn ac1_concurrency_fifo() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     queue.wait_all().await;
-    assert!(peak <= 3 && peak > 0, "peak active should be 1..3, got {}", peak);
+    assert!(
+        peak <= 3 && peak > 0,
+        "peak active should be 1..3, got {}",
+        peak
+    );
     for (i, id) in ids.iter().enumerate() {
         let snap = queue.query(id.clone()).await.expect("query");
-        assert_eq!(snap.state, TaskState::Completed, "task {} not completed: {:?}", i, snap.state);
+        assert_eq!(
+            snap.state,
+            TaskState::Completed,
+            "task {} not completed: {:?}",
+            i,
+            snap.state
+        );
         let out = temp.path().join(format!("out{}.bin", i));
         assert!(out.exists(), "file {} missing", out.display());
         let data = std::fs::read(&out).unwrap();
@@ -86,8 +96,11 @@ async fn ac1_concurrency_fifo() {
 
 #[tokio::test]
 async fn ac1_workers_isolation() {
-    let server_file = TestServerFile::new("big.bin", deterministic_bytes(2 * 1024 * 1024, 42)).unwrap();
-    let server = RunningTestServer::spawn(server_file.directory(), "64m", "64m").await.unwrap();
+    let server_file =
+        TestServerFile::new("big.bin", deterministic_bytes(2 * 1024 * 1024, 42)).unwrap();
+    let server = RunningTestServer::spawn(server_file.directory(), "64m", "64m")
+        .await
+        .unwrap();
     let temp = TempDir::new().unwrap();
     let queue = TaskQueue::with_max_concurrent(3);
     let url = server.url_for("big.bin");
@@ -95,7 +108,12 @@ async fn ac1_workers_isolation() {
     let id = queue.enqueue_with_workers(url, out.clone(), 8).await;
     queue.wait_all().await;
     let snap = queue.query(id).await.unwrap();
-    assert_eq!(snap.state, TaskState::Completed, "expected Completed got {:?}", snap.state);
+    assert_eq!(
+        snap.state,
+        TaskState::Completed,
+        "expected Completed got {:?}",
+        snap.state
+    );
     assert!(out.exists());
     let data = std::fs::read(&out).unwrap();
     let expected = deterministic_bytes(2 * 1024 * 1024, 42);
@@ -104,8 +122,11 @@ async fn ac1_workers_isolation() {
 
 #[tokio::test]
 async fn ac2_pause_resume() {
-    let server_file = TestServerFile::new("pause.bin", deterministic_bytes(2 * 1024 * 1024, 7)).unwrap();
-    let server = RunningTestServer::spawn(server_file.directory(), "64m", "64m").await.unwrap();
+    let server_file =
+        TestServerFile::new("pause.bin", deterministic_bytes(2 * 1024 * 1024, 7)).unwrap();
+    let server = RunningTestServer::spawn(server_file.directory(), "64m", "64m")
+        .await
+        .unwrap();
     let temp = TempDir::new().unwrap();
     let queue = TaskQueue::with_max_concurrent(3);
     let url = server.url_for("pause.bin");
@@ -142,7 +163,12 @@ async fn ac2_pause_resume() {
     queue.resume(id.clone()).await.unwrap();
     queue.wait_all().await;
     let snap2 = queue.query(id).await.unwrap();
-    assert_eq!(snap2.state, TaskState::Completed, "resume should complete, got {:?}", snap2.state);
+    assert_eq!(
+        snap2.state,
+        TaskState::Completed,
+        "resume should complete, got {:?}",
+        snap2.state
+    );
     assert!(out.exists());
     let data = std::fs::read(&out).unwrap();
     let expected = deterministic_bytes(2 * 1024 * 1024, 7);
@@ -251,7 +277,10 @@ async fn ac5_isolation() {
         .enqueue(format!("{}/ok1", server.url()), temp.path().join("ok1.bin"))
         .await;
     let id_fail = queue
-        .enqueue(format!("{}/fail", server.url()), temp.path().join("fail.bin"))
+        .enqueue(
+            format!("{}/fail", server.url()),
+            temp.path().join("fail.bin"),
+        )
         .await;
     let id2 = queue
         .enqueue(format!("{}/ok2", server.url()), temp.path().join("ok2.bin"))

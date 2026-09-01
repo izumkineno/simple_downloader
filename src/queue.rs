@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use faststr::FastStr;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 use tokio::task::{AbortHandle, JoinSet};
 
 use crate::downloader::Downloader;
@@ -97,12 +97,9 @@ impl TaskQueue {
         }
     }
 
-    pub async fn enqueue(
-        &self,
-        url: impl Into<FastStr>,
-        output: impl Into<PathBuf>,
-    ) -> TaskId {
-        self.enqueue_with_workers(url, output, default_workers()).await
+    pub async fn enqueue(&self, url: impl Into<FastStr>, output: impl Into<PathBuf>) -> TaskId {
+        self.enqueue_with_workers(url, output, default_workers())
+            .await
     }
 
     pub async fn enqueue_with_workers(
@@ -323,10 +320,7 @@ impl TaskQueue {
                 let s = self.state.lock().await;
                 let key = path_key(&candidate);
                 let disk_sync = candidate.exists();
-                let sidecar_sync = sidecar_opt
-                    .as_ref()
-                    .map(|p| p.exists())
-                    .unwrap_or(false);
+                let sidecar_sync = sidecar_opt.as_ref().map(|p| p.exists()).unwrap_or(false);
                 if !s.occupied.contains(&key) && !disk_sync && !sidecar_sync {
                     return candidate;
                 }
@@ -344,23 +338,27 @@ impl TaskQueue {
 }
 
 fn path_key(p: &Path) -> String {
- let s = p.to_string_lossy().to_string();
- #[cfg(windows)]
- { s.to_lowercase() }
- #[cfg(not(windows))]
- { s }
+    let s = p.to_string_lossy().to_string();
+    #[cfg(windows)]
+    {
+        s.to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        s
+    }
 }
 
 fn sidecar_path(p: &Path) -> Option<PathBuf> {
- #[cfg(feature = "resume")]
- {
- Some(crate::resume::metadata_path_for(p))
- }
- #[cfg(not(feature = "resume"))]
- {
- let _ = p;
- None
- }
+    #[cfg(feature = "resume")]
+    {
+        Some(crate::resume::metadata_path_for(p))
+    }
+    #[cfg(not(feature = "resume"))]
+    {
+        let _ = p;
+        None
+    }
 }
 fn with_suffix(path: &Path, n: u64) -> PathBuf {
     let parent = path.parent();
@@ -457,7 +455,7 @@ async fn flush_pending_deletes(state: &Arc<tokio::sync::Mutex<QueueState>>) {
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                 ::tracing::debug!(path=%path.display(), error=%e, "pending delete permission denied, retry later");
                 false
-            },
+            }
             Err(e) => {
                 ::tracing::warn!(path=%path.display(), error=%e, "pending delete failed, retry later");
                 false
@@ -481,7 +479,6 @@ async fn flush_pending_deletes(state: &Arc<tokio::sync::Mutex<QueueState>>) {
         s.pending_deletes.retain(|p| !succeeded.contains(p));
     }
 }
-
 
 async fn pump(
     state: &Arc<tokio::sync::Mutex<QueueState>>,
@@ -574,11 +571,23 @@ mod tests {
     use std::path::Path;
     #[test]
     fn with_suffix_basic() {
-        assert_eq!(with_suffix(Path::new("a.bin"), 1), PathBuf::from("a(1).bin"));
+        assert_eq!(
+            with_suffix(Path::new("a.bin"), 1),
+            PathBuf::from("a(1).bin")
+        );
         assert_eq!(with_suffix(Path::new("a"), 1), PathBuf::from("a(1)"));
-        assert_eq!(with_suffix(Path::new("a.tar.gz"), 1), PathBuf::from("a.tar(1).gz"));
-        assert_eq!(with_suffix(Path::new(".gitignore"), 1), PathBuf::from(".gitignore(1)"));
-        assert_eq!(with_suffix(Path::new("dir/a.bin"), 1), PathBuf::from("dir/a(1).bin"));
+        assert_eq!(
+            with_suffix(Path::new("a.tar.gz"), 1),
+            PathBuf::from("a.tar(1).gz")
+        );
+        assert_eq!(
+            with_suffix(Path::new(".gitignore"), 1),
+            PathBuf::from(".gitignore(1)")
+        );
+        assert_eq!(
+            with_suffix(Path::new("dir/a.bin"), 1),
+            PathBuf::from("dir/a(1).bin")
+        );
     }
     #[tokio::test]
     async fn concurrent_enqueue_assigns_unique_paths() {
@@ -586,9 +595,9 @@ mod tests {
         let desired = dir.path().join("a.bin");
         let queue = TaskQueue::new();
 
-        futures_util::future::join_all((0..20).map(|_| {
-            queue.enqueue("http://127.0.0.1:1/unreachable", desired.clone())
-        }))
+        futures_util::future::join_all(
+            (0..20).map(|_| queue.enqueue("http://127.0.0.1:1/unreachable", desired.clone())),
+        )
         .await;
         let paths: std::collections::HashSet<_> = queue
             .snapshot_all()

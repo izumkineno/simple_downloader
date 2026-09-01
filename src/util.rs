@@ -467,12 +467,9 @@ mod tests {
         let path = dir.path().join("out.bin");
         tokio::fs::write(&path, b"stale tail").await.unwrap();
 
-        let (tx, handle) = file_writer_task(
-            FastStr::from(path.to_string_lossy().to_string()),
-            3,
-        )
-        .await
-        .unwrap();
+        let (tx, handle) = file_writer_task(FastStr::from(path.to_string_lossy().to_string()), 3)
+            .await
+            .unwrap();
         tx.send(DownloadCmd::WriteFile {
             offset: 0,
             data: Bytes::from_static(b"new"),
@@ -511,4 +508,3 @@ mod tests {
         assert_eq!(tokio::fs::read(&path).await.unwrap(), b"new tail");
     }
 }
-

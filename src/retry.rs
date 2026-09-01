@@ -106,7 +106,12 @@ impl RetryHandler {
         let total = self.total_attempts.entry(id).or_insert(0);
         *total += 1;
         if *total > MAX_TOTAL_ATTEMPTS {
-            ::tracing::error!(chunk_id = id, total = *total, max = MAX_TOTAL_ATTEMPTS, "chunk permanent failure: total attempts exceeded");
+            ::tracing::error!(
+                chunk_id = id,
+                total = *total,
+                max = MAX_TOTAL_ATTEMPTS,
+                "chunk permanent failure: total attempts exceeded"
+            );
             let _ = info_tx.send(DownloadInfo::ChunkStatusChanged {
                 id,
                 status: 5,
@@ -224,7 +229,12 @@ impl RetryHandler {
             .position(|c| c.failure_time.elapsed() >= RETRY_DELAY)?;
         let chunk = self.retry_queue.remove(pos);
         if let Some(ref c) = chunk {
-            ::tracing::debug!(chunk_id = c.id, attempts = c.attempts, pos, "pop ready retry chunk (scan)");
+            ::tracing::debug!(
+                chunk_id = c.id,
+                attempts = c.attempts,
+                pos,
+                "pop ready retry chunk (scan)"
+            );
         }
         chunk
     }
@@ -241,7 +251,10 @@ impl RetryHandler {
 
     pub(crate) fn push_back_retry_with_backoff(&mut self, mut chunk: FailedChunkInfo) {
         chunk.failure_time = Instant::now();
-        ::tracing::debug!(chunk_id = chunk.id, "push back deferred retry with 2s backoff");
+        ::tracing::debug!(
+            chunk_id = chunk.id,
+            "push back deferred retry with 2s backoff"
+        );
         self.retry_queue.push_back(chunk);
     }
 

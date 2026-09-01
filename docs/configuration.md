@@ -187,22 +187,24 @@ Downloader::builder("https://example.com/large.bin", "output.bin")
     .build();
 ```
 
-## 运行时热更新（0.5.5 配置灵活性）
+## 运行时热更新（0.5.5 配置灵活性，0.6.2+2 全局限速热更已落地）
 
-`src/config.rs::RuntimeConfig` + `DownloadMonitor::apply_config` 支持下载进行中调整：
+`src/config.rs::RuntimeConfig{workers,update_interval,speed_limit,burst}` + `DownloadMonitor::apply_config` + `SharedConfig(Arc<RwLock<RuntimeConfig>>)` 支持下载进行中调整。当前已落地：`workers`（`ConcurrencyManager::set_max_workers`）、`update_interval`（`>0+finite` 才生效）、`speed_limit/burst` 全局限速热更（`limiter::RateLimiter::reconfigure/disable`，见 `src/monitor.rs:apply_config` 与 `src/limiter.rs:reconfigure`，`tests/monitor::apply_config_updates_and_disables_global_limiter` 已绿）；`per_source` 热更仍待接（`MultiRuntime` per-lane 映射独立，`RuntimeConfig` 仅表达全局维度）。
 
 ```rust
-use simple_downloader::{config::{RuntimeConfig, new_shared, apply_config}, DownloadMonitor};
+use simple_downloader::{config::{RuntimeConfig, new_shared, apply_config}};
 let shared = new_shared(RuntimeConfig::default().with_workers(8).with_update_interval(0.5));
 // ... monitor 创建后 ...
-apply_config(&shared, RuntimeConfig::default().with_workers(16));
+apply_config(&shared, RuntimeConfig { workers: 16, update_interval: 1.0, speed_limit: Some(512*1024), burst: Some(64*1024) });
 // monitor.apply_config(&shared.read());
 ```
 
-可热更字段：`workers`（`ConcurrencyManager::set_max_workers`）、`update_interval`、`speed_limit/burst`（`limiter::RateLimiter::apply` 待接）。为后续 `queue pause/resume` 与 `智能评分 burst` 打前站。
+可热更字段：`workers`、`update_interval`、`speed_limit/burst`（全局维度 `reconfigure/disable`）。`per_source`/`global burst` 动态评分场景为后续 `0.7 智能调度` 的前置。
 
 > `DownloadInfo` 自 `0.5.5` 标记 `#[non_exhaustive]`，新增变体/字段为兼容变更，`match` 需 `_` 分支。
 
 ## 配置最佳实践
-3. 多源仅对同文件多镜像生效，需保证各源 `Content-Length` 一致
-4. 代理优先走 `NO_PROXY` 环境变量，避免硬编码密码
+1. 默认不启用任何 feature，按需 `default-features = false` 组合，避免拉取 `governor/uuid/bitcode` 冗余
+2. 大文件务必开 `resume` + 小文件 `resume(false)` 减 I/O，`*.download.bitcode` 成功自动删
+3. 多源仅对同文件多镜像生效，需保证各源 `Content-Length` 一致且支持 `Range`，否则降级单流
+4. 代理优先走 `NO_PROXY` 环境变量，避免硬编码密码；`ProxyConfig::http/https/socks5` 与 `client_builder` 双路径可选

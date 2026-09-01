@@ -5,19 +5,21 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/) 规范。
 
-## [Unreleased]
+## [Unreleased] — `master` 头已含 `0.6.2+2` 两补丁待 `0.6.3` 发版
 
 ### 新增
 
-- [ ] 并行下载多个文件
-- [ ] 图形化进度展示工具
+- `eef24ea` `DownloadInfo` 稳定契约：`#[non_exhaustive]` + `MonitorUpdate` 字段/状态码 + `progress_percent/speed_mbps/downloaded_bytes/total_bytes/is_complete` 辅助方法稳定行为（`src/types.rs`，`docs/usage.md#6`）
+- `b4fcadf` 可靠终局兜底：`chunk.rs:send_terminal_event` `broadcast 4096` + `mpsc reliable 1` 双通道，`ChunkFailed/Complete/Bisected` 不因 `Lagged` 丢失；`retry.rs:RETRY_DELAY` `2s→1s` 缓解队列 stall
+- `monitor.rs:apply_config` 全局限速热更：`RuntimeConfig{speed_limit,burst}` → `RateLimiter::reconfigure/disable`（`per_source` 仍待接），`tests/monitor::apply_config_updates_and_disables_global_limiter` 已绿
 
-### 改进
+### 待规划（与 `README:79-112 TODO` 一致，已去重 `queue`/`progress` 已落地项）
 
-- [ ] 更智能的多源调度评分（响应时间/吞吐/失败率）
-- [ ] 更完整的多代理端到端测试矩阵
-- [ ] 元数据 schema 跨版本迁移策略与可观测性增强
+- [ ] 更智能的多源调度评分（`probe_speed 64KiB` 排序+黑名单 `3/30s` 已落地，`EWMA` 动态评分待 0.7）
+- [ ] 更完整的多代理端到端测试矩阵（`PerSourceProxy` 模型已落地）
+- [ ] 元数据 `version=1` 跨版本迁移策略与可观测性（`validate_shape` 自愈重建已落地，复用/失效 `segment` 事件待 0.7）
 
+> `并行下载多个文件` 已由 `queue` feature `TaskQueue::with_max_concurrent(3)` FIFO 调度实现；`图形化进度展示` 已由 `examples/with_custom_ui.rs` `indicatif::MultiProgress` 实现，上表不再列为新增占位。
 ---
 
 ## [0.6.2] - 2026-08-31

@@ -44,41 +44,48 @@
 
 ### Feature Flags
 
-当前库按“默认只保留基础能力，其他能力按需开启”的原则组织：
+当前库按“默认只保留基础能力，其他能力按需开启”的原则组织（以 `Cargo.toml:14-21` 为准）：
 
 | Feature | 默认开启 | 作用 |
 |---|---:|---|
 | _none_ | 是 | 基础单源多线程下载 + 更简洁的默认 API |
-| `resume` | 否 | 断点续传、sidecar 元数据、恢复相关 API |
+| `resume` | 否 | 断点续传、sidecar `*.download.bitcode`、恢复相关 API（`bitcode`） |
 | `multi-source` | 否 | 多源下载入口、lane 调度建模 |
-| `progress` | 否 | 公开 `DownloadInfo` 进度事件与 `run(...)` 进度回调接口（0.5.5 `#[non_exhaustive]`） |
-| `rate-limit` | 否 | 全局/分源限速（`governor` 令牌桶，`burst` 可配，自适应冻结，0.5.x 新增，0.6.x 校准 `join max`） |
-| `queue` | 否 | 任务队列 FIFO/并发调度/pause/resume/cancel/重命名（`uuid`，0.6.0 新增，0.6.1 200ms drain + 0.6.2 重试） |
+| `proxy` | 否 | 代理 lane 建模（隐含 `multi-source`，`http/https/socks5`） |
+| `progress` | 否 | 公开 `DownloadInfo` 进度事件与 `run(...)` 进度回调接口（`0.5.5+ #[non_exhaustive]`） |
+| `rate-limit` | 否 | 全局/分源限速（`governor` 令牌桶，`burst` 可配，自适应冻结，`0.5.x` 新增，`0.6.x` 校准 `join max`，`0.6.2+` 热更全局限速） |
+| `queue` | 否 | 任务队列 FIFO/并发调度/pause/resume/cancel/重命名（`uuid`，`0.6.0` 新增，`0.6.1` 200ms drain + `0.6.2` 重试，`0.6.2+` `reliable` 终局） |
 推荐理解方式：
 
 - **默认模式**：`Downloader::builder(...).download().await`
 - **需要恢复**：打开 `resume`
 - **需要多源**：打开 `multi-source`
-- **需要代理**：打开 `proxy`
+- **需要代理**：打开 `proxy`（自动隐含 `multi-source`）
 - **需要 UI / 进度事件**：打开 `progress`
 - **需要限速**：打开 `rate-limit`，见下节
 - **需要队列**：打开 `queue`，见 `examples/with_queue.rs`
 
 > 完整调用形态见 [`docs/usage.md`](docs/usage.md)，`cargo doc` 见 `src/lib.rs`  crate 文档。
-
-#### 9. **速度限制（`rate-limit` feature，0.5.x 新增，0.6.x 自适应冻结校准）**
+#### 9. **速度限制（`rate-limit` feature，0.5.x 新增，0.6.x 自适应冻结校准，0.6.2+ 热更）**
 
 - **全局限速**：`Downloader::builder(url, path).speed_limit(bps).with_burst(bytes).download().await`，`1 token = 1 byte`，`burst` 默认 64KiB 硬限，`0` 或 `>4GiB/s` 返回 `InvalidArgument`，全局为硬上限（`per_source` 之和 > 全局时按剩余分配）
 - **分源限速**：`SourceConfig::new(url).with_speed_limit(bps).with_burst(bytes)`，`MultiSourceConfig::with_global_speed_limit/with_global_burst`，分源与全局两级串联 `tokio::join` 取 `max`，避免串行 `sum` 慢 30%
-- **自适应冻结**：限速启用时 `DownloadMonitor` 跳过 `ConcurrencyManager::decide_and_act`，避免限速被误判为带宽不足而过度分裂
+- **自适应冻结**：限速启用时 `DownloadMonitor` 跳过 `ConcurrencyManager::decide_and_act`，`drain_pending` 容量补位除外（`monitor.rs:524` 注释），避免限速被误判为带宽不足而过度分裂
+- **热更**：`RuntimeConfig{speed_limit,burst}` + `DownloadMonitor::apply_config` 支持运行时全局限速 `reconfigure/disable`（`0.6.2+` 已落地，`per_source` 待接），`cargo test --test monitor -- apply_config_updates_and_disables_global_limiter` 已绿
 - **校验**：`speed_limit 0` / `burst 0` / `burst需配合speed_limit` / `>u32::MAX` 均 `InvalidArgument`，`cargo test --features rate-limit,multi-source --test rate_limit` 5 用例 `5MiB@1MiB/s 4-6.5s / per_source 5-8.5s / global 3-5.5s` 全绿
 - **示例**：`cargo run --features rate-limit,progress --example with_rate_limit`（单源 512KiB/s）/ `-- --multi`（多源 s1/s2 300KiB + 全局 512KiB）
 
+#### 10. **任务队列（`queue` feature，0.6.0 新增，0.6.2+ reliable 兜底）**
+
+- **FIFO 调度**：`TaskQueue::with_max_concurrent(3)`（`1..64` clamp）+ `enqueue`/`enqueue_with_workers`（两层并发独立）、`pause`/`resume`/`cancel`/`query`/`wait_all`，`TaskId/TaskState/TaskSnapshot/QueueError`，`examples/with_queue.rs` 演示重命名/隔离
+- **重命名与并发安全**：`occupied` 内存集合 + `try_exists` 磁盘 + `*.download.bitcode` 三重 CAS，`a.tar.gz → a.tar(1).gz` 无限递增，`windows` 大小写折叠，`concurrent_enqueue_assigns_unique_paths` 17 并发唯一
+- **可靠终局与延迟删**：`ChunkFailed/Complete/Bisected` 经 `mpsc reliable` 兜底防 `Lagged` 丢失（`b4fcadf`），`queue` 取消后 `pending_deletes` 200ms 周期 `flush_pending_deletes`（`PermissionDenied/未知Io` 重试）
+- **稳定 UI 契约**：`DownloadInfo #[non_exhaustive]` + `MonitorUpdate` 稳定行为（见 `src/types.rs` + `docs/usage.md#6`），`progress` 需 `run(handler)` 且 `match` 含 `_`
 ---
 
 ### 待实现的功能 (TODO List)
 
-目标：实现一个开箱即用、自带断点续传、任务队列、对接入 UI 友好，能自适应下载的多源多线程下载库。下面按“已落地 / 待完善”同步当前状态。
+目标：实现一个开箱即用、自带断点续传、任务队列、对接入 UI 友好，能自适应下载的多源多线程下载库。下面按“已落地 / 待完善”同步当前状态（`Cargo.toml:3 0.6.2` + `b4fcadf/eef24ea` 两补丁对应 `0.6.3` 待发版）。
 
 #### 1. **核心功能：断点续传 (Breakpoint Continuation)**
 -   [x] **二进制元数据 sidecar**: 已使用 `bitcode` 持久化恢复元数据，而不是仅依赖文件长度或内存状态。
@@ -87,27 +94,30 @@
 -   [x] **缺文件 fail-stop**: sidecar 存在但目标文件不存在时会直接报错停止，不会静默重下。
 -   [x] **单源 / 多源恢复**: 已覆盖 `Downloader::new(...)` 与 `Downloader::new_multi(...)` 的恢复路径。
 -   [x] **进程级恢复测试**: 已补充单源控制台中断恢复、多源 kill / 崩溃式终止恢复的集成测试。
--   [ ] **元数据 schema 演进策略（0.6.0 已带 version=1，待跨版本迁移）**: 当前仅单版本校验与自愈重建，后续补跨版本迁移与兼容表。
--   [ ] **可观测性增强（待 0.7）**: 补充“复用/失效 segment”日志与 `DownloadInfo` 事件，当前 `tracing` 仅 info 级。
+-   [x] **原子持久化与截断语义**: `save_atomic` 临时文件+`rename`+`sync_parent_dir`，`file_writer` `truncate(true/false)` 分支已验证（`src/resume.rs`/`src/util.rs` + `tests`）。
+-   [ ] **元数据 schema 演进策略（0.6.2 已带 version=1 自愈重建，后续补跨版本迁移与兼容表，待 0.7）**: 当前 `validate_shape` 任一 `version/file_size/segment_size` 不一致即删侧car重建，已防旧版本脏数据。
+-   [ ] **可观测性增强（待 0.7）**: 补充“复用/失效 segment”日志与 `DownloadInfo` 事件，当前 `tracing` 已全链路 `#[instrument]` 但仅信息级。
 #### 2. **核心功能：多源多代理下载 (Multi-Source Downloading)**
 -   [x] **支持多个 URL 下载同一个文件**: 通过 `MultiSourceConfig::with_sources(...)` 配置一组镜像 URL，并使用 `Downloader::new_multi(...)` 启动多源下载。
 -   [x] **支持源 / 代理 lane 建模**: 通过 `SourceConfig::with_proxies(...)`、`LaneModel::PerSource` / `LaneModel::PerSourceProxy` 表达多源多代理调度维度。
 -   [x] **源可用性与一致性校验**: 启动时跳过不可用源、不支持 Range 的源，以及文件大小与首个有效源不一致的源。
--   [x] **无效源跳过与基础失败隔离**: 已有测试覆盖无效源跳过；lane 连续失败后可被黑名单隔离。
+-   [x] **无效源跳过与基础失败隔离**: 已有测试覆盖无效源跳过；lane 连续失败 `>=3`（`BLACKLIST_THRESHOLD`）进入黑名单 `30s` 后自动解封。
 -   [x] **repo-native `test_server` 集成测试**: 已用多个不同限速的本地服务器覆盖 fast/slow、三源异构、invalid + valid 等真实 Range 下载场景。
 -   [x] **手工观察示例**: `cargo run --features multi-source,progress --example manual_multi_source_test_server` 会生成 500 MiB 测试文件，启动 fast=16m / slow=2m 两个本地源，并实时刷新总进度、速度和源侧 stats 摘要。
--   [ ] **更智能的源调度评分（0.6.0 基础隔离已落地，待 0.7 动态评分）**: 当前仅 lane 选择与失败隔离，后续引入响应时间/历史吞吐/失败率动态评分选最优源。
+-   [x] **限速感知调度**: 多源 `per_source`/`global` 双桶已打通，`with_rate_limit --multi` 演练全局硬上限。
+-   [ ] **更智能的源调度评分（0.6.0 基础隔离已落地，待 0.7 动态评分）**: 当前 `MultiRuntime::from_config` 仅 `64KiB probe_speed` 排序 + 黑名单，待引入 `EWMA` 响应时间/历史吞吐/失败率动态评分。
 -   [ ] **更完整的多代理真实集成验证（0.6.0 模型已落地，待端到端矩阵）**: 代理维度已有调度模型，待补真实代理链路端到端测试矩阵。
 
 #### 3. **核心功能：速度限制 (Speed Limiting)**
--   [x] **实现可配置的速度限制器**：`rate-limit` feature 已落地，`Downloader::builder(...).speed_limit(bps).with_burst(bytes)` 全局 + `SourceConfig::with_speed_limit/with_burst` 分源 + `MultiSourceConfig::with_global_speed_limit/with_global_burst`，`governor` 令牌桶 `1 token=1 byte`，`burst` 默认 64KiB，全局硬上限，`InvalidArgument` 校验，`monitor` 自适应冻结，`tokio::join` 双桶 `max`
+-   [x] **实现可配置的速度限制器**：`rate-limit` feature 已落地，`Downloader::builder(...).speed_limit(bps).with_burst(bytes)` 全局 + `SourceConfig::with_speed_limit/with_burst` 分源 + `MultiSourceConfig::with_global_speed_limit/with_global_burst`，`governor` 令牌桶 `1 token=1 byte`，`burst` 默认 64KiB，全局硬上限，`InvalidArgument` 校验，`monitor` 自适应冻结（`drain_pending` 除外），`tokio::join` 双桶 `max`
 -   [x] **分源 / 分代理限速策略**：全局/分源/全局+分源三档已支持，`test_server` 多源异速 + `with_rate_limit` 单/多源示例 + `rate_limit` 5 用例全绿；代理 lane 已共享分源限速（`PerSourceProxy` 同源同桶）
+-   [x] **热更新底座**：`RuntimeConfig{speed_limit,burst}` + `DownloadMonitor::apply_config` 支持运行时全局限速 `reconfigure/disable`（`0.6.2+` 已落地，`per_source` 待接）
 #### 4. **其他改进**
 -   [x] **默认 API 易用性重构（第一阶段）**: 已新增 `Downloader::builder(...).download().await` 的简化入口，不再强制默认调用方接入 progress receiver。
 -   [x] **Feature 能力裁剪（第一阶段）**: 默认模式仅保留基础多线程下载；`resume` / `multi-source` / `proxy` / `progress` 已拆为按需启用的 Cargo features。
--   [x] **配置热更新（0.6.0）**: `SharedConfig` 热更底座 `RuntimeConfig`（`workers`/`update_interval`）支持运行时 `apply_config`，`DownloadMonitor` 动态生效
--   [x] **任务队列 API（0.6.0 `queue` feature，0.6.1 200ms drain + 0.6.2 未知 Io 重试）**: `TaskQueue::with_max_concurrent(3)`（`1..64` clamp）+ `enqueue`/`enqueue_with_workers`（两层并发独立）、`pause`/`resume`/`cancel`/`query`/`wait_all`，`TaskId/TaskState/TaskSnapshot/QueueError`，`examples/with_queue.rs` 演示重命名/隔离，`pending_deletes` 延迟删
--   [x] **更稳定的 UI 对接层（0.6.2 `DownloadInfo` 稳定契约）**: `#[non_exhaustive]` + `MonitorUpdate` 字段/状态码 + `progress_percent/speed_mbps/downloaded_bytes/total_bytes/is_complete` 稳定行为（非 `MonitorUpdate` 返回 0/false），UI 仅依赖 `MonitorUpdate` 聚合，新增变体/字段为 minor，详见 `src/types.rs:DownloadInfo` 与 `docs/usage.md#6`
+-   [x] **配置热更新（0.6.2+2）**: `SharedConfig` 热更底座 `RuntimeConfig`（`workers`/`update_interval`/`speed_limit,burst` 全局）支持运行时 `apply_config`，`DownloadMonitor` 动态生效（含 `global limiter` 热更）
+-   [x] **任务队列 API（0.6.0 `queue` feature，0.6.1 200ms drain + 0.6.2 未知 Io 重试，0.6.2+ reliable）**: `TaskQueue::with_max_concurrent(3)`（`1..64` clamp）+ `enqueue`/`enqueue_with_workers`（两层并发独立）、`pause`/`resume`/`cancel`/`query`/`wait_all`，`TaskId/TaskState/TaskSnapshot/QueueError`，`examples/with_queue.rs` 演示重命名/隔离，`pending_deletes` 延迟删 + `reliable` 终局兜底
+-   [x] **更稳定的 UI 对接层（0.6.2 `DownloadInfo` 稳定契约，0.6.2+ 终局可靠）**: `#[non_exhaustive]` + `MonitorUpdate` 字段/状态码 + `progress_percent/speed_mbps/downloaded_bytes/total_bytes/is_complete` 稳定行为（非 `MonitorUpdate` 返回 0/false），`b4fcadf` 终局事件经 `reliable mpsc` 兜底防 `Lagged` 丢失，UI 仅依赖 `MonitorUpdate` 聚合，新增变体/字段为 minor，详见 `src/types.rs:DownloadInfo` 与 `docs/usage.md#6`
 #### 示例（权威调用形态见 `docs/usage.md`）
 
 ```rust
@@ -123,14 +133,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 `cargo run --features progress --example with_custom_ui` |
 `cargo run --features multi-source,progress --example manual_multi_source_test_server`（500 MiB 双源 16m/2m） |
 `cargo run --features queue --example with_queue` |
-`cargo run --features rate-limit,progress --example with_rate_limit`
+`cargo run --features rate-limit,progress --example with_rate_limit`（`-- --multi` 双模式）
 
 验证：
 ```bash
+cargo test --all-features
+cargo test --features rate-limit,multi-source --test rate_limit -- --nocapture
+cargo test --features queue --test queue -- --nocapture
 cargo test --features resume,multi-source --test resume -- --nocapture --test-threads=1
 cargo test --features resume,multi-source --test process_resume -- --nocapture --test-threads=1
 ```
-（`tests/resume` 覆盖元数据/损坏/缺文件；`process_resume` 覆盖单源中断与多源 kill 恢复，详见 `docs/README.md#三`）
+（`tests/resume` 覆盖元数据/损坏/缺文件；`process_resume` 覆盖单源中断与多源 kill 恢复；`rate_limit` 覆盖 `5MiB@1MiB/s 4-6.5s` 精度；`queue` 覆盖并发重命名，详见 `docs/README.md#三`）
 
 #### 架构概览
 
@@ -153,9 +166,9 @@ flowchart LR
     end
 
     subgraph channelBoundary["消息通道"]
-        infoBus["broadcast&lt;DownloadInfo&gt;<br/>进度 / 状态事件"]
+        infoBus["broadcast 4096 + reliable mpsc<br/>DownloadInfo 进度/状态事件"]
         controlBus["broadcast&lt;DownloadCmd&gt;<br/>Bisect / Terminate 控制"]
-        writerQueue["mpsc&lt;DownloadCmd&gt;<br/>WriteFile 写入队列"]
+        writerQueue["mpsc 128&lt;DownloadCmd&gt;<br/>WriteFile 写入队列 (流式追加)"]
     end
 
     subgraph executionBoundary["执行面"]

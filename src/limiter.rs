@@ -12,16 +12,17 @@ mod imp {
     use std::sync::Arc;
 
     use governor::{
+        Quota, RateLimiter as GovLimiter,
         clock::QuantaClock,
         state::{InMemoryState, NotKeyed},
-        Quota, RateLimiter as GovLimiter,
     };
 
     /// 字节级限速器（`governor` 封装）。
     #[allow(clippy::type_complexity)]
     #[derive(Clone)]
     pub struct RateLimiter {
-        inner: Arc<parking_lot::RwLock<Option<Arc<GovLimiter<NotKeyed, InMemoryState, QuantaClock>>>>>,
+        inner:
+            Arc<parking_lot::RwLock<Option<Arc<GovLimiter<NotKeyed, InMemoryState, QuantaClock>>>>>,
     }
 
     impl RateLimiter {
@@ -117,9 +118,7 @@ mod tests {
         let start = Instant::now();
         // 2MiB 以 1MiB/s 限速，burst=64KiB 硬限 → 应约 2s
         for _ in 0..32 {
-            limiter
-                .acquire(NonZeroU32::new(64 * 1024).unwrap())
-                .await;
+            limiter.acquire(NonZeroU32::new(64 * 1024).unwrap()).await;
         }
         let elapsed = start.elapsed();
         // 允许 ±20% 抖动（CI 容器调度）
@@ -133,14 +132,13 @@ mod tests {
     #[tokio::test]
     async fn small_limit_not_deadlock() {
         // burst 刻意设为 5KiB（与限速一致），避免默认 64KiB burst 导致前两次 acquire 均在 burst 内而无需等待
-        let limiter = RateLimiter::new(NonZeroU32::new(5 * 1024).unwrap(), Some(NonZeroU32::new(5 * 1024).unwrap()));
+        let limiter = RateLimiter::new(
+            NonZeroU32::new(5 * 1024).unwrap(),
+            Some(NonZeroU32::new(5 * 1024).unwrap()),
+        );
         let start = Instant::now();
-        limiter
-            .acquire(NonZeroU32::new(5 * 1024).unwrap())
-            .await;
-        limiter
-            .acquire(NonZeroU32::new(5 * 1024).unwrap())
-            .await;
+        limiter.acquire(NonZeroU32::new(5 * 1024).unwrap()).await;
+        limiter.acquire(NonZeroU32::new(5 * 1024).unwrap()).await;
         assert!(start.elapsed() >= Duration::from_millis(900));
     }
 }

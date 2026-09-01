@@ -54,7 +54,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if let Some(s) = queue.query(id1.clone()).await {
-            if matches!(s.state, TaskState::Completed | TaskState::Failed(_) | TaskState::Removed) {
+            if matches!(
+                s.state,
+                TaskState::Completed | TaskState::Failed(_) | TaskState::Removed
+            ) {
                 break;
             }
         }
@@ -78,9 +81,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 5. 演示 cancel（Queued / Paused 场景）
     let cancel_path = PathBuf::from(format!("{}/to_cancel.bin", out_dir));
-    let cancel_url = std::env::var("DEMO_URL").unwrap_or_else(|_| "https://proof.ovh.net/files/10Mb.dat".to_string());
+    let cancel_url = std::env::var("DEMO_URL")
+        .unwrap_or_else(|_| "https://proof.ovh.net/files/10Mb.dat".to_string());
     let id_cancel = queue.enqueue(cancel_url, cancel_path.clone()).await;
-    println!("\n[5] cancel 演示: id={} -> {}", id_cancel, cancel_path.display());
+    println!(
+        "\n[5] cancel 演示: id={} -> {}",
+        id_cancel,
+        cancel_path.display()
+    );
     tokio::time::sleep(Duration::from_millis(150)).await;
     match queue.cancel(id_cancel.clone()).await {
         Ok(()) => println!("  cancel 成功 -> Removed"),
@@ -96,7 +104,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 6. 队列状态快照与 wait_all
     println!("\n[6] 队列状态:");
-    println!("  queued_len={}, active_count={}", queue.queued_len().await, queue.active_count().await);
+    println!(
+        "  queued_len={}, active_count={}",
+        queue.queued_len().await,
+        queue.active_count().await
+    );
     for id in [&id1, &id2, &id3] {
         if let Some(s) = queue.query(id.clone()).await {
             println!("  {} -> {:?} @ {}", s.id, s.state, s.output_path.display());
@@ -109,14 +121,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .is_err()
     {
-        eprintln!("wait_all 超时，当前 active={}, queued={}", queue.active_count().await, queue.queued_len().await);
+        eprintln!(
+            "wait_all 超时，当前 active={}, queued={}",
+            queue.active_count().await,
+            queue.queued_len().await
+        );
     }
 
     println!("\n完成快照:");
     for id in [id1, id2, id3] {
         if let Some(s) = queue.query(id.clone()).await {
             match s.state {
-                TaskState::Completed => println!("  {} Completed -> {} ({} bytes)", s.id, s.output_path.display(), s.output_path.metadata().map(|m| m.len()).unwrap_or(0)),
+                TaskState::Completed => println!(
+                    "  {} Completed -> {} ({} bytes)",
+                    s.id,
+                    s.output_path.display(),
+                    s.output_path.metadata().map(|m| m.len()).unwrap_or(0)
+                ),
                 TaskState::Failed(e) => println!("  {} Failed: {}", s.id, e),
                 TaskState::Removed => println!("  {} Removed", s.id),
                 other => println!("  {} {:?}", s.id, other),
@@ -129,7 +150,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for name in ["same.bin", "same(1).bin", "workers8.bin"] {
         let p = PathBuf::from(format!("{}/{}", out_dir, name));
         if p.exists() {
-            println!("  {} 存在 ({} bytes)", p.display(), p.metadata().map(|m| m.len()).unwrap_or(0));
+            println!(
+                "  {} 存在 ({} bytes)",
+                p.display(),
+                p.metadata().map(|m| m.len()).unwrap_or(0)
+            );
         } else {
             println!("  {} 不存在", p.display());
         }

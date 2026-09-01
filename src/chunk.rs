@@ -1,14 +1,14 @@
 //! 定义和管理单个下载块（chunk）的执行逻辑。
 
-use crate::types::{ChunkId, DownloadCmd, DownloadInfo};
 use crate::limiter::RateLimiter;
-#[cfg(feature = "rate-limit")]
-use std::num::NonZeroU32;
-use std::sync::Arc;
+use crate::types::{ChunkId, DownloadCmd, DownloadInfo};
 use crate::util::ensure_user_agent;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::RequestBuilder;
+#[cfg(feature = "rate-limit")]
+use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 
@@ -516,12 +516,7 @@ pub(crate) async fn chunk_run_with_reliable(
         }
         // 如果没有发生失败且下载量匹配，则广播下载完成消息
         ::tracing::debug!(chunk_id = id, "DownloadComplete");
-        send_terminal_event(
-            &reliable_tx,
-            &bd_tx,
-            DownloadInfo::DownloadComplete(id),
-        )
-        .await;
+        send_terminal_event(&reliable_tx, &bd_tx, DownloadInfo::DownloadComplete(id)).await;
     } else if !failed {
         // !failed 但 final_downloaded != size 说明异常，判为 early EOF 避免虚假完成
         let error_msg = format!(
@@ -573,12 +568,14 @@ mod tests {
         let (broadcast_tx, broadcast_rx) = broadcast::channel(1);
         drop(broadcast_rx);
 
-        assert!(!send_terminal_event(
-            &reliable_tx,
-            &broadcast_tx,
-            DownloadInfo::DownloadComplete(7),
-        )
-        .await);
+        assert!(
+            !send_terminal_event(
+                &reliable_tx,
+                &broadcast_tx,
+                DownloadInfo::DownloadComplete(7),
+            )
+            .await
+        );
         assert!(matches!(
             reliable_rx.recv().await,
             Some(DownloadInfo::DownloadComplete(7))

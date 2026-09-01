@@ -2,6 +2,7 @@
 
 use crate::chunk::chunk_run_with_reliable;
 use crate::lane::{MultiRuntime, MultiSourceConfig};
+use crate::limiter::RateLimiter;
 use crate::monitor::DownloadMonitor;
 #[cfg(feature = "resume")]
 use crate::resume::ResumePlan;
@@ -12,16 +13,15 @@ use crate::util::file_writer_task;
 #[cfg(feature = "resume")]
 use crate::util::file_writer_task_with_resume;
 use crate::util::{ensure_user_agent, get_file_info};
-use crate::limiter::RateLimiter;
-use std::num::NonZeroU32;
-use std::sync::Arc;
 use faststr::FastStr;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 use reqwest::{Client, ClientBuilder};
+use std::num::NonZeroU32;
 #[cfg(feature = "resume")]
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 use tokio::spawn;
@@ -212,7 +212,6 @@ where
         self.resume_enabled = enabled;
         self
     }
-
 
     /// 设置全局限速（bytes/s），仅 `rate-limit` feature 可用。
     /// `0` 将在 `build().download().await` 时返回 `InvalidArgument`。
@@ -439,29 +438,46 @@ where
     async fn run_internal(mut self, progress_handler: Option<ProgressHandler>) -> Result<()> {
         ::tracing::info!("download run_internal start");
         if let Some(limit) = self.speed_limit {
-                if limit == 0 {
-                    return Err(DownloadError::InvalidArgument("speed_limit 0 无效，需 >0".to_string()));
-                }
-                if limit > u32::MAX as u64 {
-                    return Err(DownloadError::InvalidArgument(format!("speed_limit {} 超过 {} 需 ≤4GiB/s", limit, u32::MAX)));
-                }
-                if let Some(b) = self.burst {
-                    if b == 0 {
-                        return Err(DownloadError::InvalidArgument("burst 0 无效，需 >0".to_string()));
-                    }
-                    if b > u32::MAX as u64 {
-                        return Err(DownloadError::InvalidArgument(format!("burst {} 超过 {}", b, u32::MAX)));
-                    }
-                }
-                // 创建全局限速器
-                let burst_nz = self.burst.and_then(|b| NonZeroU32::new(b as u32)).or_else(|| NonZeroU32::new(64*1024));
-                let limit_nz = NonZeroU32::new(limit as u32).unwrap();
-                let limiter = crate::limiter::RateLimiter::new(limit_nz, burst_nz);
-                self.global_limiter = Some(std::sync::Arc::new(limiter));
-                ::tracing::info!(limit, burst = ?burst_nz, "rate-limit global limiter created");
-            } else if self.burst.is_some() {
-                return Err(DownloadError::InvalidArgument("burst 需配合 speed_limit".to_string()));
+            if limit == 0 {
+                return Err(DownloadError::InvalidArgument(
+                    "speed_limit 0 无效，需 >0".to_string(),
+                ));
             }
+            if limit > u32::MAX as u64 {
+                return Err(DownloadError::InvalidArgument(format!(
+                    "speed_limit {} 超过 {} 需 ≤4GiB/s",
+                    limit,
+                    u32::MAX
+                )));
+            }
+            if let Some(b) = self.burst {
+                if b == 0 {
+                    return Err(DownloadError::InvalidArgument(
+                        "burst 0 无效，需 >0".to_string(),
+                    ));
+                }
+                if b > u32::MAX as u64 {
+                    return Err(DownloadError::InvalidArgument(format!(
+                        "burst {} 超过 {}",
+                        b,
+                        u32::MAX
+                    )));
+                }
+            }
+            // 创建全局限速器
+            let burst_nz = self
+                .burst
+                .and_then(|b| NonZeroU32::new(b as u32))
+                .or_else(|| NonZeroU32::new(64 * 1024));
+            let limit_nz = NonZeroU32::new(limit as u32).unwrap();
+            let limiter = crate::limiter::RateLimiter::new(limit_nz, burst_nz);
+            self.global_limiter = Some(std::sync::Arc::new(limiter));
+            ::tracing::info!(limit, burst = ?burst_nz, "rate-limit global limiter created");
+        } else if self.burst.is_some() {
+            return Err(DownloadError::InvalidArgument(
+                "burst 需配合 speed_limit".to_string(),
+            ));
+        }
         let (file_size, support_ranges, writer_path, client, download_url, workers, multi_runtime) =
             match &self.mode {
                 DownloadMode::Single(config) => {
@@ -864,39 +880,61 @@ where
         );
         {
             // 限速冻结：任一限速器存在即冻结自适应；全局优先多源，否则 Builder
-            let global_for_monitor = multi_runtime.as_ref().and_then(|r| r.global_limiter()).or_else(|| self.global_limiter.clone());
-            let is_limited = multi_runtime.as_ref().map(|r| r.has_rate_limit()).unwrap_or(false) || self.global_limiter.is_some();
+            let global_for_monitor = multi_runtime
+                .as_ref()
+                .and_then(|r| r.global_limiter())
+                .or_else(|| self.global_limiter.clone());
+            let is_limited = multi_runtime
+                .as_ref()
+                .map(|r| r.has_rate_limit())
+                .unwrap_or(false)
+                || self.global_limiter.is_some();
             monitor = monitor.with_rate_limit(global_for_monitor);
             if is_limited {
                 monitor.set_rate_limited(true);
             }
         }
         for (start_byte, end_byte) in initial_ranges {
-            let (lane_id_opt, rb, per_source, global) = if let Some(runtime) = multi_runtime.as_mut() {
-                match runtime.claim_request_builder() {
-                    Some((lane_id, rb)) => {
-                        let per = runtime.limiter_for_lane(lane_id.as_str());
-                        let glob = runtime.global_limiter().or_else(|| self.global_limiter.clone());
-                        (Some(lane_id), rb, per, glob)
-                    },
-                    None => {
-                        ::tracing::warn!(
-                            start_byte,
-                            end_byte,
-                            "lane capacity insufficient, buffering initial range"
-                        );
-                        pending_initial.push((start_byte, end_byte));
-                        continue;
+            let (lane_id_opt, rb, per_source, global) =
+                if let Some(runtime) = multi_runtime.as_mut() {
+                    match runtime.claim_request_builder() {
+                        Some((lane_id, rb)) => {
+                            let per = runtime.limiter_for_lane(lane_id.as_str());
+                            let glob = runtime
+                                .global_limiter()
+                                .or_else(|| self.global_limiter.clone());
+                            (Some(lane_id), rb, per, glob)
+                        }
+                        None => {
+                            ::tracing::warn!(
+                                start_byte,
+                                end_byte,
+                                "lane capacity insufficient, buffering initial range"
+                            );
+                            pending_initial.push((start_byte, end_byte));
+                            continue;
+                        }
                     }
-                }
-            } else {
-                (None, client.get(download_url.as_str()), None, self.global_limiter.clone())
-            };
+                } else {
+                    (
+                        None,
+                        client.get(download_url.as_str()),
+                        None,
+                        self.global_limiter.clone(),
+                    )
+                };
             let id = next_chunk_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if let Some(ref lane_id) = lane_id_opt {
                 initial_lanes.push((id, lane_id.clone()));
             }
-            ::tracing::debug!(chunk_id = id, start_byte, end_byte, per_limited = per_source.is_some(), global_limited = global.is_some(), "spawn initial chunk");
+            ::tracing::debug!(
+                chunk_id = id,
+                start_byte,
+                end_byte,
+                per_limited = per_source.is_some(),
+                global_limited = global.is_some(),
+                "spawn initial chunk"
+            );
             let task = chunk_run_with_reliable(
                 id,
                 writer_tx.clone(),

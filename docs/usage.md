@@ -15,9 +15,10 @@
 - [9. 场景六：自定义 HTTP 客户端](#9-场景六自定义-http-客户端)
 - [10. 错误处理模板](#10-错误处理模板)
 - [11. 并发与自动降级](#11-并发与自动降级)
-- [12. 完整示例索引](#12-完整示例索引)
-- [13. 调用检查清单](#13-调用检查清单)
-
+- [12. 场景七：速度限制](#12-场景七速度限制rate-limit)
+- [13. 场景八：任务队列](#13-场景八任务队列queue)
+- [14. 完整示例索引](#14-完整示例索引)
+- [15. 调用检查清单](#15-调用检查清单)
 ---
 
 | Feature | 默认 | 作用 | 额外依赖 |
@@ -75,13 +76,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 | 方法 | Feature | 说明 | 示例 |
 |---|---|---|---|
-| `workers(n)` | — | 并发上限，`max(1, n)`，实际生效受 §11 约束 | `.workers(16)` |
+| `workers(n)` | — | 并发上限，`max(1, n)`，实际生效受 §11 约束（`!Range/1/<1MiB→1`） | `.workers(16)` |
 | `update_interval(secs)` | — | `MonitorUpdate` 广播间隔，`>0` 生效，默认 `0.5` | `.update_interval(1.0)` |
-| `client_builder(\|\| ClientBuilder::new()...)` | — | 注入 `reqwest::ClientBuilder` 闭包，见 §9 | `.client_builder(\|\| ClientBuilder::new().timeout(...))` |
+| `client_builder(\|\| ClientBuilder::new()...)` | — | 注入 `reqwest::ClientBuilder` 闭包（`pool 32/90s/60s + UA simple_downloader/x.y.z`），见 §9 | `.client_builder(\|\| ClientBuilder::new().timeout(...))` |
 | `resume(bool)` | `resume` | 显式开关断点续传，默认 `true`（当 feature 启用时） | `.resume(false)` |
+| `speed_limit(bps)` | `rate-limit` | 全局限速 `bytes/s`，`0/>u32::MAX` 均 `InvalidArgument`，`burst` 默认 `64KiB` | `.speed_limit(1_048_576)` |
+| `with_burst(bytes)` | `rate-limit` | 突发容量，需配合 `speed_limit`，`0/>u32::MAX` 均 `InvalidArgument` | `.with_burst(64*1024)` |
 | `build() -> Downloader` | — | 产出下载器，复用或进一步 `with_resume()` | `let dl = builder.build();` |
 | `download().await` | — | 消费 `self` 直接下载 | `builder.download().await?;` |
-| `run(handler).await` | `progress` | 消费 `self` 并注入进度回调 | `builder.run(\|total, rx\| async move {...}).await?;` |
+| `run(handler).await` | `progress` | 消费 `self` 并注入进度回调（`DownloadInfo #[non_exhaustive]` 稳定契约见 §6） | `builder.run(\|total, rx\| async move {...}).await?;` |
 
 `Downloader` 侧同名方法：`with_resume(bool)`（`resume`）、`download().await`、`run(handler).await`（`progress`）、`new_multi(config, client_builder)`（`multi-source`）。
 
@@ -428,41 +431,137 @@ async fn download_with_retry(url: &str, path: &str) -> Result<(), DownloadError>
         }
     }
 }
-```
-
----
-
 ## 11. 并发与自动降级
 
-`src/downloader.rs:502-510` 实际生效并发：
+`src/downloader.rs:orchestrate_downloads` 实际生效并发：
 
 ```text
 if !support_ranges || workers == 1 || file_size < 1 MiB { 1 } else { workers }
 ```
 
 - 服务器不支持 `Range` → 强制单线程，忽略 `workers`。
-- 文件 `< 1 MiB` → 单线程，避免分片开销。
-- 运行时 `DownloadState`/`ConcurrencyManager` 在 `Probing -> Stable` 两阶段动态探测带宽，自动分裂最慢可分片块（`state.rs:is_splittable` 要求 `remaining >= 20 KiB`），无需调用方干预。详见 `architecture.md:动态分片` 与 `tests/concurrency.rs`。
+- 文件 `< 1 MiB`（`MIN_PARALLEL_FILE_SIZE`）→ 单线程，避免分片开销。
+- 运行时 `DownloadState`/`ConcurrencyManager` 在 `Probing -> Stable` 两阶段动态探测：`Probing` 需正向吞吐增益才扩容，`Stable` 仅在吞吐相对历史基线显著回落（`STABLE_SPLIT_THRESHOLD 0.8`）且 `MIN_REMAINING_TIME_FOR_SPLIT 3s` 仍值得时才切最慢可分片块；`ConcurrencyManager` 补位亦按 `remaining 可分片量` 而非原始尺寸选目标（`MIN_SPLITTABLE_REMAINING 256KiB`，`MIN_CHUNK_SIZE 10KiB`）。详见 `architecture.md:动态分片` 与 `tests/concurrency.rs`。
+- `rate-limit` 启用时 `DownloadMonitor::is_rate_limited=true` 冻结 `decide_and_act`，`drain_pending` 容量补位除外（`monitor.rs:524` 注释），避免限速被误判为带宽不足而过度分裂。
 
-建议：小文件 `<100 MiB` 用 `4-8` workers，大文件 `>1 GiB` 用 `16-32`，多源可 `32-64` 但不超过 `源数×4`。
+建议：小文件 `<100 MiB` 用 `4-8` workers，大文件 `>1 GiB` 用 `16-32`，多源可 `32` 但不超过 `源数×4` 且受 `max_chunks_per_lane/source` 约束。
 
 ---
 
-## 12. 完整示例索引
+## 12. 场景七：速度限制（`rate-limit`）
+
+```toml
+[dependencies]
+simple_downloader = { version = "0.6", features = ["rate-limit", "progress"] }
+```
+
+```rust
+use simple_downloader::Downloader;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 单源全局限速 1 MiB/s，burst 显式 64 KiB（默认亦 64 KiB 硬限）
+    Downloader::builder("https://example.com/file.bin", "output.bin")
+        .workers(16)
+        .speed_limit(1024*1024)
+        .with_burst(64*1024)
+        .download().await?;
+    Ok(())
+}
+```
+
+```rust
+use simple_downloader::{Downloader, MultiSourceConfig, SourceConfig};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 分源 + 全局双桶：per_source 300 KiB/s ×2，global 512 KiB/s 硬上限，join 取 max
+    let mut s1 = SourceConfig::new("https://m1.example.com/file.bin");
+    let mut s2 = SourceConfig::new("https://m2.example.com/file.bin");
+    #[cfg(feature = "rate-limit")]
+    {
+        s1 = s1.with_speed_limit(300*1024).with_burst(64*1024);
+        s2 = s2.with_speed_limit(300*1024).with_burst(64*1024);
+    }
+    let cfg = MultiSourceConfig::new("output.bin", 32, 0.5)
+        .with_sources(vec![s1, s2])
+        .with_global_speed_limit(512*1024)
+        .with_global_burst(64*1024);
+    Downloader::new_multi(cfg, Default::default).download().await?;
+    Ok(())
+}
+```
+
+校验（`src/downloader.rs:run_internal` / `src/lane.rs:from_config` / `src/limiter.rs`）：
+
+- `speed_limit == 0` / `burst == 0` / `burst 需配合 speed_limit` / `>u32::MAX (≈4GiB/s)` 均 `Err(InvalidArgument)`。
+- `1 token = 1 byte`，`Quota::per_second(limit).allow_burst(burst)`，`burst None` 默认 `64KiB`，`chunk` 内 `32-64KiB` 批量 `tokio::join!(per.acquire, global.acquire)`。
+- `is_rate_limited` 时 `Monitor` 跳过 `decide_and_act`，`drain_pending` 仍补位（冻结例外）。
+
+运行与精度矩阵：`examples/with_rate_limit.rs`（`-- --multi` 双模式）与 `tests/rate_limit.rs`（`5MiB@1MiB/s 4-6.5s` 段）。
+
+---
+
+## 13. 场景八：任务队列（`queue`）
+
+```toml
+[dependencies]
+simple_downloader = { version = "0.6", features = ["queue"] }
+```
+
+```rust
+use simple_downloader::{TaskQueue, DownloadError};
+use std::path::PathBuf;
+
+#[tokio::main]
+async fn main() -> Result<(), DownloadError> {
+    let queue = TaskQueue::with_max_concurrent(3); // 1..64 clamp，默认 3
+    let id1 = queue.enqueue("https://example.com/a.bin", PathBuf::from("a.bin")).await?;
+    let id2 = queue.enqueue_with_workers("https://example.com/b.bin", PathBuf::from("b.bin"), 8).await?;
+    // 同名自动重命名：a.bin 已存在 → a(1).bin → a(2).bin ...（`with_suffix` 无限递增，.tar.gz → .tar(1).gz）
+    let id_dup = queue.enqueue("https://example.com/a.bin", PathBuf::from("a.bin")).await?;
+    // 控制
+    queue.pause(id1).await?;
+    queue.resume(id1).await?;
+    queue.cancel(id2).await?; // Active: abort+延迟删，Queued/Paused: 立即删（pending_deletes 200ms 周期）
+    let snap = queue.query(id1).await;
+    queue.wait_all().await;
+    Ok(())
+}
+```
+
+语义（`src/queue.rs`/`src/task.rs`）：
+
+- FIFO 调度，`JoinSet + AbortHandle + Notify + mpsc 128` 驱动，`queued_len/active_count` 可观测。
+- 重命名三重 CAS：`occupied` 内存集合 + `try_exists` 磁盘 + `*.download.bitcode` sidecar，`windows` 大小写折叠，`TaskQueue` 仅进程内保证，跨进程同路径需外部文件锁（`TaskQueue` 顶层 `WARNING`）。
+- 取消删除：`pending_deletes` 200ms 周期 `flush_pending_deletes`，`NotFound` 视成功，`PermissionDenied/未知Io` `warn+重试`（`0.6.2 R1`）。
+- `TaskState: Queued/Paused/Active/Completed/Failed/Cancelled/Removed`，`QueueError` 仅队列层错误，下载层错误在 `TaskSnapshot`。
+
+示例：`examples/with_queue.rs`（并发3、同名 `a(N).ext`、pause/resume/cancel 隔离）。
+
+---
+
+## 14. 完整示例索引
 
 | 示例 | 路径 | Feature | 说明 |
 |---|---|---|---|
 | 基础下载 | `examples/download.rs` | — | 单源最小调用 |
 | 自定义 UI | `examples/with_custom_ui.rs` | `progress` | `indicatif::MultiProgress` 总进度+分块进度条 |
+| 限速单/多源 | `examples/with_rate_limit.rs` | `rate-limit,progress` | 单源 512KiB/s 与多源 `per_source+global` 双演示（`-- --multi`） |
+| 任务队列 | `examples/with_queue.rs` | `queue` | `with_max_concurrent 3`、重命名、pause/resume/cancel 隔离 |
 | 断点续传子进程 | `examples/resume_harness.rs` | `resume,multi-source` | `single`/`multi` 双模式，供 `process_resume` 集成测试 |
 | 智能调度观察 | `examples/test_server_smart_schedule.rs` | `progress` | 本地 `test_server` 限速观察并发决策 |
 | 手工多源 500MiB | `examples/manual_multi_source_test_server.rs` | `multi-source,progress` | 双源 `16m`/`2m` 限速、实时 stats 与字节校验 |
+| 自适应压测 | `examples/adaptive_bench.rs` | — | `ConcurrencyManager` 收敛参数压测 harness |
 
 运行：
 
 ```bash
 cargo run --example download
 cargo run --features progress --example with_custom_ui
+cargo run --features rate-limit,progress --example with_rate_limit
+cargo run --features rate-limit,progress --example with_rate_limit -- --multi
+cargo run --features queue --example with_queue
 cargo run --features multi-source,progress --example manual_multi_source_test_server
 cargo run --features resume,multi-source --example resume_harness -- single https://example.com/file.bin out.bin 8 0.5
 ```
@@ -472,17 +571,21 @@ cargo run --features resume,multi-source --example resume_harness -- single http
 ```bash
 cargo test --features resume,multi-source --test resume -- --nocapture --test-threads=1
 cargo test --features resume,multi-source --test process_resume -- --nocapture --test-threads=1
+cargo test --features rate-limit,multi-source --test rate_limit -- --nocapture
+cargo test --features queue --test queue -- --nocapture
 cargo test --test multi_source -- --nocapture
 ```
 
 ---
 
-## 13. 调用检查清单
+## 15. 调用检查清单
 
 - [ ] `Cargo.toml` feature 按需开启，未全量 `default-features = false` 是否满足需求？
 - [ ] `workers` / `update_interval` 是否符合文件大小与 UI 刷新需求？
-- [ ] 需要断点续传时 `resume` 是否启用，sidecar 清理策略是否明确？
-- [ ] 需要进度时 `progress` + `run(handler)` 回调内是否无阻塞操作？
-- [ ] 多源场景源是否同文件同大小且支持 `Range`，`LaneModel` 是否匹配代理维度？
-- [ ] 自定义 `ClientBuilder` 超时/连接池是否按文件大小配置？
-- [ ] 错误分支是否区分可重试/不可重试（`Request::is_timeout` / `ResumeTargetMissing` 等）？
+- [ ] 需要断点续传时 `resume` 是否启用，sidecar 清理策略是否明确（成功自动删 `*.download.bitcode`，中断残留下次 hash 复用）？
+- [ ] 需要进度时 `progress` + `run(handler)` 回调内是否无阻塞操作（`mpsc` 转发）且 `match` 含 `_` 分支（`#[non_exhaustive]`）？
+- [ ] 多源场景源是否同文件同大小且支持 `Range`，`LaneModel` 是否匹配代理维度（`PerSource`/`PerSourceProxy`）？
+- [ ] 限速场景 `speed_limit/burst` 是否校验且 `global` 为硬上限（`per_source` 之和受 `global` 约束，`join max`）？
+- [ ] 队列场景 `with_max_concurrent` 是否 `1..64` 且 `enqueue` 同路径是否接受 `a(N).ext` 重命名（跨进程需外部锁）？
+- [ ] 自定义 `ClientBuilder` 超时/连接池（`pool 32/90s/60s`）是否按文件大小配置？
+- [ ] 错误分支是否区分可重试/不可重试（`Request::is_timeout` / `ResumeTargetMissing` / `InvalidArgument` 等）？

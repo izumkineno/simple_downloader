@@ -145,8 +145,15 @@ async fn test_file_writer_task() {
     let mut file = fs::File::open(path).await.unwrap();
     let metadata = file.metadata().await.unwrap();
     // streaming: file should be at least 15 bytes (highest write), not preallocated to 100
-    assert!(metadata.len() >= 15, "streaming file should be at least 15 bytes, got {}", metadata.len());
-    assert!(metadata.len() <= file_size, "streaming file should not exceed file_size");
+    assert!(
+        metadata.len() >= 15,
+        "streaming file should be at least 15 bytes, got {}",
+        metadata.len()
+    );
+    assert!(
+        metadata.len() <= file_size,
+        "streaming file should not exceed file_size"
+    );
 
     let mut content = Vec::new();
     file.read_to_end(&mut content).await.unwrap();

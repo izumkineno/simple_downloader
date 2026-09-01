@@ -1,23 +1,26 @@
 #![cfg(feature = "rate-limit")]
 
+use simple_downloader::{DownloadError, Downloader};
 #[cfg(feature = "multi-source")]
 use simple_downloader::{MultiSourceConfig, SourceConfig};
-use simple_downloader::{DownloadError, Downloader};
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 mod test_server_harness;
-use test_server_harness::{deterministic_bytes, RunningTestServer, TestServerFile};
+use test_server_harness::{RunningTestServer, TestServerFile, deterministic_bytes};
 
 #[tokio::test]
 async fn invalid_zero_returns_error() {
     let dir = tempdir().unwrap();
     let out = dir.path().join("out.bin");
     // speed_limit 0 should return InvalidArgument
-    let res = Downloader::builder("http://example.com/file.bin", out.to_string_lossy().to_string())
-        .speed_limit(0)
-        .download()
-        .await;
+    let res = Downloader::builder(
+        "http://example.com/file.bin",
+        out.to_string_lossy().to_string(),
+    )
+    .speed_limit(0)
+    .download()
+    .await;
     assert!(matches!(res, Err(DownloadError::InvalidArgument(_))));
 }
 
@@ -70,7 +73,11 @@ async fn hard_limit_burst_zero() {
         .await
         .unwrap();
     let elapsed = start.elapsed();
-    assert!(elapsed >= Duration::from_millis(1800), "too fast {:?}", elapsed);
+    assert!(
+        elapsed >= Duration::from_millis(1800),
+        "too fast {:?}",
+        elapsed
+    );
     let _ = start;
 }
 
@@ -85,16 +92,24 @@ async fn per_source_limit_enforced() {
     // Need two servers with same file
     let file2 = TestServerFile::new("per2.bin", file.bytes.clone()).unwrap();
     // Reuse same directory for second server? Use same file name but different port
-    let server1 = RunningTestServer::spawn(file.directory(), "16m", "16m").await.unwrap();
-    let server2 = RunningTestServer::spawn(file2.directory(), "16m", "16m").await.unwrap();
+    let server1 = RunningTestServer::spawn(file.directory(), "16m", "16m")
+        .await
+        .unwrap();
+    let server2 = RunningTestServer::spawn(file2.directory(), "16m", "16m")
+        .await
+        .unwrap();
     let url1 = server1.url_for("per.bin");
     let url2 = server2.url_for("per2.bin");
     let out_dir = tempdir().unwrap();
     let out = out_dir.path().join("out_per.bin");
     let cfg = MultiSourceConfig::new(out.to_string_lossy().to_string(), 8, 0.5)
         .with_sources(vec![
-            SourceConfig::new(url1).with_id("s1").with_speed_limit(400 * 1024),
-            SourceConfig::new(url2).with_id("s2").with_speed_limit(400 * 1024),
+            SourceConfig::new(url1)
+                .with_id("s1")
+                .with_speed_limit(400 * 1024),
+            SourceConfig::new(url2)
+                .with_id("s2")
+                .with_speed_limit(400 * 1024),
         ])
         .with_global_speed_limit(1024 * 1024);
     let start = Instant::now();
@@ -119,16 +134,24 @@ async fn global_hard_limit_with_per_source_sum_exceeds() {
     // global 500KiB/s, per_source 400+400=800 >500, should be limited to ~500
     let file = TestServerFile::new("hard2.bin", deterministic_bytes(2 * 1024 * 1024)).unwrap();
     let file2 = TestServerFile::new("hard2_2.bin", file.bytes.clone()).unwrap();
-    let server1 = RunningTestServer::spawn(file.directory(), "16m", "16m").await.unwrap();
-    let server2 = RunningTestServer::spawn(file2.directory(), "16m", "16m").await.unwrap();
+    let server1 = RunningTestServer::spawn(file.directory(), "16m", "16m")
+        .await
+        .unwrap();
+    let server2 = RunningTestServer::spawn(file2.directory(), "16m", "16m")
+        .await
+        .unwrap();
     let url1 = server1.url_for("hard2.bin");
     let url2 = server2.url_for("hard2_2.bin");
     let out_dir = tempdir().unwrap();
     let out = out_dir.path().join("out_hard2.bin");
     let cfg = MultiSourceConfig::new(out.to_string_lossy().to_string(), 8, 0.5)
         .with_sources(vec![
-            SourceConfig::new(url1).with_id("s1").with_speed_limit(400 * 1024),
-            SourceConfig::new(url2).with_id("s2").with_speed_limit(400 * 1024),
+            SourceConfig::new(url1)
+                .with_id("s1")
+                .with_speed_limit(400 * 1024),
+            SourceConfig::new(url2)
+                .with_id("s2")
+                .with_speed_limit(400 * 1024),
         ])
         .with_global_speed_limit(500 * 1024);
     let start = Instant::now();

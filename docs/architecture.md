@@ -44,14 +44,16 @@ tests/
 ### 3.1 启动链路
 
 ```text
-Downloader.run(progress_handler)
-  ├─ build reqwest::Client
-  ├─ get_file_info(HEAD；必要时回退 Range GET)
-  ├─ file_writer_task(output_path, file_size) -> mpsc<DownloadCmd>
-  ├─ spawn(progress_handler(total_size, info_rx))
-  ├─ spawn initial chunk covering the whole file range
-  ├─ DownloadMonitor::new(file_size, update_interval, workers)
-  └─ monitor.run(info_rx, tasks, channels, next_chunk_id, client, writer_tx, cmd_tx, url)
+Downloader::builder(url, output).workers(n).download() / .run(handler)
+  ├─ build reqwest::Client (pool 32/90s/keepalive 60s + UA simple_downloader/x.y.z)
+  ├─ get_file_info(HEAD；必要时回退 Range: bytes=0-0 → Content-Range)
+  ├─ ResumePlan::prepare_async (resume feature, 64KiB segment hash, version=1)
+  ├─ file_writer_task[_with_resume](output_path, file_size) -> mpsc<DownloadCmd> 128  # 0.5.4+ 流式追加，无 set_len 预分配，.truncate(false)，create_dir_all
+  ├─ spawn(progress_handler(total_size, info_rx)) // progress feature, broadcast + reliable mpsc
+  ├─ spawn initial chunk(s) covering remaining_ranges (单源全量或 resume 剩余区间；workers 仅上限)
+  ├─ DownloadMonitor::new[_with_completed](file_size, update_interval, workers).with_rate_limit(global_limiter)
+  └─ monitor.run[with_reliable](info_rx, tasks, channels, next_chunk_id, client, writer_tx, cmd_tx, url, multi_runtime)
+     └─ 限速时 is_rate_limited=true 跳过 ConcurrencyManager::decide_and_act (0.5.1+ 冻结，drain_pending 例外见 §6.4)
 ```
 
 这条链路强调两点：
@@ -66,38 +68,25 @@ Downloader.run(progress_handler)
 - **DownloadMonitor**：消费 `DownloadInfo`，更新 `DownloadState`，定期计算速度/总进度，驱动并发分片和重试队列。
 - **ConcurrencyManager**：作为 monitor 的内部策略组件，基于速度、剩余时间、稳定性采样和最大并发限制决定是否广播 `BisectDownload`；当前策略会避免在吞吐证据不足、接近完成或只是“恰好有空闲 worker 槽位”时盲目继续分片。
 - **RetryHandler**：作为 monitor 的内部恢复组件，维护即时重试队列和延迟重试队列，决定失败 range 何时重新生成 chunk。
-- **ProgressHandler / UI**：只消费 `DownloadInfo`，不参与调度决策。
-
 ## 4. 协议与通道图例
 
 | 协议/通道 | 传输 | 发送者 | 消费者 | 语义 |
 | --- | --- | --- | --- | --- |
-| `DownloadInfo` | `broadcast<DownloadInfo>` | chunk、monitor | monitor、progress handler | 状态/进度事件协议：`ChunkProgress`、`DownloadComplete`、`ChunkFailed`、`ChunkBisected`、`ChunkStatusChanged`、`MonitorUpdate` |
+| `DownloadInfo` | `broadcast 4096` + `mpsc reliable 1` 兜底 | chunk、monitor | monitor、progress handler | 状态/进度事件：`ChunkProgress`/`DownloadComplete`/`ChunkFailed`/`ChunkBisected`/`ChunkStatusChanged`/`MonitorUpdate`；终局 `Failed/Complete/Bisected` 经 `mpsc reliable` 兜底防 `Lagged` 丢失（0.6.2+ `send_terminal_event`） |
 | `DownloadCmd::BisectDownload` | `broadcast<DownloadCmd>` | `ConcurrencyManager` 经由 monitor tick | chunk worker | 控制命令：要求指定 chunk 自切一半，并上报新 range |
 | `DownloadCmd::TerminateAll` | `broadcast<DownloadCmd>` | `Downloader` 在 monitor 返回后 | chunk worker | 控制命令：下载结束后的清理信号 |
-| `DownloadCmd::WriteFile` | `mpsc<DownloadCmd>` | chunk worker | file writer task | 写入命令：有界队列提供背压，避免下载端无限积压内存 |
+| `DownloadCmd::WriteFile` | `mpsc<DownloadCmd> 128` | chunk worker | file writer task | 写入命令：有界队列提供背压；`file_writer_task_impl` 流式 `seek+write+flush`，`ENOSPC` 在 `write/flush` 以 `Io` 暴露 |
 
-`DownloadCmd` 是同一个 enum，但它有两条传输路径：控制命令走 `broadcast`，写入命令走 `mpsc`。因此文档和图示中不把它描述成一个统一命令总线。
+`DownloadCmd` 是同一个 enum，但有两条传输路径：控制命令走 `broadcast`，写入命令走 `mpsc`。因此文档和图示中不把它描述成一个统一命令总线。
+
+`DownloadInfo` 亦有两条传输路径：`broadcast 4096` 主通道 + `mpsc reliable` 终局兜底（`ChunkFailed/DownloadComplete/ChunkBisected`，`src/chunk.rs:send_terminal_event`）。
 
 状态码来自 `DownloadInfo::MonitorUpdate.chunk_details` 和 `ChunkStatusChanged`：`0=下载中`、`1=重试中`、`2=等待重试`、`3=延迟重试`、`4=已完成`、`5=失败`。
 
 ## 5. 运行时时序图（单张分区块）
 
-下面这张图是本文唯一的运行时时序图。它用 `Note over ...` 分区展示启动、初始分片、常规进度、动态分片、即时重试、延迟恢复、完成关闭七个阶段。
-
-```mermaid
-sequenceDiagram
-    actor User as 用户
-    participant Downloader as Downloader
-    participant Probe as get_file_info
-    participant Writer as FileWriter
-    participant Monitor as DownloadMonitor
-    participant Chunk as ChunkWorker
-    participant Server as RemoteServer
-    participant Progress as ProgressHandler
-
     Note over User,Downloader: 1. 启动与探测
-    User->>Downloader: run(progress_handler)
+    User->>Downloader: builder(url, output).workers(n).download() / run(handler)
     Downloader->>Probe: build client and probe file info
     Probe->>Server: HEAD
     alt HEAD 返回完整元数据
@@ -107,8 +96,8 @@ sequenceDiagram
         Server-->>Probe: Content-Range / Content-Length
     end
     Probe-->>Downloader: file_size + support_ranges
-    Downloader->>Writer: start writer task and preallocate file
-    Downloader->>Progress: spawn progress_handler(info_rx)
+    Downloader->>Writer: file_writer_task[_with_resume](streaming append, no preallocate, truncate(false))
+    Downloader->>Progress: spawn progress_handler(info_rx) // broadcast + reliable mpsc
 
     Note over Downloader,Monitor: 2. 初始分片与 Monitor 接管
     Downloader->>Chunk: spawn initial full-range chunk
@@ -195,16 +184,20 @@ chunk 拉取远端字节流后，把数据通过 `mpsc<DownloadCmd>` 发送给 `
 
 chunk 完成后上报 `DownloadComplete`。monitor 标记该 chunk 完成并清理 retry 记录；当活跃任务和重试队列都为空且 `DownloadState` 判断文件已完成时，monitor loop 返回。随后 `Downloader` 广播 `TerminateAll` 做最终清理。
 
-## 7. 源码映射
+## 7. 源码映射（模块级，不绑定行号，见 `src/*.rs` 顶层文档）
 
-- 启动与编排：`src/downloader.rs:88-169`
-- 文件信息探测与写入任务：`src/util.rs:13-132`
-- monitor 主循环与运行时接管：`src/monitor.rs:20-247`
-- 动态分片策略：`src/concurrency.rs:20-247`
-- 重试队列与延迟恢复：`src/retry.rs:9-173`
-- chunk 下载、切分、写入、事件上报：`src/chunk.rs:12-150`
-- 状态与 EMA 速度：`src/state.rs:7-137`
-- 消息协议：`src/types.rs:30-82`
+- 启动与编排：`src/downloader.rs` (`DownloadBuilder`/`Downloader`/`orchestrate_downloads`/`streaming_download` 含 `MissingContentLength` 单流回退)
+- 文件信息探测与写入任务：`src/util.rs` (`get_file_info`→`Head→Range 0-0→Content-Length` 三级回退/`parse_content_range`/`file_writer_task_impl` 流式追加 `mpsc 128` + `ENOSPC` 透传)
+- monitor 主循环与运行时接管：`src/monitor.rs` (`DownloadMonitor::run`/`run_with_reliable`/`apply_config` 热更 `workers/interval/global limiter`/`drain_pending` 容量补位不限速冻结/`reliable_rx` 终局兜底)
+- 动态分片策略：`src/concurrency.rs` (`ConcurrencyManager` `Probing→Stable` + `MIN_SPLITTABLE_REMAINING 256KiB`/`MIN_CHUNK_SIZE 10KiB`/`ObservationState`)
+- 重试队列与延迟恢复：`src/retry.rs` (`RetryHandler` `MAX_RETRIES=10`/`RETRY_DELAY=1s`/`DELAYED=10s`/`MAX_TOTAL=30` FIFO `VecDeque`)
+- chunk 下载、切分、写入、事件上报：`src/chunk.rs` (`chunk_run_with_reliable` `206/Content-Range`强校验/`Early-EOF`门限/`send_terminal_event`/`PROGRESS_THROTTLE 64KiB/50ms`)
+- 状态与 EMA 速度：`src/state.rs` (`DownloadState` `SMOOTHING_FACTOR 0.30` EMA + `is_splittable`/`complete_chunk`)
+- 消息协议：`src/types.rs` (`DownloadCmd`/`DownloadInfo #[non_exhaustive]` + `MonitorUpdate` 稳定契约 `0.6.2+` + `is_complete` 对 `0/0` 分支)
+- 限速：`src/limiter.rs` (`RateLimiter` `governor` `1token=1byte` `burst 64KiB` `reconfigure`/`disable`/`acquire` 32-64KiB 批量 `join max`)
+- 配置热更新：`src/config.rs` (`RuntimeConfig{workers,update_interval,speed_limit,burst}`/`SharedConfig` `apply_config` 热更全局限速已落地，`per_source` 待接)
+- 任务队列：`src/queue.rs`/`src/task.rs` (`TaskQueue` FIFO `pending_deletes 200ms` `PermissionDenied/未知Io重试`/`with_suffix a.tar(1).gz`/`occupied` 三重 CAS)
+- 可观测：`src/trace.rs` (`init_tracing`/`try_init_tracing`/`RUST_LOG`/`SIMPLE_DOWNLOADER_LOG` + `#[instrument]` 全链路)
 
 ## 8. 扩展边界
 

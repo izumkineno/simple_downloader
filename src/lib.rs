@@ -145,23 +145,23 @@
 pub mod chunk;
 #[doc(hidden)]
 pub mod concurrency;
+pub mod config;
 #[doc(hidden)]
 pub mod downloader;
 mod lane;
+pub mod limiter;
 #[doc(hidden)]
 pub mod monitor;
+#[cfg(feature = "queue")]
+pub mod queue;
 #[cfg(feature = "resume")]
 mod resume;
 pub mod retry;
 #[doc(hidden)]
 pub mod state;
-pub mod trace;
-pub mod limiter;
-pub mod config;
 #[cfg(feature = "queue")]
 pub mod task;
-#[cfg(feature = "queue")]
-pub mod queue;
+pub mod trace;
 mod types;
 #[doc(hidden)]
 pub mod util;
@@ -170,18 +170,18 @@ pub(crate) const DEFAULT_USER_AGENT: &str =
 
 // 导出核心的 `Downloader`，它是用户的主要入口点。
 pub use downloader::{DownloadBuilder, Downloader};
-#[cfg(feature = "queue")]
-pub use queue::{QueueError, TaskQueue};
-#[cfg(feature = "queue")]
-pub use task::{TaskId, TaskSnapshot, TaskState};
 #[cfg(feature = "proxy")]
 pub use lane::ProxyConfig;
 #[cfg(feature = "multi-source")]
 pub use lane::{
     LaneCandidate, LaneHealth, LaneModel, LaneScheduler, MultiSourceConfig, SourceConfig,
 };
+#[cfg(feature = "queue")]
+pub use queue::{QueueError, TaskQueue};
 #[cfg(feature = "resume")]
 pub use resume::{DEFAULT_SEGMENT_SIZE, ResumeMetadata, hash_bytes, metadata_path_for};
+#[cfg(feature = "queue")]
+pub use task::{TaskId, TaskSnapshot, TaskState};
 // 导出公共类型，方便用户在类型注解和模式匹配中使用。
 #[cfg(feature = "progress")]
 pub use types::DownloadInfo;
@@ -189,7 +189,7 @@ pub use types::{ChunkId, DownloadError, Result};
 
 #[doc(hidden)]
 pub mod internal {
- pub use crate::types::{DownloadCmd, DownloadInfo};
+    pub use crate::types::{DownloadCmd, DownloadInfo};
 }
 // 日志门面：基于 tracing 的调试/生产分级初始化，库本身不自动安装全局订阅者。
 // 二进制按需调用 `simple_downloader::trace::init_tracing()` 即可通过

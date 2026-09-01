@@ -416,7 +416,7 @@ async fn render_progress(
                     total_bar.println(format!("[manual-multi-source] chunk {id} status={status}"))
                 }
             },
-            DownloadInfo::ChunkProgress { .. } => {},
+            DownloadInfo::ChunkProgress { .. } => {}
             _ => {}
         }
     }

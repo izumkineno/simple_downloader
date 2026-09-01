@@ -284,14 +284,23 @@ impl ResumeMetadata {
             file.seek(SeekFrom::Start(segment.start))?;
             file.read_exact(&mut buf)?;
             if hash_bytes(&buf) != expected_hash {
-                ::tracing::warn!(start = segment.start, end = segment.end, "resume segment hash mismatch, discarding");
+                ::tracing::warn!(
+                    start = segment.start,
+                    end = segment.end,
+                    "resume segment hash mismatch, discarding"
+                );
                 segment.hash = None;
                 invalid += 1;
             } else {
                 verified += 1;
             }
         }
-        ::tracing::info!(verified, invalid, file_len, "resume verify_against_file done");
+        ::tracing::info!(
+            verified,
+            invalid,
+            file_len,
+            "resume verify_against_file done"
+        );
         Ok(())
     }
 }
@@ -409,23 +418,32 @@ impl ResumePlan {
     ) -> Result<Self> {
         let path_clone = output_path.clone();
         ::tracing::debug!(path = %path_clone.display(), file_size, enabled, "resume prepare_async start");
-        let res = tokio::task::spawn_blocking(move || Self::prepare(&output_path, file_size, enabled))
-            .await
-            .unwrap_or_else(|e| {
-                Err(DownloadError::ResumeMetadata(format!(
-                    "resume prepare panicked: {e}"
-                )))
-            });
+        let res =
+            tokio::task::spawn_blocking(move || Self::prepare(&output_path, file_size, enabled))
+                .await
+                .unwrap_or_else(|e| {
+                    Err(DownloadError::ResumeMetadata(format!(
+                        "resume prepare panicked: {e}"
+                    )))
+                });
         match &res {
-            Ok(plan) => ::tracing::info!(path = %path_clone.display(), completed = plan.completed_bytes, remaining = plan.remaining_ranges.len(), truncate = plan.truncate_output, "resume prepare_async done"),
-            Err(e) => ::tracing::error!(path = %path_clone.display(), error = %e, "resume prepare_async failed"),
+            Ok(plan) => {
+                ::tracing::info!(path = %path_clone.display(), completed = plan.completed_bytes, remaining = plan.remaining_ranges.len(), truncate = plan.truncate_output, "resume prepare_async done")
+            }
+            Err(e) => {
+                ::tracing::error!(path = %path_clone.display(), error = %e, "resume prepare_async failed")
+            }
         }
         res
     }
 
     pub fn into_recorder(self) -> Option<ResumeRecorder> {
         let has_metadata = self.metadata.is_some();
-        ::tracing::debug!(has_metadata, completed = self.completed_bytes, "into_recorder");
+        ::tracing::debug!(
+            has_metadata,
+            completed = self.completed_bytes,
+            "into_recorder"
+        );
         self.metadata
             .map(|metadata| ResumeRecorder::new(self.metadata_path, metadata))
     }
@@ -488,7 +506,12 @@ impl ResumeRecorder {
                 let bytes = read_segment(file, seg_start, seg_len).await?;
                 self.metadata.segments[index].hash = Some(hash_bytes(&bytes));
                 newly_completed += 1;
-                ::tracing::trace!(segment = index, start = seg_start, end = seg_end, "segment completed and hashed");
+                ::tracing::trace!(
+                    segment = index,
+                    start = seg_start,
+                    end = seg_end,
+                    "segment completed and hashed"
+                );
             }
         }
 
@@ -496,7 +519,12 @@ impl ResumeRecorder {
             self.pending_segments += newly_completed;
             let should_flush =
                 self.pending_segments >= 16 || self.last_save.elapsed() >= Duration::from_secs(1);
-            ::tracing::debug!(newly_completed, pending = self.pending_segments, should_flush, "record_write segment progress");
+            ::tracing::debug!(
+                newly_completed,
+                pending = self.pending_segments,
+                should_flush,
+                "record_write segment progress"
+            );
             if should_flush {
                 self.metadata.save_atomic_async(&self.metadata_path).await?;
                 ::tracing::info!(pending = self.pending_segments, path = %self.metadata_path.display(), "resume metadata flushed");
@@ -708,7 +736,10 @@ mod tests {
         let mut second = ResumeMetadata::new(1, 1);
         second.set_segment_hash(0, 22);
         second.save_atomic(&path).unwrap();
-        assert_eq!(ResumeMetadata::load(&path).unwrap().segments[0].hash, Some(22));
+        assert_eq!(
+            ResumeMetadata::load(&path).unwrap().segments[0].hash,
+            Some(22)
+        );
 
         let mut third = ResumeMetadata::new(1, 1);
         third.set_segment_hash(0, 33);
@@ -717,7 +748,10 @@ mod tests {
         let mut fourth = ResumeMetadata::new(1, 1);
         fourth.set_segment_hash(0, 44);
         fourth.save_atomic_async(&path).await.unwrap();
-        assert_eq!(ResumeMetadata::load(&path).unwrap().segments[0].hash, Some(44));
+        assert_eq!(
+            ResumeMetadata::load(&path).unwrap().segments[0].hash,
+            Some(44)
+        );
 
         assert!(
             std::fs::read_dir(tmp.path())

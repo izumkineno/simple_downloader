@@ -1,18 +1,26 @@
 use simple_downloader::{DownloadInfo, Downloader};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-use std::net::TcpListener;
 use tempfile::TempDir;
 
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 fn script_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_server").join("server.py")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("test_server")
+        .join("server.py")
 }
 fn deterministic_bytes(len: usize) -> Vec<u8> {
-    (0..len).map(|i| ((i.wrapping_mul(31).wrapping_add(7)) % 251) as u8).collect()
+    (0..len)
+        .map(|i| ((i.wrapping_mul(31).wrapping_add(7)) % 251) as u8)
+        .collect()
 }
 
 struct Running {
@@ -35,7 +43,10 @@ impl Running {
             .env("SIMPLE_DOWNLOADER_TEST_SERVER_PORT", port.to_string())
             .env("SIMPLE_DOWNLOADER_TEST_SERVER_DIRECTORY", dir.as_os_str())
             .env("SIMPLE_DOWNLOADER_TEST_SERVER_TOTAL_MAX_SPEED", total)
-            .env("SIMPLE_DOWNLOADER_TEST_SERVER_PER_THREAD_MAX_SPEED", per_thread)
+            .env(
+                "SIMPLE_DOWNLOADER_TEST_SERVER_PER_THREAD_MAX_SPEED",
+                per_thread,
+            )
             .env("SIMPLE_DOWNLOADER_TEST_SERVER_DISABLE_CONSOLE", "1")
             .env("SIMPLE_DOWNLOADER_TEST_SERVER_DISABLE_STATUS", "1")
             .stdin(Stdio::null())
@@ -55,23 +66,39 @@ impl Running {
                 panic!("server not ready");
             }
             if let Ok(r) = client.get(&url).send().await {
-                if r.status().is_success() { break; }
+                if r.status().is_success() {
+                    break;
+                }
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        Self { child, port, _root: root }
+        Self {
+            child,
+            port,
+            _root: root,
+        }
     }
     fn url(&self, name: &str) -> String {
         format!("http://127.0.0.1:{}/{}", self.port, name)
     }
 }
 impl Drop for Running {
-    fn drop(&mut self) { let _ = self.child.kill(); let _ = self.child.wait(); }
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 async fn run_one(label: &str, file_size: usize, total: &str, per_thread: &str, workers: u64) {
     eprintln!("\n========== SCENARIO: {} ==========", label);
-    eprintln!("[Bench] file_size={} ({:.2} MiB) total={} per_thread={} workers={}", file_size, file_size as f64/1024.0/1024.0, total, per_thread, workers);
+    eprintln!(
+        "[Bench] file_size={} ({:.2} MiB) total={} per_thread={} workers={}",
+        file_size,
+        file_size as f64 / 1024.0 / 1024.0,
+        total,
+        per_thread,
+        workers
+    );
     let bytes = deterministic_bytes(file_size);
     let srv = Running::spawn(bytes.clone(), total, per_thread, "bench.bin").await;
     let tmp = TempDir::new().unwrap();
@@ -94,36 +121,80 @@ async fn run_one(label: &str, file_size: usize, total: &str, per_thread: &str, w
     dl2.run(move |total_size, mut info_rx| async move {
         while let Ok(info) = info_rx.recv().await {
             match &info {
-                DownloadInfo::ChunkBisected { original_id, new_start, new_end } => {
-                    eprintln!("[Bench][Event] Bisected orig={} new={}..{}", original_id, new_start, new_end);
+                DownloadInfo::ChunkBisected {
+                    original_id,
+                    new_start,
+                    new_end,
+                } => {
+                    eprintln!(
+                        "[Bench][Event] Bisected orig={} new={}..{}",
+                        original_id, new_start, new_end
+                    );
                     bc2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
                 DownloadInfo::DownloadComplete(id) => {
                     eprintln!("[Bench][Event] Complete id={}", id);
                     cc2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
-                DownloadInfo::ChunkFailed { id, start, end, error } => {
-                    eprintln!("[Bench][Event] Failed id={} {}..{} err={}", id, start, end, error);
+                DownloadInfo::ChunkFailed {
+                    id,
+                    start,
+                    end,
+                    error,
+                } => {
+                    eprintln!(
+                        "[Bench][Event] Failed id={} {}..{} err={}",
+                        id, start, end, error
+                    );
                     fc2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
-                DownloadInfo::MonitorUpdate { total_downloaded, total_speed, chunk_details, .. } => {
-                    eprintln!("[Bench][Monitor] {}/{} {:.2} MiB/s chunks={} {:?}", total_downloaded, total_size, total_speed/1024.0/1024.0, chunk_details.len(), chunk_details.iter().map(|(id,_,_,sp,st)| format!("{}:{:.1}KB/s st{}", id, sp/1024.0, st)).collect::<Vec<_>>());
+                DownloadInfo::MonitorUpdate {
+                    total_downloaded,
+                    total_speed,
+                    chunk_details,
+                    ..
+                } => {
+                    eprintln!(
+                        "[Bench][Monitor] {}/{} {:.2} MiB/s chunks={} {:?}",
+                        total_downloaded,
+                        total_size,
+                        total_speed / 1024.0 / 1024.0,
+                        chunk_details.len(),
+                        chunk_details
+                            .iter()
+                            .map(|(id, _, _, sp, st)| format!(
+                                "{}:{:.1}KB/s st{}",
+                                id,
+                                sp / 1024.0,
+                                st
+                            ))
+                            .collect::<Vec<_>>()
+                    );
                 }
                 _ => {}
             }
         }
-    }).await.expect("download failed");
+    })
+    .await
+    .expect("download failed");
     let elapsed = start.elapsed();
     let got = std::fs::read(&out).unwrap();
     assert_eq!(got.len(), file_size, "size mismatch");
     assert_eq!(got, bytes, "content mismatch");
-    let avg = file_size as f64 / elapsed.as_secs_f64() / 1024.0/1024.0;
-    eprintln!("[Bench][Result] {} done size={:.2} MiB time={:.2}s avg={:.2} MiB/s bisects={} completes={} fails={}", label, file_size as f64/1024.0/1024.0, elapsed.as_secs_f64(), avg, bisect_counter.load(std::sync::atomic::Ordering::SeqCst), complete_counter.load(std::sync::atomic::Ordering::SeqCst), failed_counter.load(std::sync::atomic::Ordering::SeqCst));
+    let avg = file_size as f64 / elapsed.as_secs_f64() / 1024.0 / 1024.0;
+    eprintln!(
+        "[Bench][Result] {} done size={:.2} MiB time={:.2}s avg={:.2} MiB/s bisects={} completes={} fails={}",
+        label,
+        file_size as f64 / 1024.0 / 1024.0,
+        elapsed.as_secs_f64(),
+        avg,
+        bisect_counter.load(std::sync::atomic::Ordering::SeqCst),
+        complete_counter.load(std::sync::atomic::Ordering::SeqCst),
+        failed_counter.load(std::sync::atomic::Ordering::SeqCst)
+    );
     // brief sleep to let server flush
     tokio::time::sleep(Duration::from_millis(200)).await;
 }
-
-
 
 #[tokio::main]
 async fn main() {
@@ -136,10 +207,45 @@ async fn main() {
         .try_init();
     eprintln!("[Bench] starting adaptive bench with verbose adaptive logs");
     // Scenario matrix: adaptivity should shine on large file + moderate throttle where splitting helps
-    run_one("S1_small_fast_3MiB_w8_total128m_per64m", 3*1024*1024, "128m", "64m", 8).await;
-    run_one("S2_large_fast_20MiB_w16_total128m_per64m", 20*1024*1024, "128m", "64m", 16).await;
-    run_one("S3_large_slow_per_thread_20MiB_w16_total96m_per1m", 20*1024*1024, "96m", "1m", 16).await;
-    run_one("S4_large_total_bottleneck_20MiB_w16_total5m_per10m", 20*1024*1024, "5m", "10m", 16).await;
-    run_one("S5_medium_w4_total32m_per8m", 8*1024*1024, "32m", "8m", 4).await;
+    run_one(
+        "S1_small_fast_3MiB_w8_total128m_per64m",
+        3 * 1024 * 1024,
+        "128m",
+        "64m",
+        8,
+    )
+    .await;
+    run_one(
+        "S2_large_fast_20MiB_w16_total128m_per64m",
+        20 * 1024 * 1024,
+        "128m",
+        "64m",
+        16,
+    )
+    .await;
+    run_one(
+        "S3_large_slow_per_thread_20MiB_w16_total96m_per1m",
+        20 * 1024 * 1024,
+        "96m",
+        "1m",
+        16,
+    )
+    .await;
+    run_one(
+        "S4_large_total_bottleneck_20MiB_w16_total5m_per10m",
+        20 * 1024 * 1024,
+        "5m",
+        "10m",
+        16,
+    )
+    .await;
+    run_one(
+        "S5_medium_w4_total32m_per8m",
+        8 * 1024 * 1024,
+        "32m",
+        "8m",
+        4,
+    )
+    .await;
     eprintln!("\n========== ALL BENCH DONE ==========");
 }

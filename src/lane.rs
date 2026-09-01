@@ -756,24 +756,46 @@ impl MultiRuntime {
             for src in &config.sources {
                 if let Some(limit) = src.speed_limit {
                     if limit == 0 {
-                        return Err(DownloadError::InvalidArgument(format!("source {} speed_limit 0 无效", src.id)));
+                        return Err(DownloadError::InvalidArgument(format!(
+                            "source {} speed_limit 0 无效",
+                            src.id
+                        )));
                     }
                     if limit > u32::MAX as u64 {
-                        return Err(DownloadError::InvalidArgument(format!("source {} speed_limit {} 超过 {} 需 ≤4GiB/s", src.id, limit, u32::MAX)));
+                        return Err(DownloadError::InvalidArgument(format!(
+                            "source {} speed_limit {} 超过 {} 需 ≤4GiB/s",
+                            src.id,
+                            limit,
+                            u32::MAX
+                        )));
                     }
                     if let Some(b) = src.burst {
                         if b == 0 {
-                            return Err(DownloadError::InvalidArgument(format!("source {} burst 0 无效", src.id)));
+                            return Err(DownloadError::InvalidArgument(format!(
+                                "source {} burst 0 无效",
+                                src.id
+                            )));
                         }
                         if b > u32::MAX as u64 {
-                            return Err(DownloadError::InvalidArgument(format!("source {} burst {} 超过 {}", src.id, b, u32::MAX)));
+                            return Err(DownloadError::InvalidArgument(format!(
+                                "source {} burst {} 超过 {}",
+                                src.id,
+                                b,
+                                u32::MAX
+                            )));
                         }
                     }
-                    let burst = src.burst.and_then(|b| std::num::NonZeroU32::new(b as u32)).or_else(|| std::num::NonZeroU32::new(64*1024));
+                    let burst = src
+                        .burst
+                        .and_then(|b| std::num::NonZeroU32::new(b as u32))
+                        .or_else(|| std::num::NonZeroU32::new(64 * 1024));
                     let nz = std::num::NonZeroU32::new(limit as u32).unwrap();
                     map.insert(src.id.clone(), Arc::new(RateLimiter::new(nz, burst)));
                 } else if src.burst.is_some() {
-                    return Err(DownloadError::InvalidArgument(format!("source {} burst 需配合 speed_limit", src.id)));
+                    return Err(DownloadError::InvalidArgument(format!(
+                        "source {} burst 需配合 speed_limit",
+                        src.id
+                    )));
                 }
             }
             map
@@ -781,30 +803,48 @@ impl MultiRuntime {
         #[cfg(not(feature = "rate-limit"))]
         let per_source_limiters: HashMap<FastStr, Arc<RateLimiter>> = HashMap::new();
         #[cfg(feature = "rate-limit")]
-        let global_limiter: Option<Arc<RateLimiter>> = if let Some(limit) = config.global_speed_limit {
-            if limit == 0 {
-                return Err(DownloadError::InvalidArgument("global_speed_limit 0 无效".to_string()));
-            }
-            if limit > u32::MAX as u64 {
-                return Err(DownloadError::InvalidArgument(format!("global_speed_limit {} 超过 {} 需 ≤4GiB/s", limit, u32::MAX)));
-            }
-            if let Some(b) = config.global_burst {
-                if b == 0 {
-                    return Err(DownloadError::InvalidArgument("global_burst 0 无效".to_string()));
+        let global_limiter: Option<Arc<RateLimiter>> =
+            if let Some(limit) = config.global_speed_limit {
+                if limit == 0 {
+                    return Err(DownloadError::InvalidArgument(
+                        "global_speed_limit 0 无效".to_string(),
+                    ));
                 }
-                if b > u32::MAX as u64 {
-                    return Err(DownloadError::InvalidArgument(format!("global_burst {} 超过 {}", b, u32::MAX)));
+                if limit > u32::MAX as u64 {
+                    return Err(DownloadError::InvalidArgument(format!(
+                        "global_speed_limit {} 超过 {} 需 ≤4GiB/s",
+                        limit,
+                        u32::MAX
+                    )));
                 }
-            }
-            let burst = config.global_burst.and_then(|b| std::num::NonZeroU32::new(b as u32)).or_else(|| std::num::NonZeroU32::new(64*1024));
-            let nz = std::num::NonZeroU32::new(limit as u32).unwrap();
-            Some(Arc::new(RateLimiter::new(nz, burst)))
-        } else {
-            if config.global_burst.is_some() {
-                return Err(DownloadError::InvalidArgument("global_burst 需配合 global_speed_limit".to_string()));
-            }
-            None
-        };
+                if let Some(b) = config.global_burst {
+                    if b == 0 {
+                        return Err(DownloadError::InvalidArgument(
+                            "global_burst 0 无效".to_string(),
+                        ));
+                    }
+                    if b > u32::MAX as u64 {
+                        return Err(DownloadError::InvalidArgument(format!(
+                            "global_burst {} 超过 {}",
+                            b,
+                            u32::MAX
+                        )));
+                    }
+                }
+                let burst = config
+                    .global_burst
+                    .and_then(|b| std::num::NonZeroU32::new(b as u32))
+                    .or_else(|| std::num::NonZeroU32::new(64 * 1024));
+                let nz = std::num::NonZeroU32::new(limit as u32).unwrap();
+                Some(Arc::new(RateLimiter::new(nz, burst)))
+            } else {
+                if config.global_burst.is_some() {
+                    return Err(DownloadError::InvalidArgument(
+                        "global_burst 需配合 global_speed_limit".to_string(),
+                    ));
+                }
+                None
+            };
         #[cfg(not(feature = "rate-limit"))]
         let global_limiter: Option<Arc<RateLimiter>> = None;
         Ok((
@@ -820,7 +860,12 @@ impl MultiRuntime {
         ))
     }
     pub fn limiter_for_lane(&self, lane_id: &str) -> Option<Arc<RateLimiter>> {
-        let source_id = self.scheduler.lanes.iter().find(|e| e.candidate.lane_id.as_str() == lane_id).map(|e| e.candidate.source_id.clone())?;
+        let source_id = self
+            .scheduler
+            .lanes
+            .iter()
+            .find(|e| e.candidate.lane_id.as_str() == lane_id)
+            .map(|e| e.candidate.source_id.clone())?;
         self.per_source_limiters.get(&source_id).cloned()
     }
 

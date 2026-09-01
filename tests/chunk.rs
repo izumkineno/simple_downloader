@@ -40,7 +40,18 @@ async fn test_chunk_download_success() {
     let chunk_id: ChunkId = 1;
     let end = len - 1;
     let handle = tokio::spawn(async move {
-        chunk_run(chunk_id, cmd_tx, cmd_bd_rx, info_bd_tx.clone(), rb, 0, end, None, None).await;
+        chunk_run(
+            chunk_id,
+            cmd_tx,
+            cmd_bd_rx,
+            info_bd_tx.clone(),
+            rb,
+            0,
+            end,
+            None,
+            None,
+        )
+        .await;
     });
 
     // 收集写入命令
@@ -69,7 +80,11 @@ async fn test_chunk_download_success() {
             diag.push(format!("{:?}", info));
         }
         eprintln!("diag infos before complete check: {:?}", diag);
-        eprintln!("received len {}, expected len {}", received_data.len(), test_data.len());
+        eprintln!(
+            "received len {}, expected len {}",
+            received_data.len(),
+            test_data.len()
+        );
     }
     assert_eq!(received_data, test_data);
 
@@ -220,7 +235,18 @@ async fn test_chunk_200_single_segment_downgrade_allowed() {
 
     let chunk_id: ChunkId = 10;
     let handle = tokio::spawn(async move {
-        chunk_run(chunk_id, cmd_tx, cmd_bd_rx, info_bd_tx.clone(), rb, 0, 9, None, None).await;
+        chunk_run(
+            chunk_id,
+            cmd_tx,
+            cmd_bd_rx,
+            info_bd_tx.clone(),
+            rb,
+            0,
+            9,
+            None,
+            None,
+        )
+        .await;
     });
 
     let mut received = Vec::new();
@@ -239,7 +265,9 @@ async fn test_chunk_200_single_segment_downgrade_allowed() {
                 ok = true;
                 break;
             }
-            DownloadInfo::ChunkFailed { id, .. } if id == chunk_id => panic!("expected downgrade success but got ChunkFailed"),
+            DownloadInfo::ChunkFailed { id, .. } if id == chunk_id => {
+                panic!("expected downgrade success but got ChunkFailed")
+            }
             _ => continue,
         }
     }
@@ -271,7 +299,18 @@ async fn test_chunk_200_multi_segment_rejected() {
 
     let chunk_id: ChunkId = 11;
     let handle = tokio::spawn(async move {
-        chunk_run(chunk_id, cmd_tx, cmd_bd_rx, info_bd_tx.clone(), rb, 10, 19, None, None).await;
+        chunk_run(
+            chunk_id,
+            cmd_tx,
+            cmd_bd_rx,
+            info_bd_tx.clone(),
+            rb,
+            10,
+            19,
+            None,
+            None,
+        )
+        .await;
     });
 
     let mut failed = false;
@@ -282,7 +321,9 @@ async fn test_chunk_200_multi_segment_rejected() {
                 failed = true;
                 break;
             }
-            DownloadInfo::DownloadComplete(id) if id == chunk_id => panic!("multi-segment 200 should not succeed"),
+            DownloadInfo::DownloadComplete(id) if id == chunk_id => {
+                panic!("multi-segment 200 should not succeed")
+            }
             _ => continue,
         }
     }
@@ -315,18 +356,34 @@ async fn test_chunk_206_wrong_content_range_rejected() {
 
     let chunk_id: ChunkId = 12;
     let handle = tokio::spawn(async move {
-        chunk_run(chunk_id, cmd_tx, cmd_bd_rx, info_bd_tx.clone(), rb, 10, 19, None, None).await;
+        chunk_run(
+            chunk_id,
+            cmd_tx,
+            cmd_bd_rx,
+            info_bd_tx.clone(),
+            rb,
+            10,
+            19,
+            None,
+            None,
+        )
+        .await;
     });
 
     let mut failed = false;
     while let Ok(info) = info_bd_rx.recv().await {
         match info {
             DownloadInfo::ChunkFailed { id, error, .. } if id == chunk_id => {
-                assert!(error.contains("Content-Range mismatch") || error.contains("mismatch"), "error should mention mismatch: {error}");
+                assert!(
+                    error.contains("Content-Range mismatch") || error.contains("mismatch"),
+                    "error should mention mismatch: {error}"
+                );
                 failed = true;
                 break;
             }
-            DownloadInfo::DownloadComplete(id) if id == chunk_id => panic!("wrong Content-Range should not succeed"),
+            DownloadInfo::DownloadComplete(id) if id == chunk_id => {
+                panic!("wrong Content-Range should not succeed")
+            }
             _ => continue,
         }
     }
@@ -359,7 +416,18 @@ async fn test_chunk_early_eof_is_failed() {
 
     let chunk_id: ChunkId = 99;
     let handle = tokio::spawn(async move {
-        chunk_run(chunk_id, cmd_tx, cmd_bd_rx, info_bd_tx.clone(), rb, 0, 1023, None, None).await;
+        chunk_run(
+            chunk_id,
+            cmd_tx,
+            cmd_bd_rx,
+            info_bd_tx.clone(),
+            rb,
+            0,
+            1023,
+            None,
+            None,
+        )
+        .await;
     });
 
     let mut received: Vec<u8> = Vec::new();
@@ -376,7 +444,10 @@ async fn test_chunk_early_eof_is_failed() {
     while let Ok(info) = info_bd_rx.recv().await {
         match info {
             DownloadInfo::ChunkFailed { id, error, .. } if id == chunk_id => {
-                assert!(error.contains("early EOF"), "error should mention early EOF: {error}");
+                assert!(
+                    error.contains("early EOF"),
+                    "error should mention early EOF: {error}"
+                );
                 failed = true;
                 break;
             }
@@ -420,7 +491,18 @@ async fn test_chunk_request_failure() {
     // 启动chunk任务
     let chunk_id: ChunkId = 1;
     let handle = tokio::spawn(async move {
-        chunk_run(chunk_id, cmd_tx, cmd_bd_rx, info_bd_tx.clone(), rb, 0, 100, None, None).await;
+        chunk_run(
+            chunk_id,
+            cmd_tx,
+            cmd_bd_rx,
+            info_bd_tx.clone(),
+            rb,
+            0,
+            100,
+            None,
+            None,
+        )
+        .await;
     });
 
     // 检查是否收到失败消息

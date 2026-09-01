@@ -1,18 +1,18 @@
 # 错误码说明
 
 本文档详细介绍 simple_downloader 中可能出现的所有错误类型，以及对应的原因和处理方案。
-
-## 错误类型总览（以 `src/types.rs:DownloadError` 为准，当前无数字错误码）
+## 错误类型总览（以 `src/types.rs:DownloadError` 为准，当前无数字错误码，`0.6.x` 含 `InvalidArgument`/`PermanentFailure`）
 
 | 错误类型 | 变体 | 说明 | 可重试 |
 |----------|------|------|--------|
 | 网络请求错误 | `DownloadError::Request(reqwest::Error)` | HTTP 请求过程中发生的错误 | ✅ 大部分情况可重试 |
-| 文件 I/O 错误 | `DownloadError::Io(io::Error)` | 本地文件读写操作发生的错误 | ❌ 一般不可重试 |
+| 文件 I/O 错误 | `DownloadError::Io(io::Error)` | 本地文件读写操作发生的错误 | ❌ 一般不可重试（`ENOSPC` 在 `write/flush` 透传） |
 | 并发任务错误 | `DownloadError::Join(JoinError)` | 异步任务执行过程中发生的错误 | ✅ 可重试 |
-| 缺少长度错误 | `DownloadError::MissingContentLength` | 服务器未返回 Content-Length（自动回退流式下载） | ✅ 自动回退，无需重试 |
+| 缺少长度错误 | `DownloadError::MissingContentLength` | 服务器未返回 Content-Length（`0.3.1+` 自动回退单流流式 `total_size=0`） | ✅ 自动回退，无需重试 |
 | 多源下载错误 | `DownloadError::NoAvailableSources` | 多源模式下无可用源 | ✅ 可重试 |
-| 断点续传错误 | `DownloadError::ResumeTargetMissing` / `ResumeMetadata(String)` | 断点续传相关错误 | ❌ 需清理后重试 |
-## 详细错误说明
+| 断点续传错误 | `DownloadError::ResumeTargetMissing(PathBuf)` / `ResumeMetadata(String)` | 断点续传相关错误 | ❌ 需清理后重试 |
+| 永久失败 | `DownloadError::PermanentFailure(String)` | `RetryHandler` 跨周期 `MAX_TOTAL_ATTEMPTS=30` 熔断 | ❌ 需检查网络/源 |
+| 参数校验 | `DownloadError::InvalidArgument(String)` | `rate-limit` `speed_limit/burst` `0/>u32::MAX` 或 `burst 需配合 speed_limit` 等 | ❌ 修正参数后重试 |
 
 ### 1. 网络请求错误 (Request)
 
@@ -300,8 +300,6 @@ async fn download_with_retry(url: &str, output_path: &str, max_retries: u32) -> 
         }
     }
 }
-```
-
 ### 2. 用户友好的错误提示
 
 ```rust
@@ -325,32 +323,43 @@ fn format_error(e: &DownloadError) -> String {
                 _ => format!("文件读写错误: {}", io_e),
             }
         }
-        DownloadError::MissingContentLength => "服务器不支持获取文件大小，建议使用单线程下载".to_string(),
+        DownloadError::MissingContentLength => "服务器不支持获取文件大小，已自动回退单流流式，流式亦失败时才透传".to_string(),
         DownloadError::NoAvailableSources => "所有下载源都不可用".to_string(),
         DownloadError::ResumeTargetMissing(_) => "断点续传的目标文件不存在，需要重新下载".to_string(),
         DownloadError::ResumeMetadata(_) => "断点续传数据损坏，需要重新下载".to_string(),
+        DownloadError::PermanentFailure(msg) => format!("重试熔断（30次总量）：{msg}"),
+        DownloadError::InvalidArgument(msg) => format!("参数校验：{msg}"),
         _ => format!("下载失败: {}", e),
     }
 }
 ```
 
+### 8. 永久失败（PermanentFailure）
+
+**触发**：`RetryHandler` 跨 `retry_queue 10` + `delayed 10s` 总量 `30` 熔断，`monitor::run` 返回 `Err` 并 `TerminateAll`。
+
+**处理**：`Request/Join` 可重试；`PermanentFailure` 说明网络/源持续不可用，需换源或降并发后重试。
+
+### 9. 参数校验（InvalidArgument）
+
+**触发**：`rate-limit` 下 `speed_limit 0` / `burst 0` / `burst 需配合 speed_limit` / `>u32::MAX` 均 `Err(InvalidArgument)`（`downloader.rs:run_internal` / `lane.rs:from_config`）。
+
+**处理**：修正参数后重试，`burst None` 默认 `64KiB` 硬限。
+
 ## 错误调试技巧
 
 1. **启用详细日志**：
    ```rust
-   // 在程序开头添加日志初始化
-   env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("simple_downloader=debug"))
-       .init();
+   // simple_downloader 使用 tracing，需初始化订阅者
+   simple_downloader::trace::init_tracing();
+   // 或 RUST_LOG=simple_downloader=debug cargo run --example download
    ```
 
 2. **捕获错误上下文**：
    使用 `thiserror` 和 `anyhow` 库可以保留更多错误上下文信息，便于调试。
 
 3. **检查临时文件**：
-   断点续传的元数据文件默认保存在与输出文件相同的目录下，后缀为 `.resume`，可以检查该文件内容是否正常。
-
-## 常见问题排查
-
+   断点续传的元数据文件后缀为 `*.download.bitcode`（`src/resume.rs:RESUME_EXTENSION`），成功自动删除，中断残留含 `version/file_size/segment_size` 校验；`queue` 的 `pending_deletes` 延迟删亦在此目录。
 ### Q: 总是出现 "网络请求失败: 连接超时"
 A: 
 - 检查网络连接是否正常

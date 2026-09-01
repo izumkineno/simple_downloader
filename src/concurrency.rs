@@ -83,7 +83,11 @@ impl ConcurrencyManager {
 
     /// 使用指定的 update_interval 创建实例，Monitor 应传入真实间隔以自适应观察期。
     pub fn new_with_interval(max_workers: u64, update_interval: f64) -> Self {
-        let interval = if update_interval > 0.0 { update_interval } else { 0.5 };
+        let interval = if update_interval > 0.0 {
+            update_interval
+        } else {
+            0.5
+        };
         ::tracing::debug!(max_workers, interval, "ConcurrencyManager created");
         Self {
             max_workers,
@@ -108,7 +112,11 @@ impl ConcurrencyManager {
     pub fn set_max_workers(&mut self, workers: u64) {
         let w = workers.max(1);
         if w != self.max_workers {
-            ::tracing::info!(old = self.max_workers, new = w, "concurrency max_workers hot-update");
+            ::tracing::info!(
+                old = self.max_workers,
+                new = w,
+                "concurrency max_workers hot-update"
+            );
             self.max_workers = w;
         }
     }
@@ -267,7 +275,9 @@ impl ConcurrencyManager {
                 avg_kbs = avg_speed / 1024.0,
                 est_s = estimated_time,
                 threshold = Self::adaptive_remaining_threshold(state.total_file_size),
-                remaining = state.total_file_size.saturating_sub(state.total_downloaded()),
+                remaining = state
+                    .total_file_size
+                    .saturating_sub(state.total_downloaded()),
                 "probing: split not useful"
             );
             return;
@@ -360,9 +370,8 @@ impl ConcurrencyManager {
         // 3. 分割是有用的（按文件大小自适应）
         let threshold = self.recent_best_speed * STABLE_SPLIT_THRESHOLD;
         let useful = self.split_is_useful(state, avg_speed, estimated_time);
-        let should_consider_split = avg_speed < threshold
-            && active_chunks < self.max_workers
-            && useful;
+        let should_consider_split =
+            avg_speed < threshold && active_chunks < self.max_workers && useful;
 
         ::tracing::debug!(
             avg_kbs = avg_speed / 1024.0,
@@ -373,7 +382,9 @@ impl ConcurrencyManager {
             max = self.max_workers,
             est_s = estimated_time,
             adaptive_threshold = Self::adaptive_remaining_threshold(state.total_file_size),
-            remaining = state.total_file_size.saturating_sub(state.total_downloaded()),
+            remaining = state
+                .total_file_size
+                .saturating_sub(state.total_downloaded()),
             useful = useful,
             should_split = should_consider_split,
             "stable::ready check"
@@ -472,7 +483,12 @@ impl ConcurrencyManager {
             collected_samples: 0,
             best_speed_seen: current_speed,
         });
-        ::tracing::debug!(chunk_id = id, pre_kbs = current_speed / 1024.0, required_samples = required, "stable -> Observing");
+        ::tracing::debug!(
+            chunk_id = id,
+            pre_kbs = current_speed / 1024.0,
+            required_samples = required,
+            "stable -> Observing"
+        );
     }
 
     /// 发送一个分割请求。
@@ -502,7 +518,9 @@ impl ConcurrencyManager {
             return false;
         }
         // M3-02: 极小剩余量不值得再分，避免碎片；门槛提升至 256KiB（覆盖原 40KiB），防止小文件过度分裂
-        let remaining = state.total_file_size.saturating_sub(state.total_downloaded());
+        let remaining = state
+            .total_file_size
+            .saturating_sub(state.total_downloaded());
         if remaining < 256 * 1024 {
             return false;
         }
