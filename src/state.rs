@@ -91,7 +91,7 @@ impl ChunkState {
             return;
         }
         let mut instantaneous_speed = newly_downloaded as f64 / elapsed;
-        const MAX_SINGLE_CHUNK_BPS: f64 = 200.0 * 1024.0 * 1024.0;
+        const MAX_SINGLE_CHUNK_BPS: f64 = 80.0 * 1024.0 * 1024.0;
         if instantaneous_speed > MAX_SINGLE_CHUNK_BPS {
             instantaneous_speed = MAX_SINGLE_CHUNK_BPS;
         }
@@ -167,12 +167,13 @@ impl DownloadState {
     /// 计算当前已下载的总字节数。
     /// 这是已完成块的字节数和所有活跃块当前已下载字节数的总和。
     pub fn total_downloaded(&self) -> u64 {
-        self.completed_bytes
+        (self.completed_bytes
             + self
                 .chunks
                 .values()
                 .map(|c| c.downloaded_bytes)
-                .sum::<u64>()
+                .sum::<u64>())
+        .min(self.total_file_size)
     }
 
     /// 计算当前的总下载速度。
@@ -183,7 +184,7 @@ impl DownloadState {
 
     /// 检查下载是否已完成。
     pub fn is_download_finished(&self) -> bool {
-        self.total_downloaded() >= self.total_file_size
+        self.completed_bytes >= self.total_file_size
     }
 }
 

@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use tokio::time::interval;
 
 /// 用于速度计算的平滑因子，0.30 更快响应新建连接的带宽变化，利于探测增益
-const SMOOTHING_FACTOR: f64 = 0.15;
+const SMOOTHING_FACTOR: f64 = 0.10;
 
 /// 下载监控器，充当状态、重试和并发管理的协调器。
 pub struct DownloadMonitor {
@@ -446,6 +446,11 @@ impl DownloadMonitor {
                     pending = self.pending_bisects.len(),
                     "ChunkBisected"
                 );
+                // 立刻收缩原块 end，避免后续 DownloadComplete 按旧 size() 双计导致已下载>>总量
+                let bisect_mid = new_start.saturating_sub(1);
+                if let Some(chunk) = self.state.chunks.get_mut(&original_id) {
+                    chunk.update_end_byte(bisect_mid);
+                }
                 // 尝试为新区间分配 lane；若容量不足则缓冲至 pending_bisects，避免丢范围
                 let Some((lane_id, rb)) = build_request(client, url, multi_runtime.as_mut()) else {
                     ::tracing::warn!(

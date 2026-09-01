@@ -113,10 +113,14 @@ pub(crate) async fn chunk_run_with_reliable(
         "chunk start"
     );
     // 构建 Range 请求头，确保携带 User-Agent（保留用户自定义，仅缺失时注入默认值）
+    // 强制 identity 避免服务器对 Range 响应做 gzip 压缩导致 "error decoding response body"（reqwest 默认自动解压对 Range 分片不适用）
     let range_header = format!("bytes={start_byte}-{end_byte}");
-    let response = match ensure_user_agent(rb.header("Range", range_header.clone()))
-        .send()
-        .await
+    let response = match ensure_user_agent(
+        rb.header("Range", range_header.clone())
+            .header(reqwest::header::ACCEPT_ENCODING, "identity"),
+    )
+    .send()
+    .await
     {
         Ok(resp) => {
             ::tracing::debug!(

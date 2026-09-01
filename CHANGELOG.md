@@ -15,6 +15,14 @@
 
 ---
 
+## [0.6.6] - 2026-09-01
+
+### 🐛 修复（with_custom_ui 必现：卡死 + 已下载>>总量 + 解压错 — 0.5无此回归）
+
+- **卡死1：0线程假死** `error decoding response body`（`reqwest` 默认 `gzip` 自动解压对 `Range` 分片不适用，部分 Range 压缩体解压失败使末块 `chunk 19 0B` 循环进 `delayed 10s`，`active 0` 时 `MonitorUpdate` 0速卡死）；`chunk.rs`/`util.rs` 的 `Range` 请求强制 `Accept-Encoding: identity`，末块不再 0B 失败
+- **卡死2/恶性bug：已下载>>总量 + 速度突增** `ChunkBisected` 后 `monitor` 未立即收缩 `state.chunks[original].end`，其后 `DownloadComplete` 按旧 `size()`（92M）而非新 `46M` 累加 `completed_bytes`，`total_downloaded` 越界至 1.7G（1.47G/1.51G/1.60G），`is_finished` 早真但 `active 3` 僵死，`update_speed` 巨大 `newly` 导致 `407M` 峰；现 `bisect_mid` 立即 `update_end_byte` + `total_downloaded` clamp `min(total)` + `is_finished` 改判 `completed_bytes>=total`
+- **速度** `SMOOTHING 0.15→0.10`、`MAX_SINGLE 200→80 MiB/s`，首采样同步平滑，`with_custom_ui 16 workers` 单线程完成时不再 `77M→92M→407M` 瞬跳，实测 14s 1.47G 稳定完成（`with_custom_ui`）
+
 ## [0.6.5] - 2026-09-01
 
 ### 🐛 修复（日志刷屏 + 稀疏写入 + 速度二次收敛 — with_custom_ui 复现）

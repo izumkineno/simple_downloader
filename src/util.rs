@@ -69,9 +69,14 @@ pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
 
     ::tracing::debug!(head_size = ?head_size, head_support, "HEAD probe result");
     // 2. 范围 GET 探测：以 206/ Content-Range 为金标准，失败则回退 HEAD 避免 501 误判
-    let range_resp = match ensure_user_agent(client.get(url).header("Range", "bytes=0-0"))
-        .send()
-        .await
+    let range_resp = match ensure_user_agent(
+        client
+            .get(url)
+            .header("Range", "bytes=0-0")
+            .header(reqwest::header::ACCEPT_ENCODING, "identity"),
+    )
+    .send()
+    .await
     {
         Ok(resp) => {
             ::tracing::debug!(status = %resp.status(), headers = ?resp.headers(), "Range GET probe");
