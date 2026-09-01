@@ -15,6 +15,22 @@
 
 ---
 
+## [0.6.7] - 2026-09-02
+
+### 🐛 修复（with_custom_ui 重试期 293MB/s 假象 + 卡大速度 + 落盘校验 — 0.6.6 回归）
+
+- **卡大速度1：停滞线程速度不衰减** `state.rs:update_speed` `newly==0 return` 保持旧速，`with_custom_ui` 重试期 16 线程各 `~18MB/s` 的 `downloaded` 14s 不动仍 `total 293.68MB/s`；现 `instant=0` 走 `EMA 0*0.3+old*0.7` 每 tick 衰 0.7，5s 内归零，与 `aria2/curl` 窗口 `0/elapsed=0` 一致，`regression_speed_zero_delta` 同步改为衰减断言
+- **卡大速度2：非正常线程计速** `state.rs:total_speed` 全量 `sum(all)` + `monitor::handle_tick` 全量 `update_speed`，`status=1/2/3` 仍计入；现 `total_speed filter(status==0)` + `tick status!=0→speed=0 skip` + `monitor::send_monitor_update` `normal_chunk_count==0?0:window>0?window:per_sum`，全重试期立即 0
+- **速度口径对齐主流** 新增 `src/speed.rs SpeedEstimator 5s 窗口 (latest-oldest)/elapsed`（`aria2 SpeedCalc 10s桶/curl ring 5-10s`），`monitor` `global_estimator.observe(total)` 为权威 `total_speed`（`2GiB/s` 上界），`SMOOTHING 0.10→0.30` 回主流，`MAX_SINGLE 80→200 MiB/s`，贴近系统任务管理器
+- **落盘金标准** `downloader.rs:run_internal` `orchestrate+writer TerminateAll/await` 后 `metadata.len()!=file_size → UnexpectedEof` 保留 `*.download.bitcode` 不删（`aria2 actualFileSize==totalLength`），`resume::save_atomic` `MoveFileExW REPLACE|WRITE_THROUGH` + `__temp/pid.tmp` + `lastDigest` 去重 + `writer retry3/WARN`
+- **Range 解压** `chunk.rs/util.rs` 的 `Range` 强制 `identity` 已在 `0.6.6` 落地，本版保持
+
+### ✅ 测试
+
+- `cargo test --all-features 40 passed 2.5s`，`cargo clippy --all-features -D warnings 0`
+
+---
+
 ## [0.6.6] - 2026-09-01
 
 ### 🐛 修复（with_custom_ui 必现：卡死 + 已下载>>总量 + 解压错 — 0.5无此回归）

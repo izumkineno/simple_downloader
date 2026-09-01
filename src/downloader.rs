@@ -665,6 +665,28 @@ where
         }
         orchestrate_result?;
         writer_result?;
+        // 主流收口校验（aria2 pieceStorage->allDownloadFinished / actualFileSize==totalLength）：
+        // monitor 的 completed_bytes 与 clamp 的 total_downloaded 可能在 Lagged/双计等边界下虚报 100%，
+        // 必须以落盘文件长度为金标准，否则不删 sidecar 并报错以便 resume 重试，而非假完成卡死。
+        if file_size > 0 {
+            match tokio::fs::metadata(&writer_path_string).await {
+                Ok(meta) => {
+                    let actual = meta.len();
+                    if actual != file_size {
+                        ::tracing::error!(expected = file_size, actual, path = %writer_path, "final file size mismatch, download incomplete (aria2 allDownloadFinished fail)");
+                        // 保留 sidecar 供断点续传
+                        return Err(DownloadError::Io(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            format!("incomplete download: expected {file_size} got {actual}"),
+                        )));
+                    }
+                }
+                Err(e) => {
+                    ::tracing::error!(error = %e, path = %writer_path, "failed to stat output file for final verification");
+                    return Err(DownloadError::Io(e));
+                }
+            }
+        }
         #[cfg(feature = "resume")]
         {
             // M3-04: 下载成功后清理 sidecar，重试 3 次避免偶发 PermissionDenied/文件占用导致泄漏

@@ -86,18 +86,15 @@ impl ChunkState {
         let newly_downloaded = self
             .downloaded_bytes
             .saturating_sub(self.last_sampled_bytes);
-        if newly_downloaded == 0 {
-            self.last_sampled_bytes = self.downloaded_bytes;
-            return;
-        }
         let mut instantaneous_speed = newly_downloaded as f64 / elapsed;
-        const MAX_SINGLE_CHUNK_BPS: f64 = 80.0 * 1024.0 * 1024.0;
+        const MAX_SINGLE_CHUNK_BPS: f64 = 200.0 * 1024.0 * 1024.0;
         if instantaneous_speed > MAX_SINGLE_CHUNK_BPS {
             instantaneous_speed = MAX_SINGLE_CHUNK_BPS;
         }
+        // 非正常下载线程的速度已在 monitor 侧置 0 并跳过，但此处仍需对停滞（0增量）做 EMA 衰减，
+        // 否则重试期 downloaded 停滞时速度卡大值（with_custom_ui 293MB/s 14s 假象）
         if self.speed == 0.0 {
-            // 首采样同样平滑，避免首个 46M/0.2s 瞬时 230M 直接污染 total
-            self.speed = instantaneous_speed * smoothing_factor;
+            self.speed = instantaneous_speed;
         } else {
             self.speed =
                 (instantaneous_speed * smoothing_factor) + (self.speed * (1.0 - smoothing_factor));
@@ -177,9 +174,18 @@ impl DownloadState {
     }
 
     /// 计算当前的总下载速度。
-    /// 这是所有活跃块速度的总和。
+    /// 仅统计正常下载中（status==0）的块，排除重试/等待/延迟/完成/失败等非正常线程，避免重试抖动虚高。
     pub fn total_speed(&self) -> f64 {
-        self.chunks.values().map(|c| c.speed).sum::<f64>()
+        self.chunks
+            .values()
+            .filter(|c| c.status == 0)
+            .map(|c| c.speed)
+            .sum::<f64>()
+    }
+
+    /// 正常下载线程数（status==0），供监控与自适应并发参考
+    pub fn normal_chunk_count(&self) -> usize {
+        self.chunks.values().filter(|c| c.status == 0).count()
     }
 
     /// 检查下载是否已完成。
@@ -249,8 +255,10 @@ mod tests {
         chunk.update_downloaded(100);
         chunk.update_speed(0.5, 0.30);
         let speed1 = chunk.speed;
-        // 无新数据时不应突变，last_sampled 更新后 speed 保持
+        // 无新数据时应 EMA 衰减而非卡死，避免 with_custom_ui 重试期 293MB/s 假象
         chunk.update_speed(0.5, 0.30);
-        assert_eq!(chunk.speed, speed1, "zero delta should not change speed");
+        let expected = speed1 * (1.0 - 0.30);
+        assert!((chunk.speed - expected).abs() < 1e-6, "zero delta should decay via EMA");
+        assert!(chunk.speed < speed1, "stalled speed must decay");
     }
 }
