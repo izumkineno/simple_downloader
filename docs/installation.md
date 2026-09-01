@@ -24,13 +24,13 @@ rustup update
 
 ```toml
 [dependencies]
-simple_downloader = "0.6.2"
+simple_downloader = "0.6.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
 此时可用 `Downloader::builder(url, path).download().await`，未启用 `resume/progress/multi-source/proxy`。
 
-> `simple_downloader = "0.6.2"` **不会** 默认启用任何可选功能，旧文“默认启用所有”已过时。
+> `simple_downloader = "0.6.3"` **不会** 默认启用任何可选功能，旧文“默认启用所有”已过时。
 ## 自定义 Feature 安装
 
 以 `Cargo.toml:14-19` 与 `docs/usage.md:25` 为准：
@@ -127,7 +127,7 @@ cargo run
 | 0.3.x | 1.85 | `tokio 1.52` `reqwest 0.13` `thiserror 2` `bytes 1` `faststr 0.2` `futures-util 0.3` `bitcode 0.6` (resume) `parking_lot 0.12` |
 | 0.2.x | 1.85 | 同 0.3.x，逻辑加固与测试补齐 |
 | 0.1.x | 1.85 | 同 0.2.x，API 兼容，仅性能与文档差异 |
-> 当前 `Cargo.toml:3` 为 `0.6.2`，`master` 头含 `b4fcadf`/`eef24ea` 两补丁待 `0.6.3` 发版，上表以 `0.6.x` 行覆盖。
+> 当前 `Cargo.toml:3` 为 `0.6.3`，上表以 `0.6.x` 行覆盖（`b4fcadf/eef24ea/全局热更` 已在 `0.6.3` 发版）。
 ## Cargo 配置优化（可选）
 
 `~/.cargo/config.toml`:

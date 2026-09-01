@@ -188,12 +188,26 @@ async fn ac3_cancel() {
     let id = queue.enqueue(url, out.clone()).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     queue.cancel(id.clone()).await.unwrap();
+    // Active cancel uses pending_deletes 200ms deferred delete (Windows file lock + file_writer flush)
+    // Poll until file is gone to avoid flaky immediate assert
+    for _ in 0..20 {
+        if !out.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     let snap = queue.query(id.clone()).await.unwrap();
     assert_eq!(snap.state, TaskState::Removed);
-    assert!(!out.exists(), "file should be deleted after cancel");
+    assert!(!out.exists(), "file should be deleted after cancel (deferred 200ms)");
     #[cfg(feature = "resume")]
     {
         let sidecar = simple_downloader::metadata_path_for(&out);
+        for _ in 0..20 {
+            if !sidecar.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert!(!sidecar.exists(), "sidecar should be deleted after cancel");
     }
     tokio::time::timeout(Duration::from_secs(2), queue.wait_all())
