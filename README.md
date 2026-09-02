@@ -175,6 +175,14 @@ async fn main() {
 cargo run --features progress --example with_custom_ui
 ```
 
+##### 限速演示（`rate-limit` feature）
+
+```bash
+cargo run --features rate-limit,progress --example with_rate_limit
+cargo run --features rate-limit,progress --example with_rate_limit -- --multi
+```
+单源全局限速与多源 `SourceConfig::with_speed_limit` + `MultiSourceConfig::with_global_speed_limit` 双桶 `tokio::join` 演示，详见 `docs/usage.md:9` 与 `docs/configuration.md:限速`。
+
 #### 架构概览
 
 README 中的图只保留概念级视角；更完整、权威的运行时时序、重试与动态分片细节见 [`docs/architecture.md`](docs/architecture.md)。

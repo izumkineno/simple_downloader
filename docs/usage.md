@@ -12,11 +12,12 @@
 - [6. 场景三：进度监控](#6-场景三进度监控progress)
 - [7. 场景四：多源下载](#7-场景四多源下载multi-source)
 - [8. 场景五：代理](#8-场景五代理proxy)
-- [9. 场景六：自定义 HTTP 客户端](#9-场景六自定义-http-客户端)
-- [10. 错误处理模板](#10-错误处理模板)
-- [11. 并发与自动降级](#11-并发与自动降级)
-- [12. 完整示例索引](#12-完整示例索引)
-- [13. 调用检查清单](#13-调用检查清单)
+- [9. 场景六：限速](#9-场景六限速rate-limit)
+- [10. 场景七：自定义 HTTP 客户端](#10-场景七自定义-http-客户端)
+- [11. 错误处理模板](#11-错误处理模板)
+- [12. 并发与自动降级](#12-并发与自动降级)
+- [13. 完整示例索引](#13-完整示例索引)
+- [14. 调用检查清单](#14-调用检查清单)
 
 ---
 
@@ -76,14 +77,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 | 方法 | Feature | 说明 | 示例 |
 |---|---|---|---|
-| `workers(n)` | — | 并发上限，`max(1, n)`，实际生效受 §11 约束 | `.workers(16)` |
+| `workers(n)` | — | 并发上限，`max(1, n)`，实际生效受 §12 约束 | `.workers(16)` |
 | `update_interval(secs)` | — | `MonitorUpdate` 广播间隔，`>0` 生效，默认 `0.5` | `.update_interval(1.0)` |
-| `client_builder(\|\| ClientBuilder::new()...)` | — | 注入 `reqwest::ClientBuilder` 闭包，见 §9 | `.client_builder(\|\| ClientBuilder::new().timeout(...))` |
+| `client_builder(\|\| ClientBuilder::new()...)` | — | 注入 `reqwest::ClientBuilder` 闭包，见 §10 | `.client_builder(\|\| ClientBuilder::new().timeout(...))` |
 | `resume(bool)` | `resume` | 显式开关断点续传，默认 `true`（当 feature 启用时） | `.resume(false)` |
+| `speed_limit(bps)` | `rate-limit` | 全局限速，`0`/`>u32::MAX` 校验，`burst` 需配合 | `.speed_limit(1024*1024)` |
+| `with_burst(bytes)` | `rate-limit` | 突发容量，默认 64 KiB | `.with_burst(64*1024)` |
 | `build() -> Downloader` | — | 产出下载器，复用或进一步 `with_resume()` | `let dl = builder.build();` |
 | `download().await` | — | 消费 `self` 直接下载 | `builder.download().await?;` |
 | `run(handler).await` | `progress` | 消费 `self` 并注入进度回调 | `builder.run(\|total, rx\| async move {...}).await?;` |
-
 `Downloader` 侧同名方法：`with_resume(bool)`（`resume`）、`download().await`、`run(handler).await`（`progress`）、`new_multi(config, client_builder)`（`multi-source`）。
 
 ---
@@ -120,10 +122,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## 5. 场景二：断点续传（`resume`）
 
 启用 `resume` 后，`Downloader` 自动在 `output_path` 同级维护 `output_path.download.bitcode` sidecar（`src/resume.rs:RESUME_EXTENSION`），基于固定 `64 KiB` segment 哈希校验恢复，非简单追文件长度。
-
 ```toml
 [dependencies]
-simple_downloader = { version = "0.3", features = ["resume"] }
+simple_downloader = { version = "0.5", features = ["resume"] }
 ```
 
 ```rust
@@ -177,7 +178,7 @@ let meta = ResumeMetadata::new(file_size, DEFAULT_SEGMENT_SIZE);
 
 ```toml
 [dependencies]
-simple_downloader = { version = "0.3", features = ["progress"] }
+simple_downloader = { version = "0.5", features = ["progress"] }
 ```
 
 `run(handler)` 将 `total_size: u64` 与 `broadcast::Receiver<DownloadInfo>` 交给调用方，调用方在独立 task 中消费事件。`DownloadInfo` 变体见 `src/types.rs:99-187`。
@@ -238,7 +239,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```toml
 [dependencies]
-simple_downloader = { version = "0.3", features = ["multi-source", "progress"] }
+simple_downloader = { version = "0.5", features = ["multi-source", "progress"] }
 ```
 
 ```rust
@@ -299,7 +300,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```toml
 [dependencies]
-simple_downloader = { version = "0.3", features = ["proxy", "progress"] }
+simple_downloader = { version = "0.5", features = ["proxy", "progress"] }
 ```
 
 ```rust
@@ -324,13 +325,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`ProxyConfig` 构造（`src/lane.rs:24-43`）：`ProxyConfig::http(url)`、`ProxyConfig::https(url)`、`ProxyConfig::socks5(url)`，亦可通过 `client_builder` 直接注入 `reqwest::Proxy`（见 §9）。
+`ProxyConfig` 构造（`src/lane.rs:50-86`）：`ProxyConfig::http(url)`、`ProxyConfig::https(url)`、`ProxyConfig::socks5(url)`，亦可通过 `client_builder` 直接注入 `reqwest::Proxy`（见 §10）。
 
 环境变量自动识别：`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY`（由 `reqwest` 底层处理）。
 
 ---
 
-## 9. 场景六：自定义 HTTP 客户端
+## 9. 场景六：限速（`rate-limit`）
+
+基于 `governor 0.7` 令牌桶，`1 token = 1 byte`，全局与分源两级串联 `tokio::join!` 取 `max`，`burst` 默认 `64 KiB`，全局为硬上限，限速期冻结并发自适应。
+
+```toml
+[dependencies]
+simple_downloader = { version = "0.5", features = ["rate-limit", "progress"] }
+```
+
+```rust
+use simple_downloader::Downloader;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 单源全局限速 1 MiB/s
+    Downloader::builder("https://example.com/file.bin", "output.bin")
+        .speed_limit(1024 * 1024)
+        .with_burst(64 * 1024)
+        .download()
+        .await?;
+    Ok(())
+}
+```
+
+```rust
+use simple_downloader::{Downloader, MultiSourceConfig, SourceConfig};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 多源：分源 300 KiB/s + 全局 512 KiB/s 硬上限
+    let cfg = MultiSourceConfig::new("output.bin", 32, 0.5)
+        .with_sources(vec![
+            SourceConfig::new("https://mirror1.example.com/file.bin")
+                .with_speed_limit(300 * 1024)
+                .with_burst(64 * 1024),
+            SourceConfig::new("https://mirror2.example.com/file.bin")
+                .with_speed_limit(300 * 1024),
+        ])
+        .with_global_speed_limit(512 * 1024)
+        .with_global_burst(64 * 1024);
+
+    Downloader::new_multi(cfg, Default::default).download().await?;
+    Ok(())
+}
+```
+
+校验（`src/downloader.rs:run_internal`）：`speed_limit == 0` / `burst == 0` / `burst` 无 `speed_limit` / `> u32::MAX` 均 `Err(InvalidArgument)`。完整演示见 `examples/with_rate_limit.rs`（单源 `cargo run --features rate-limit,progress --example with_rate_limit` / 多源 `... -- --multi`）。
+
+---
+
+## 10. 场景七：自定义 HTTP 客户端
 
 所有场景均可通过 `client_builder` 注入 `reqwest::ClientBuilder`，用于超时、TLS、Header、连接池等。
 
@@ -352,7 +403,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // 自定义 Header
                 .default_headers({
                     let mut h = reqwest::header::HeaderMap::new();
-                    h.insert("User-Agent", "simple_downloader/0.3".parse().unwrap());
+                    h.insert("User-Agent", "simple_downloader/0.5".parse().unwrap());
                     h
                 })
                 // 危险：仅测试环境
@@ -379,21 +430,21 @@ Downloader::builder("https://example.com/file.bin", "output.bin")
 
 > `client_builder` 为 `Fn() -> ClientBuilder`，每次探测/重试会重新 `build()`，确保多源场景下每个 lane 独立 `Client`。
 
----
+## 11. 错误处理模板
 
-## 10. 错误处理模板
-
-完整错误变体与重试建议见 [`errors.md`](./errors.md)。`src/types.rs:14-82` 定义：
+完整错误变体与重试建议见 [`errors.md`](./errors.md)。`src/types.rs:15-90` 定义：
 
 | 变体 | 场景 | 可重试 |
 |---|---|---|
 | `Request(reqwest::Error)` | 网络/DNS/超时/4xx/5xx/TLS | 部分（超时/5xx） |
 | `Io(io::Error)` | 磁盘满/权限/占用 | 否 |
 | `Join(JoinError)` | task panic/取消 | 是 |
-| `MissingContentLength` | 无 `Content-Length` | 否（需降级单线程） |
+| `MissingContentLength` | 无 `Content-Length`（0.3.1+ 自动流式回退） | 否（预探测后流式） |
 | `NoAvailableSources` | 多源全不可用 | 是（增源后） |
 | `ResumeTargetMissing(PathBuf)` | sidecar 存在但文件缺失 | 否 |
 | `ResumeMetadata(String)` | 元数据损坏/版本不兼容 | 否 |
+| `PermanentFailure(String)` | 达 `MAX_TOTAL_ATTEMPTS=30` 熔断 | 否 |
+| `InvalidArgument(String)` | `rate-limit` 参数校验等 | 否 |
 
 ```rust
 use simple_downloader::{Downloader, DownloadError};
@@ -426,7 +477,7 @@ async fn download_with_retry(url: &str, path: &str) -> Result<(), DownloadError>
 
 ---
 
-## 11. 并发与自动降级
+## 12. 并发与自动降级
 
 `src/downloader.rs:502-510` 实际生效并发：
 
@@ -436,18 +487,18 @@ if !support_ranges || workers == 1 || file_size < 1 MiB { 1 } else { workers }
 
 - 服务器不支持 `Range` → 强制单线程，忽略 `workers`。
 - 文件 `< 1 MiB` → 单线程，避免分片开销。
-- 运行时 `DownloadState`/`ConcurrencyManager` 在 `Probing -> Stable` 两阶段动态探测带宽，自动分裂最慢可分片块（`state.rs:is_splittable` 要求 `remaining >= 20 KiB`），无需调用方干预。详见 `architecture.md:动态分片` 与 `tests/concurrency.rs`。
+- 运行时 `DownloadState`/`ConcurrencyManager` 在 `Probing -> Stable` 两阶段动态探测带宽，自动分裂最慢可分片块（`state.rs:is_splittable` 要求 `remaining >= 20 KiB`，即 `MIN_CHUNK_SIZE 10 KiB ×2`），无需调用方干预；限速启用时冻结分片。详见 `architecture.md:动态分片` 与 `tests/concurrency.rs`。
 
 建议：小文件 `<100 MiB` 用 `4-8` workers，大文件 `>1 GiB` 用 `16-32`，多源可 `32-64` 但不超过 `源数×4`。
-
 ---
 
-## 12. 完整示例索引
+## 13. 完整示例索引
 
 | 示例 | 路径 | Feature | 说明 |
 |---|---|---|---|
 | 基础下载 | `examples/download.rs` | — | 单源最小调用 |
 | 自定义 UI | `examples/with_custom_ui.rs` | `progress` | `indicatif::MultiProgress` 总进度+分块进度条 |
+| 限速演示 | `examples/with_rate_limit.rs` | `rate-limit,progress` | 单源 `speed_limit/with_burst` + 多源 `SourceConfig::with_speed_limit` / `MultiSourceConfig::with_global_speed_limit`（`-- --multi`） |
 | 断点续传子进程 | `examples/resume_harness.rs` | `resume,multi-source` | `single`/`multi` 双模式，供 `process_resume` 集成测试 |
 | 智能调度观察 | `examples/test_server_smart_schedule.rs` | `progress` | 本地 `test_server` 限速观察并发决策 |
 | 手工多源 500MiB | `examples/manual_multi_source_test_server.rs` | `multi-source,progress` | 双源 `16m`/`2m` 限速、实时 stats 与字节校验 |
@@ -457,6 +508,8 @@ if !support_ranges || workers == 1 || file_size < 1 MiB { 1 } else { workers }
 ```bash
 cargo run --example download
 cargo run --features progress --example with_custom_ui
+cargo run --features rate-limit,progress --example with_rate_limit
+cargo run --features rate-limit,progress --example with_rate_limit -- --multi
 cargo run --features multi-source,progress --example manual_multi_source_test_server
 cargo run --features resume,multi-source --example resume_harness -- single https://example.com/file.bin out.bin 8 0.5
 ```
@@ -467,16 +520,18 @@ cargo run --features resume,multi-source --example resume_harness -- single http
 cargo test --features resume,multi-source --test resume -- --nocapture --test-threads=1
 cargo test --features resume,multi-source --test process_resume -- --nocapture --test-threads=1
 cargo test --test multi_source -- --nocapture
+cargo test --features rate-limit,multi-source --test rate_limit -- --nocapture
 ```
 
 ---
 
-## 13. 调用检查清单
+## 14. 调用检查清单
 
 - [ ] `Cargo.toml` feature 按需开启，未全量 `default-features = false` 是否满足需求？
 - [ ] `workers` / `update_interval` 是否符合文件大小与 UI 刷新需求？
 - [ ] 需要断点续传时 `resume` 是否启用，sidecar 清理策略是否明确？
 - [ ] 需要进度时 `progress` + `run(handler)` 回调内是否无阻塞操作？
 - [ ] 多源场景源是否同文件同大小且支持 `Range`，`LaneModel` 是否匹配代理维度？
+- [ ] 需要限速时 `rate-limit` 全局/分源 `speed_limit`/`with_burst` 校验是否通过（`0`/`>u32::MAX`/`burst` 单独）？
 - [ ] 自定义 `ClientBuilder` 超时/连接池是否按文件大小配置？
-- [ ] 错误分支是否区分可重试/不可重试（`Request::is_timeout` / `ResumeTargetMissing` 等）？
+- [ ] 错误分支是否区分可重试/不可重试（`Request::is_timeout` / `ResumeTargetMissing` / `InvalidArgument` 等）？

@@ -16,20 +16,29 @@
 
 ```text
 src/
-  chunk.rs         # 单分片下载、分片响应、写入回传
+  chunk.rs         # 单分片下载、分片响应、写入回传（MIN_CHUNK_SIZE 10 KiB）
   concurrency.rs   # 动态并发控制、分片决策、阶段管理
-  downloader.rs    # 顶层下载入口与启动编排
-  monitor.rs       # 运行时控制环，拥有状态、并发管理器、重试处理器
-  retry.rs         # 即时重试与延迟重试队列
-  state.rs         # 分片状态与聚合下载状态
-  types.rs         # 领域消息、错误、事件协议
-  util.rs          # 远端文件探测与文件写入任务
+  downloader.rs    # 顶层下载入口与启动编排（CHANNEL_CAPACITY 4096、MIN_PARALLEL_FILE_SIZE 1 MiB）
+  monitor.rs       # 运行时控制环，拥有状态、并发管理器、重试处理器（限速冻结）
+  retry.rs         # 即时重试与延迟重试队列（RETRY_DELAY 2s / DELAYED 10s / MAX 30）
+  state.rs         # 分片状态与聚合下载状态（EMA smoothing 0.30）
+  types.rs         # 领域消息、错误、事件协议（DownloadError 9 变体）
+  util.rs          # 远端文件探测与文件写入任务（流式追加，无 set_len）
+  limiter.rs       # rate-limit 令牌桶（governor 1 token=1 byte，burst 64 KiB）
+  resume.rs        # 断点续传 ledger（DEFAULT_SEGMENT_SIZE 64 KiB，*.download.bitcode）
+  trace.rs         # tracing 门面（init_tracing / Env::Development|Production）
+  lane.rs          # 多源/代理 lane 调度（MultiRuntime、BLACKLIST 3×30s）
 examples/
   download.rs
   with_custom_ui.rs
+  with_rate_limit.rs
+  manual_multi_source_test_server.rs
+  test_server_smart_schedule.rs
+  resume_harness.rs
 test_server/
-  server.py        # 可控测试 HTTP 服务
+  server.py        # 可控测试 HTTP 服务（Range / 限速 / stats）
 tests/
+  chunk.rs / concurrency.rs / rate_limit.rs / util.rs / multi_source.rs / resume.rs
 ```
 
 ## 3. 核心模块与所有权
@@ -38,13 +47,14 @@ tests/
 
 ```text
 Downloader.run(progress_handler)
-  ├─ build reqwest::Client
-  ├─ get_file_info(HEAD；必要时回退 Range GET)
-  ├─ file_writer_task(output_path, file_size) -> mpsc<DownloadCmd>
+  ├─ build reqwest::Client（保留 pool/keepalive，用户 ClientBuilder 覆盖）
+  ├─ get_file_info(HEAD；必要时回退 Range GET；206/Content-Range 为金标准)
+  ├─ file_writer_task(output_path, file_size) -> mpsc<DownloadCmd>（流式追加，无 set_len；ENOSPC 在 write/flush 暴露）
+  ├─ ResumePlan::prepare/restore（resume 时，hash 校验 segment，按覆盖重建范围）
   ├─ spawn(progress_handler(total_size, info_rx))
-  ├─ spawn initial chunk covering the whole file range
-  ├─ DownloadMonitor::new(file_size, update_interval, workers)
-  └─ monitor.run(info_rx, tasks, channels, next_chunk_id, client, writer_tx, cmd_tx, url)
+  ├─ spawn initial chunk(s) covering 全量或 resume 剩余范围
+  ├─ DownloadMonitor::new(file_size, update_interval, workers).with_rate_limit(global_limiter)
+  └─ monitor.run(info_rx, tasks, channels, next_chunk_id, client, writer_tx, cmd_tx, url, laneBindings, multiRuntime)
 ```
 
 这条链路强调两点：
@@ -88,7 +98,6 @@ sequenceDiagram
     participant Chunk as ChunkWorker
     participant Server as RemoteServer
     participant Progress as ProgressHandler
-
     Note over User,Downloader: 1. 启动与探测
     User->>Downloader: run(progress_handler)
     Downloader->>Probe: build client and probe file info
@@ -100,7 +109,7 @@ sequenceDiagram
         Server-->>Probe: Content-Range / Content-Length
     end
     Probe-->>Downloader: file_size + support_ranges
-    Downloader->>Writer: start writer task and preallocate file
+    Downloader->>Writer: start writer task (streaming truncate(false), no prealloc)
     Downloader->>Progress: spawn progress_handler(info_rx)
 
     Note over Downloader,Monitor: 2. 初始分片与 Monitor 接管
@@ -159,47 +168,49 @@ sequenceDiagram
 
 ### 6.1 启动与探测
 
-`get_file_info` 先尝试 `HEAD`，读取 `Content-Length` 与 `Accept-Ranges`。如果服务端不支持或响应头不完整，则回退到 `GET Range: bytes=0-0`，优先解析 `Content-Range`，最后才尝试普通 `Content-Length`。返回值是 `(file_size, support_ranges)`。
+`get_file_info` 先尝试 `HEAD`，读取 `Content-Length` 与 `Accept-Ranges`。如果服务端不支持或响应头不完整，则回退到 `GET Range: bytes=0-0`，优先解析 `Content-Range`，最后才尝试普通 `Content-Length`。以 `206/Content-Range` 为金标准，`501` 等非 Range 支持会回退 HEAD 值；支持 `MissingContentLength` 自动单流流式回退（`Transfer-Encoding: chunked`）。返回值是 `(file_size, support_ranges)`。
 
 ### 6.2 初始分片与接管
 
-即使配置允许多个 worker，当前实现也先创建一个覆盖完整文件范围的初始 chunk。后续是否增加 worker，由 `DownloadMonitor` 定期调用 `ConcurrencyManager` 决定。这样可以先用真实吞吐采样判断是否值得分片，而不是在启动时预创建所有分片。
+`resume` 关闭时：即使配置允许多个 worker，也先创建一个覆盖完整文件范围的初始 chunk（或按 `workers` + `MIN_PARALLEL_FILE_SIZE 1 MiB` 与 `support_ranges` 降级决策）。`resume` 启用时：`ResumePlan` 基于 `64 KiB` segment 哈希校验，仅复用已验证范围，剩余按 `split_resume_ranges` 重建为待下载区间，支持单源/多源统一路径。后续是否增加 worker，由 `DownloadMonitor` 定期调用 `ConcurrencyManager` 决定；限速启用时冻结该决策。
 
 ### 6.3 常规进度循环
 
-chunk 拉取远端字节流后，把数据通过 `mpsc<DownloadCmd>` 发送给 `FileWriter`，同时通过 `broadcast<DownloadInfo>` 上报 `ChunkProgress`。monitor 消费这些事件，更新 `DownloadState` 中对应 chunk 的进度和结束位置；tick 到来时，monitor 更新 EMA 速度并广播聚合 `MonitorUpdate`。
+chunk 拉取远端字节流后（`Range 206` 强校验 + `416/200` 降级 + Early-EOF 门限），把数据通过 `mpsc<DownloadCmd>` 发送给 `FileWriter`（有界 `128` 背压，`64 KiB/50ms` 节流 `ChunkProgress`），同时通过 `broadcast<DownloadInfo>` 上报 `ChunkProgress`。monitor 消费这些事件，更新 `DownloadState` 中对应 chunk 的进度和结束位置；tick 到来时，monitor 更新 EMA 速度（`SMOOTHING_FACTOR 0.30`）并广播聚合 `MonitorUpdate`；`rate-limit` 时按 `governor` 令牌桶 `32-64 KiB` 批量 `acquire`。
 
 ### 6.4 动态分片
 
-`ConcurrencyManager` 是 monitor 内部的决策器。它根据当前总速度、稳定性样本、剩余时间、最小分片间隔、最大并发数等因素决定是否发送 `BisectDownload`。当前实现的关键策略是：
+`ConcurrencyManager` 是 monitor 内部的决策器。它根据当前总速度、稳定性样本、剩余时间、最小分片间隔 `150ms`、最大并发数等因素决定是否发送 `BisectDownload`。当前实现的关键策略是：
 
 - **探测阶段**：只有在正向吞吐样本表明确有带宽增益时才继续扩容；如果没有可安全切分的 range，则直接转入稳定阶段。
 - **稳定阶段**：速度上升只会刷新历史基线，不会因为“速度又涨了”就立刻重新探测；只有当吞吐相对历史基线显著下降、且仍有足够剩余时间时，才尝试切分最慢的可分片 chunk。
 - **补位分片**：并发槽位空出来后，也只有在当前平均速度为正、剩余完成时间仍值得分片、并且存在足够大的剩余 range 时，才会补充分片。
-- **目标选择**：无论主动恢复还是补位，优先选择“剩余未下载字节数最多且仍可安全二分”的 chunk，而不是按原始 chunk 总尺寸粗暴排序。
+- **目标选择**：无论主动恢复还是补位，优先选择“剩余未下载字节数最多且仍可安全二分（`remaining >= 20 KiB`，即 `MIN_CHUNK_SIZE 10 KiB ×2`）”的 chunk，而不是按原始 chunk 总尺寸粗暴排序。
 
-收到命令的 chunk 自己调整当前 range 并上报 `ChunkBisected`，monitor 再为新增 range 生成新 chunk。
+收到命令的 chunk 自己调整当前 range 并上报 `ChunkBisected`，monitor 再为新增 range 生成新 chunk（`pending_bisects` 缓冲容量不足时避免丢范围）。
 
 ### 6.5 即时重试与延迟恢复
 
-当网络流错误或写入队列关闭导致 chunk 失败时，chunk 上报 `ChunkFailed`。monitor 将失败范围交给 `RetryHandler`：未超过 `MAX_RETRIES` 时进入即时重试队列并等待 `RETRY_DELAY`；超过后进入延迟重试队列并等待 `DELAYED_RETRY_DURATION`。队列到期后，monitor 重新 spawn 对应 range 的 chunk。
+当网络流错误或写入队列关闭导致 chunk 失败时，chunk 上报 `ChunkFailed`。monitor 将失败范围交给 `RetryHandler`：未超过 `MAX_RETRIES` 时进入即时重试队列并等待 `RETRY_DELAY 2s`；超过后进入延迟重试队列并等待 `DELAYED_RETRY_DURATION 10s`（`MAX_TOTAL_ATTEMPTS 30` 熔断 → `PermanentFailure`）。队列到期后，monitor 重新 spawn 对应 range 的 chunk；限速与重试正交。
 
 ### 6.6 完成与关闭
 
-chunk 完成后上报 `DownloadComplete`。monitor 标记该 chunk 完成并清理 retry 记录；当活跃任务和重试队列都为空且 `DownloadState` 判断文件已完成时，monitor loop 返回。随后 `Downloader` 广播 `TerminateAll` 做最终清理。
+chunk 完成后上报 `DownloadComplete`（需 `final_downloaded==size` 且未标记失败）。monitor 标记该 chunk 完成并清理 retry 记录；当活跃任务、重试队列、`pending_bisects` 均空且 `DownloadState` 判断文件已完成时，monitor loop 返回。随后 `Downloader` 广播 `TerminateAll` 做最终清理，成功后删除 `*.download.bitcode`（带 `PermissionDenied` 指数退避重试）。
 
 ## 7. 源码映射
 
-- 启动与编排：`src/downloader.rs:88-169`
-- 文件信息探测与写入任务：`src/util.rs:13-132`
-- monitor 主循环与运行时接管：`src/monitor.rs:20-247`
-- 动态分片策略：`src/concurrency.rs:20-247`
-- 重试队列与延迟恢复：`src/retry.rs:9-173`
-- chunk 下载、切分、写入、事件上报：`src/chunk.rs:12-150`
-- 状态与 EMA 速度：`src/state.rs:7-137`
-- 消息协议：`src/types.rs:30-82`
-
-## 8. 扩展边界
+- 启动与编排：`src/downloader.rs`
+- 文件信息探测与写入任务：`src/util.rs`（`get_file_info` / `file_writer_task` 流式）
+- monitor 主循环与运行时接管：`src/monitor.rs`（`DownloadMonitor::run`）
+- 动态分片策略：`src/concurrency.rs`（`ConcurrencyManager`）
+- 重试队列与延迟恢复：`src/retry.rs`（`RetryHandler`）
+- chunk 下载、切分、写入、事件上报：`src/chunk.rs`（`chunk_run`、`MIN_CHUNK_SIZE`）
+- 状态与 EMA 速度：`src/state.rs`（`DownloadState`/`ChunkState`）
+- 限速令牌桶：`src/limiter.rs`（`RateLimiter`）
+- 断点续传：`src/resume.rs`（`ResumeMetadata` / `ResumePlan`）
+- 可观测性门面：`src/trace.rs`（`init_tracing`）
+- 多源/代理调度：`src/lane.rs`（`MultiRuntime` / `LaneScheduler`）
+- 消息协议：`src/types.rs`（`DownloadInfo` / `DownloadCmd` / `DownloadError`）
 
 - 新调度策略优先扩展 `concurrency.rs`，并保持由 `DownloadMonitor` 调用。
 - 新重试策略优先扩展 `retry.rs`，不要让 chunk 直接持有全局恢复状态。

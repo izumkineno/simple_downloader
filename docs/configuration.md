@@ -67,19 +67,19 @@ let downloader = Downloader::builder("https://example.com/file.bin", "output.bin
 | `progress` | ❌ | — | `DownloadInfo` 与 `run(handler)` 进度回调 |
 | `multi-source` | ❌ | — | `MultiSourceConfig`/`SourceConfig`/`LaneModel`、`Downloader::new_multi` |
 | `proxy` | ❌ | `multi-source` | `ProxyConfig`、`SourceConfig::with_proxies`，支持 `http/https/socks5` |
+| `rate-limit` | ❌ | `governor@0.7` | 全局/分源限速 `governor` 令牌桶（`1 token=1 byte`），`speed_limit`/`with_burst` |
 | `default` | ❌ | — | 仅基础单源多线程下载 `Downloader::builder().download()` |
 
 ```toml
 # 最轻量
-simple_downloader = { version = "0.3", default-features = false }
+simple_downloader = { version = "0.5", default-features = false }
 # 常用：基础 + 断点续传 + 进度
-simple_downloader = { version = "0.3", default-features = false, features = ["resume","progress"] }
-# 全功能
-simple_downloader = { version = "0.3", default-features = false, features = ["resume","progress","multi-source","proxy"] }
+simple_downloader = { version = "0.5", default-features = false, features = ["resume","progress"] }
+# 全功能（含限速）
+simple_downloader = { version = "0.5", default-features = false, features = ["resume","progress","multi-source","proxy","rate-limit"] }
 ```
 
 > 历史文档中 `default = [resume, progress, ...]` 与 `full` 已过时。
-
 ## 多源下载配置（`multi-source` feature）
 
 ### 构造示例（以 `docs/usage.md` §7 为准）
@@ -106,6 +106,8 @@ Downloader::new_multi(cfg, Default::default).download().await?;
 | `SourceConfig::new(url)` | 新建源，`id` 默认即 `url` |
 | `.with_id("m1")` | 显式 lane/source 标识 |
 | `.with_proxies(vec![ProxyConfig::http("http://proxy:8080").unwrap()])` | 需 `proxy` feature |
+| `.with_speed_limit(bps)` | 需 `rate-limit`，该源限速（`0` 或 `>u32::MAX` 均 `InvalidArgument`） |
+| `.with_burst(bytes)` | 需 `rate-limit`，突发容量，默认 64 KiB，需配合 `with_speed_limit` |
 
 ### MultiSourceConfig
 
@@ -116,10 +118,10 @@ Downloader::new_multi(cfg, Default::default).download().await?;
 | `.with_lane_model(LaneModel::PerSource\|PerSourceProxy)` | `PerSource` 同源共享 lane，`PerSourceProxy` 按 源×代理 独立 lane |
 | `.with_max_chunks_per_lane(n)` | 单 lane 并发上限 |
 | `.with_max_chunks_per_source(Some(n))` | 单源并发上限（仅 PerSource 生效） |
+| `.with_global_speed_limit(bps)` | 需 `rate-limit`，全局硬上限（`>u32::MAX`/`0` 校验同分源） |
+| `.with_global_burst(bytes)` | 需 `rate-limit`，全局突发，默认 64 KiB |
 
 调度：启动时 `get_file_info` 探测各源，跳过不可用/不支持 Range/大小不一致的源，全不可用则 `Err(NoAvailableSources)`；`BLACKLIST_THRESHOLD=3` 连续失败进黑名单。
-
-## 代理配置（`proxy` feature，隐含 `multi-source`）
 
 `SourceConfig::with_proxies` 以 lane 维度建模，`ClientBuilder` 侧亦可直接 `proxy(Proxy::all(..))` 注入：
 
@@ -140,6 +142,36 @@ Downloader::new_multi(cfg, Default::default).download().await?;
 ```
 
 短链：`ProxyConfig::http/https/socks5(url) -> Result<Self>`，`with_id` 可显式命名。
+
+## 限速配置（`rate-limit` feature，`governor` 令牌桶）
+
+全局与分源均为 `1 token = 1 byte`，突发默认 `64 KiB`，两级桶串联 `tokio::join!` 取 `max`（避免串行 `sum` 慢 30%），全局为硬上限；限速启用时 `DownloadMonitor` 自动冻结 `ConcurrencyManager::decide_and_act`。
+
+```rust
+use simple_downloader::Downloader;
+// 单源全局限速 1 MiB/s + 128 KiB 突发
+Downloader::builder("https://example.com/file.bin", "output.bin")
+    .speed_limit(1024 * 1024)
+    .with_burst(128 * 1024)
+    .download().await?;
+```
+
+```rust
+use simple_downloader::{MultiSourceConfig, SourceConfig};
+// 多源：分源 300 KiB/s + 全局 512 KiB/s 硬上限
+let cfg = MultiSourceConfig::new("output.bin", 32, 0.5)
+    .with_sources(vec![
+        SourceConfig::new("https://mirror1.example.com/file.bin")
+            .with_speed_limit(300 * 1024)
+            .with_burst(64 * 1024),
+        SourceConfig::new("https://mirror2.example.com/file.bin")
+            .with_speed_limit(300 * 1024),
+    ])
+    .with_global_speed_limit(512 * 1024)
+    .with_global_burst(64 * 1024);
+```
+
+校验：`speed_limit == 0` / `burst == 0` / `burst` 无 `speed_limit` / `> u32::MAX` 均 `Err(InvalidArgument)`；测试见 `tests/rate_limit.rs` 与 `examples/with_rate_limit.rs`（`-- --multi`）。
 
 ## 环境变量配置
 

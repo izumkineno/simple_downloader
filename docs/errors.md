@@ -9,10 +9,11 @@
 | 网络请求错误 | `DownloadError::Request(reqwest::Error)` | HTTP 请求过程中发生的错误 | ✅ 大部分情况可重试 |
 | 文件 I/O 错误 | `DownloadError::Io(io::Error)` | 本地文件读写操作发生的错误 | ❌ 一般不可重试 |
 | 并发任务错误 | `DownloadError::Join(JoinError)` | 异步任务执行过程中发生的错误 | ✅ 可重试 |
-| 缺少长度错误 | `DownloadError::MissingContentLength` | 服务器未返回 Content-Length（自动回退流式下载） | ✅ 自动回退，无需重试 |
+| 缺少长度错误 | `DownloadError::MissingContentLength` | 服务器未返回 Content-Length（0.3.1+ 自动回退单流流式下载） | ✅ 自动回退，无需重试 |
 | 多源下载错误 | `DownloadError::NoAvailableSources` | 多源模式下无可用源 | ✅ 可重试 |
-| 断点续传错误 | `DownloadError::ResumeTargetMissing` / `ResumeMetadata(String)` | 断点续传相关错误 | ❌ 需清理后重试 |
-## 详细错误说明
+| 断点续传错误 | `DownloadError::ResumeTargetMissing(PathBuf)` / `ResumeMetadata(String)` | 断点续传相关：sidecar 存在但文件缺失 / 元数据损坏 | ❌ 需清理后重试 |
+| 永久失败 | `DownloadError::PermanentFailure(String)` | 达 `MAX_TOTAL_ATTEMPTS=30` 或 lane 连续失败熔断 | ❌ 需修源/网络后重试 |
+| 无效参数 | `DownloadError::InvalidArgument(String)` | `rate-limit` 等参数校验（`0`/`>u32::MAX`/`burst` 无限速等） | ❌ 改参后重试 |
 
 ### 1. 网络请求错误 (Request)
 
@@ -222,8 +223,8 @@ match result {
         eprintln!("断点续传失败，目标文件不存在: {}", path.display());
         eprintln!("可以选择：");
         eprintln!("1. 恢复目标文件到原路径");
-        eprintln!("2. 删除对应的 .resume 元数据文件后重新下载");
-        eprintln!("3. 禁用断点续传功能重新下载");
+        eprintln!("2. 删除对应的 *.download.bitcode 元数据文件后重新下载");
+        eprintln!("3. 禁用断点续传功能重新下载（.resume(false)/with_resume(false)）");
     }
 }
 ```
@@ -251,7 +252,7 @@ match result {
     Err(DownloadError::ResumeMetadata(reason)) => {
         eprintln!("断点续传元数据无效: {}", reason);
         eprintln!("建议：");
-        eprintln!("1. 删除对应的 .resume 元数据文件后重新下载");
+        eprintln!("1. 删除对应的 *.download.bitcode 元数据文件后重新下载");
         eprintln!("2. 禁用断点续传功能重新下载");
     }
 }
@@ -259,6 +260,47 @@ match result {
 
 **重试策略**：
 - ❌ 直接重试会失败，需要删除无效的元数据文件或禁用断点续传
+
+---
+
+### 8. 永久失败（PermanentFailure）
+
+**错误信息**：`下载失败，已达重试上限: {原因}`
+
+**可能原因**：
+-  `RetryHandler` 达 `MAX_TOTAL_ATTEMPTS=30` 或 `MAX_RETRIES` + `DELAYED_RETRY_DURATION 10s` 仍未成功
+-  多源 `lane` 连续失败 `≥ BLACKLIST_THRESHOLD=3` 隔离 + 无健康 lane 可用
+-  网络/源端长期不可用
+
+**处理建议**：
+```rust
+match result {
+    Err(DownloadError::PermanentFailure(msg)) => {
+        eprintln!("永久失败: {}，请检查网络/源可用性后重试", msg);
+    }
+}
+```
+
+---
+
+### 9. 无效参数（InvalidArgument）
+
+**错误信息**：`无效参数: {原因}`
+
+**常见场景（`rate-limit` feature）**：
+- `speed_limit == 0` 或 `burst == 0`
+- `burst` 单独设置而无 `speed_limit`
+- `speed_limit` / `burst`  `> u32::MAX`（`~4 GiB/s` 上限，`governor::Quota` 限制）
+- `MultiSourceConfig::with_global_speed_limit(0)` 等
+
+**处理建议**：
+```rust
+match Downloader::builder(url, path)
+    .speed_limit(0) // ❌ 将返回 InvalidArgument
+    .download().await {
+    Err(DownloadError::InvalidArgument(msg)) => eprintln!("参数错误: {}", msg),
+    other => other.unwrap(),
+```
 
 ## 全局错误处理最佳实践
 
@@ -338,19 +380,18 @@ fn format_error(e: &DownloadError) -> String {
 
 1. **启用详细日志**：
    ```rust
-   // 在程序开头添加日志初始化
-   env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("simple_downloader=debug"))
-       .init();
+   // 推荐：本库 tracing 门面（见 `src/trace.rs`）
+   simple_downloader::trace::init_tracing();
+   // 或：RUST_LOG=simple_downloader=debug cargo run ...
    ```
 
 2. **捕获错误上下文**：
    使用 `thiserror` 和 `anyhow` 库可以保留更多错误上下文信息，便于调试。
 
 3. **检查临时文件**：
-   断点续传的元数据文件默认保存在与输出文件相同的目录下，后缀为 `.resume`，可以检查该文件内容是否正常。
+   断点续传的元数据文件默认保存在与输出文件相同的目录下，后缀为 `.download.bitcode`（`RESUME_EXTENSION`），可以检查该文件是否存在；损坏时会被自动删除重建（`src/resume.rs:validate_shape`）。
 
 ## 常见问题排查
-
 ### Q: 总是出现 "网络请求失败: 连接超时"
 A: 
 - 检查网络连接是否正常
@@ -362,12 +403,10 @@ A:
 A:
 - 检查输出文件是否被其他程序占用
 - 检查磁盘空间是否足够
-- 尝试删除对应的 `.resume` 元数据文件后重新下载
+- 尝试删除对应的 `*.download.bitcode` 元数据文件后重新下载
 - 确认下载的文件是否支持 Range 请求
 
 ### Q: 多源下载时提示 "没有可用的下载源"
-A:
-- 检查所有下载源的 URL 是否正确
 - 检查每个下载源是否能单独访问
 - 检查是否需要配置代理
 - 尝试降低 `max_retries_per_source` 配置值

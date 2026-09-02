@@ -198,7 +198,23 @@ Downloader::new_multi(cfg, Default::default).download().await.unwrap();
 ```
 
 ### 3. 备用源与健康检查
-建议配置 2–3 个备用源；启动时不可用源会被自动跳过，连续失败 `≥3` 次的 lane 进黑名单，运行时健康由 `LaneScheduler` 管理，无需手动 `health_check_interval`。
+建议配置 2–3 个备用源；启动时不可用源会被自动跳过，连续失败 `≥3` 次的 lane 进黑名单（`BLACKLIST 30s`），运行时健康由 `LaneScheduler` 管理，无需手动 `health_check_interval`。
+
+### 4. 限速（`rate-limit`）最佳实践
+- 全局为硬上限，分源之和超全局时被限为全局速率；利用 `with_global_speed_limit` 控总带宽，`SourceConfig::with_speed_limit` 控单源公平
+- `burst` 默认 `64 KiB`，突发越大瞬时越易超 `1.05×`；压测建议保持默认或 `≤128 KiB`
+- 限速启用自动冻结并发自适应（`DownloadMonitor::is_rate_limited`），勿同时手动频繁调 `workers`
+- 参数校验失败为 `InvalidArgument`：`0`/`>u32::MAX`/`burst` 无 `speed_limit`；校验在 `run_internal` 阶段即失败，无侧车残留
+```rust
+use simple_downloader::{MultiSourceConfig, SourceConfig};
+let cfg = MultiSourceConfig::new("out.bin", 32, 0.5)
+    .with_sources(vec![
+        SourceConfig::new("https://m1.example.com/file.bin").with_speed_limit(300*1024),
+        SourceConfig::new("https://m2.example.com/file.bin").with_speed_limit(300*1024),
+    ])
+    .with_global_speed_limit(512*1024); // 硬上限 512 KiB/s
+```
+
 ---
 
 ## 代理使用最佳实践

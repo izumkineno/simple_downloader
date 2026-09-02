@@ -1,9 +1,11 @@
 # 常见问题解答
 
+> 以 `Cargo.toml:14-19` 与 `docs/usage.md` 为准；`default = []` 默认不启用任何可选 feature。
+
 ## 基础使用问题
 
 ### Q: 最简单的下载怎么实现？
-A: 使用 builder 模式只需要几行代码：
+A: 默认无需任何 feature，使用 builder 即可：
 ```rust
 use simple_downloader::Downloader;
 
@@ -17,92 +19,140 @@ async fn main() {
 ```
 
 ### Q: 如何显示下载进度？
-A: 使用 `run()` 方法并提供进度回调函数：
+A: 启用 `progress` feature，使用 `run()`：
 ```rust
-Downloader::builder("https://example.com/large_file.zip", "output.zip")
-    .run(|total_size, mut info_rx| async move {
-        println!("总大小: {} bytes", total_size);
-        while let Ok(info) = info_rx.recv().await {
-            println!(
-                "进度: {:.1}% | 速度: {:.2} MB/s | 已下载: {} bytes",
-                info.progress_percent(),
-                info.speed_mbps(),
-                info.downloaded_bytes()
-            );
-        }
-    })
-    .await
-    .unwrap();
+use simple_downloader::Downloader;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    Downloader::builder("https://example.com/large_file.zip", "output.zip")
+        .workers(16)
+        .run(|total_size, mut info_rx| async move {
+            println!("总大小: {} bytes", total_size);
+            while let Ok(info) = info_rx.recv().await {
+                // 仅 MonitorUpdate 携带可聚合进度（见 DownloadInfo 文档）
+                println!(
+                    "进度: {:.1}% | 速度: {:.2} MB/s | 已下载: {} bytes",
+                    info.progress_percent(),
+                    info.speed_mbps(),
+                    info.downloaded_bytes()
+                );
+                if info.is_complete() { break; }
+            }
+        })
+        .await?;
+    Ok(())
+}
 ```
+完整 UI 见 `examples/with_custom_ui.rs`（`indicatif::MultiProgress`）与 `docs/usage.md:6`。
 
 ### Q: 断点续传功能如何使用？
-A: 默认已经启用（需要 `resume` feature，默认已开启），下载中断后再次运行相同的代码会自动从断点恢复：
+A: 启用 `resume` feature（`default = []`，需显式开启），下载中断后再次运行相同 `url + output_path` 会自动从校验通过的 segment 恢复：
+```toml
+[dependencies]
+simple_downloader = { version = "0.5", features = ["resume"] }
+```
 ```rust
 Downloader::builder("https://example.com/large_file.zip", "output.zip")
-    .resume(true) // 显式启用，默认是 true
+    .download() // resume 启用时默认 true，自动恢复
+    .await
+    .unwrap();
+
+// 显式禁用
+Downloader::builder("https://example.com/large_file.zip", "output.zip")
+    .resume(false)
     .download()
     .await
     .unwrap();
 ```
-断点续传的元数据保存在与输出文件同目录下，文件名是 `输出文件名.resume`。
+元数据为 `output_path.download.bitcode`（`src/resume.rs:RESUME_EXTENSION`，`DEFAULT_SEGMENT_SIZE 64 KiB` 固定 ledger + 哈希校验），成功后自动删除。`ResumeTargetMissing`（sidecar 存在但文件缺失）会 fail-stop，详见 `docs/errors.md:6/7`。
 
 ### Q: 如何设置并发下载线程数？
-A: 使用 `workers()` 方法配置：
+A: `workers()`：
 ```rust
 Downloader::builder("https://example.com/large_file.zip", "output.zip")
-    .workers(16) // 使用 16 个线程并行下载
+    .workers(16)
     .download()
     .await
     .unwrap();
 ```
-**注意**：如果服务器不支持 Range 请求，或者文件大小小于 1MB，会自动降级为单线程下载。
+**注意**：`src/downloader.rs:502` 实际并发 `if !support_ranges || file_size < 1 MiB {1} else {workers}`；`state.rs:is_splittable` 要求 `remaining >= 20 KiB`（`MIN_CHUNK_SIZE 10 KiB ×2`）；限速启用时冻结自适应分裂。
 
 ### Q: 如何配置代理？
-A: 通过自定义 reqwest 客户端配置代理：
+A: 两种方式，二选一：
+
+**单源**（任意 feature）通过 `client_builder`：
 ```rust
 use reqwest::{ClientBuilder, Proxy};
-
 Downloader::builder("https://example.com/file.zip", "output.zip")
     .client_builder(|| {
         ClientBuilder::new()
             .proxy(Proxy::http("http://proxy.example.com:8080").unwrap())
-            // SOCKS5 代理: .proxy(Proxy::socks5("socks5://127.0.0.1:1080").unwrap())
     })
     .download()
     .await
     .unwrap();
 ```
-程序也会自动识别 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 等环境变量。
+
+**多源多代理**（需 `proxy` feature，隐含 `multi-source`）以 lane 建模：
+```rust
+use simple_downloader::{MultiSourceConfig, SourceConfig, ProxyConfig, LaneModel, Downloader};
+let src = SourceConfig::new("https://example.com/file.bin")
+    .with_proxies(vec![
+        ProxyConfig::http("http://proxy:8080").unwrap(),
+        ProxyConfig::socks5("socks5://proxy:1080").unwrap(),
+    ]);
+let cfg = MultiSourceConfig::new("output.bin", 16, 0.5)
+    .with_sources(vec![src])
+    .with_lane_model(LaneModel::PerSourceProxy);
+Downloader::new_multi(cfg, Default::default).download().await.unwrap();
+```
+程序亦自动识别 `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY`（`reqwest` 底层）。
 
 ---
 
 ## 功能相关问题
 
 ### Q: 多源下载怎么配置？
-A: 需要启用 `multi-source` feature（默认已开启），使用 `MultiSourceConfig` 配置多个下载源：
+A: 启用 `multi-source`（`proxy` 隐含它），以 `MultiSourceConfig`/`SourceConfig`/`LaneModel` 为准（无 `weight/priority/headers` 伪接口）：
 ```rust
-use simple_downloader::{Downloader, MultiSourceConfig, SourceConfig};
+use simple_downloader::{Downloader, MultiSourceConfig, SourceConfig, LaneModel};
 
-let config = MultiSourceConfig::builder(
-    vec![
-        SourceConfig::new("https://mirror1.example.com/file.zip").weight(2),
-        SourceConfig::new("https://mirror2.example.com/file.zip").weight(1),
-        SourceConfig::new("https://mirror3.example.com/file.zip").weight(1),
-    ],
-    "output.zip",
-)
-.workers(32)
-.build();
+let config = MultiSourceConfig::new("output.zip", 32, 0.5)
+    .with_sources(vec![
+        SourceConfig::new("https://mirror1.example.com/file.zip").with_id("m1"),
+        SourceConfig::new("https://mirror2.example.com/file.zip").with_id("m2"),
+    ])
+    .with_lane_model(LaneModel::PerSource)
+    .with_max_chunks_per_lane(2)
+    .with_max_chunks_per_source(Some(8));
 
-Downloader::new_multi(config, Default::default)
-    .download()
-    .await
-    .unwrap();
+Downloader::new_multi(config, Default::default).download().await.unwrap();
 ```
-权重越高的源会被分配更多的下载任务。
+启动时 `get_file_info` 探测各源，跳过不可用/不支持 Range/大小不一致的源，全不可用 → `NoAvailableSources`；lane 连续失败 `≥3` 次进 `BLACKLIST 30s`。详见 `docs/usage.md:7` 与 `docs/architecture.md:6.2`。
+
+### Q: 限速怎么用？
+A: 启用 `rate-limit` feature（`governor 0.7`，`1 token=1 byte`，`burst` 默认 64 KiB）：
+```rust
+// 全局
+Downloader::builder("https://example.com/file.bin", "output.bin")
+    .speed_limit(1024*1024) // 1 MiB/s
+    .with_burst(64*1024)
+    .download().await?;
+
+// 分源 + 全局硬上限
+use simple_downloader::{MultiSourceConfig, SourceConfig};
+let cfg = MultiSourceConfig::new("output.bin", 32, 0.5)
+    .with_sources(vec![
+        SourceConfig::new("https://m1.example.com/file.bin").with_speed_limit(300*1024),
+        SourceConfig::new("https://m2.example.com/file.bin").with_speed_limit(300*1024),
+    ])
+    .with_global_speed_limit(512*1024);
+```
+校验：`0`/`>u32::MAX`/`burst` 无 `speed_limit` 均为 `InvalidArgument`；限速期自适应冻结，详见 `docs/configuration.md:限速` 与 `examples/with_rate_limit.rs`。
 
 ### Q: 如何自定义 HTTP 请求头？
-A: 在 client_builder 中配置默认 headers：
+A: `client_builder` 中配置 `default_headers`：
 ```rust
 use reqwest::header::{HeaderMap, USER_AGENT};
 
@@ -119,113 +169,82 @@ Downloader::builder("https://example.com/file.zip", "output.zip")
     .await
     .unwrap();
 ```
+默认 UA 为 `simple_downloader/<version>`（`src/lib.rs:DEFAULT_USER_AGENT`，`util::ensure_user_agent` 注入）。
 
 ### Q: 如何设置请求超时时间？
-A: 在 client_builder 中配置超时：
+A: `client_builder`：
 ```rust
 use std::time::Duration;
-
 Downloader::builder("https://example.com/large_file.zip", "output.zip")
     .client_builder(|| {
         ClientBuilder::new()
-            .connect_timeout(Duration::from_secs(10)) // 连接超时 10 秒
-            .timeout(Duration::from_secs(120)) // 整个请求超时 120 秒
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(120))
     })
     .download()
     .await
     .unwrap();
 ```
+建议大文件 `timeout 60-120s`，`tcp_keepalive 60s`，`pool_max_idle_per_host 32`（见 `docs/best-practices.md:性能`）。
 
 ### Q: 下载完成后会校验文件完整性吗？
-A: 当前版本会校验下载的总字节数是否与服务器返回的 Content-Length 一致。如果需要哈希校验，可以在下载完成后自行计算文件的 MD5/SHA256 等哈希值与预期值比较。
+A: 会校验 `total_downloaded >= total_size` 与 `Range 206/Content-Range` 一致性及 `Early-EOF` 门限（`chunk.rs:P0-1/P0-2`）；`resume` 场景按 `64 KiB` segment 哈希复用；如需业务级 `MD5/SHA256`，下载完成后自行计算比对。
 
 ### Q: 可以暂停和恢复下载吗？
-A: 目前的断点续传功能支持程序退出后再次启动时恢复下载。运行时的暂停/恢复功能正在开发中，预计在 0.2.0 版本提供。
+A: `resume` feature 支持进程级中断后恢复（`*.download.bitcode` ledger，`tests/process_resume.rs` 已覆盖控制台中断与 kill 恢复）；运行时暂停/恢复的任务队列 API 仍在 TODO（见 `README:任务队列 API`）。
 
 ---
 
 ## 性能优化问题
 
 ### Q: 下载速度慢怎么办？
-A: 可以尝试以下优化：
-1. **增加并发线程数**：
-   ```rust
-   Downloader::builder(url, path)
-       .workers(32) // 对于大文件可以增加到 16-64 线程
-       .download()
-       .await
-   ```
-   
-2. **使用多源下载**：配置多个镜像源，充分利用带宽。
-
-3. **调整客户端配置**：
-   ```rust
-   ClientBuilder::new()
-       .tcp_keepalive(Duration::from_secs(60))
-       .pool_max_idle_per_host(32) // 增加连接池大小
-       .build()
-   ```
-
-4. **检查网络环境**：确保网络带宽足够，没有被限流，服务器没有限速。
-
-5. **选择离自己近的镜像源**：延迟越低，下载速度越快。
+A: 排查清单：
+1. **并发**：`workers 16-32`（大文件），小文件 `4-8`，`<1 MiB` 自动单线程。
+2. **多源**：配置多镜像充分利用带宽（`MultiSourceConfig`）。
+3. **限速**：确认未误启用 `rate-limit` 的全局/分源限速。
+4. **客户端**：`tcp_keepalive 60s`、`pool_max_idle_per_host 32`。
+5. **网络/源**：选近源，检查源侧限流与 `RetryHandler` 熔断（`MAX_TOTAL_ATTEMPTS 30`）。
 
 ### Q: 大文件下载时内存占用高怎么办？
-A: simple_downloader 对内存使用已经做了优化，正常情况下内存占用应该是稳定的。如果还是很高：
-1. 适当降低并发线程数，减少同时下载的块数
-2. 检查是否开启了过多的其他功能
-3. 确保使用的是最新版本，我们持续在优化内存使用
+A: 本库已通过有界 `mpsc 128` 背压与 `ChunkProgress 64KiB/50ms` 节流控制内存（`CHANNEL_CAPACITY 4096`）；若仍高：降 `workers`、检查是否同时启动大量 `Downloader` 实例、升级到 `0.5.4` 流式追加（无 `set_len` 预分配）。
 
 ### Q: 小文件下载速度慢怎么办？
-A: 对于小文件（<10MB），建议：
-1. 降低并发线程数到 1-4
-2. 禁用断点续传功能（`.resume(false)`）
-3. 如果批量下载多个小文件，建议使用连接池复用连接
+A: 小文件（`<10MB`）建议：`workers 1-4`、`resume(false)`、复用连接、批量下载时复用 `ClientBuilder`（见 `docs/best-practices.md:小文件`），`<1 MiB` 已自动单线程。
 
 ### Q: 进度更新太频繁导致 UI 卡顿怎么办？
-A: 调整进度更新间隔：
+A: `update_interval(secs)`：
 ```rust
 Downloader::builder(url, path)
-    .update_interval(1.0) // 每秒更新一次进度，默认是 0.5 秒
+    .update_interval(1.0) // 默认 0.5s，桌面 0.5-1s，服务端 1-5s
     .run(progress_callback)
     .await
 ```
+回调内避免阻塞，必要时 `mpsc` 转发。
 
 ---
 
 ## 错误处理问题
 
 ### Q: 提示 "无法从服务器响应头中获取文件大小" 怎么办？
-A: 这个错误说明服务器没有返回 Content-Length 头，或者使用了分块传输编码。可以尝试：
-1. 强制使用单线程下载：
-   ```rust
-   Downloader::builder(url, path)
-       .workers(1)
-       .download()
-       .await
-   ```
-2. 检查下载链接是否正确，有些动态生成的文件确实没有固定大小
-3. 如果知道文件大小，可以手动设置（需要修改源码，未来版本会提供 API）
+A: `0.3.1+` 已自动回退为**单流流式下载**（`Transfer-Encoding: chunked`，`util::get_file_info` HEAD→`Range 0-0`→`Content-Length`→流式），无需手动 `workers(1)`；若仍 `MissingContentLength`，说明三阶段探测与流式 `GET` 均失败，需检查链接/网络；详见 `docs/errors.md:4`。
 
 ### Q: 断点续传失败怎么办？
-A: 常见原因和解决方案：
-1. **目标文件不存在**：检查文件是否被删除或移动，可以删除对应的 `.resume` 文件重新下载
-2. **元数据损坏**：删除对应的 `.resume` 文件，重新下载
-3. **服务器文件已变更**：删除 `.resume` 文件和不完整的目标文件，重新下载
+A:
+1. `ResumeTargetMissing`：sidecar 存在但目标文件缺失 → 恢复文件或删 `*.download.bitcode` 或 `resume(false)`。
+2. `ResumeMetadata`：损坏/版本不一致 → 删 sidecar 重下（`validate_shape` 会自愈，但显式删除更可控）。
+3. 服务器文件已变更（大小/内容变）→ 删 sidecar 与未完成文件重下。
 
 ### Q: 提示 "没有可用的下载源"（多源下载时）怎么办？
-A: 
-1. 检查每个下载源的 URL 是否正确
-2. 单独访问每个下载源，确认是否可以正常下载
-3. 检查网络连接和代理配置
-4. 增加更多可用的下载源
-5. 调整 `max_retries_per_source` 配置，允许更多的重试次数
+A: 检查：URL 是否正确、是否单独可访问、是否支持 `Range`、大小是否一致、是否需代理；全部探测失败即 `NoAvailableSources`，可增源后重试。
+
+### Q: `InvalidArgument` 限速参数错误？
+A: `speed_limit 0` / `burst 0` / `burst` 无 `speed_limit` / `>u32::MAX` 均 `InvalidArgument`（`src/downloader.rs:run_internal` 即时校验，无残留文件）。
 
 ### Q: SSL 证书验证失败怎么办？
-A: 优先建议修复证书问题，如果是测试环境或者信任的源，可以临时禁用证书验证（**不安全，生产环境不建议使用**）：
+A: 优先修复证书；测试环境临时禁用（**生产不建议**）：
 ```rust
 ClientBuilder::new()
-    .danger_accept_invalid_certs(true) // 仅用于测试环境！
+    .danger_accept_invalid_certs(true)
     .build()
 ```
 
@@ -234,62 +253,45 @@ ClientBuilder::new()
 ## 开发相关问题
 
 ### Q: 如何在生产环境使用 simple_downloader？
-A: 生产环境建议：
-1. 使用最新的稳定版本
-2. 配置合理的重试机制
-3. 对错误进行全面处理
-4. 避免使用不安全的配置（如禁用证书验证）
-5. 监控下载进度和错误情况
-6. 对于关键文件下载，下载完成后校验文件哈希值
+A: 建议：固定 `version = "0.5"`、按需 feature、`cargo tree` 检查 `governor/tracing`、区分可重试错误（`Request::is_timeout/is_connect/5xx`、`Join`）与不可重试（`Io/ResumeTargetMissing/InvalidArgument/PermanentFailure`）、落地指数退避与 `trace::init_tracing()` 日志、关键文件下载后哈希校验。
 
 ### Q: 支持同步 API 吗？
-A: simple_downloader 是完全基于异步 Tokio 运行时设计的，不提供同步 API。如果需要在同步代码中使用，可以使用 `tokio::runtime::Runtime` 来运行异步代码：
+A: 基于 `Tokio` 异步，不提供同步 API；可在同步代码中 `Runtime::block_on`：
 ```rust
 use tokio::runtime::Runtime;
-
 fn sync_download(url: &str, path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let rt = Runtime::new()?;
-    rt.block_on(async {
-        Downloader::builder(url, path)
-            .download()
-            .await
-    })?;
+    rt.block_on(async { Downloader::builder(url, path).download().await })?;
     Ok(())
 }
 ```
 
 ### Q: 支持 WASM 吗？
-A: 目前还不支持 WASM 环境，因为依赖的 reqwest 和 Tokio 在 WASM 环境下有较多限制。我们计划在未来的版本中考虑 WASM 支持。
+A: 暂不支持（`reqwest` + `Tokio` 多线程 runtime 限制）。
 
 ### Q: 支持下载到内存中而不是文件吗？
-A: 目前版本只支持下载到本地文件。下载到内存的功能在规划中，预计在 0.2.0 版本提供。如果现在需要，可以自定义文件写入逻辑（需要修改源码）。
+A: 暂仅支持文件落地（`file_writer_task` 有界 `mpsc` + `seek/write`）；内存目标可通过替换 `file_writer` 存储后端扩展（保持背压协议，见 `architecture.md:8`）。
 
 ### Q: 如何贡献代码？
-A: 请参考 [CONTRIBUTING.md](../CONTRIBUTING.md) 文档，欢迎提交 PR 和 Issue！
+A: 见 `CONTRIBUTING.md`；提交前 `cargo fmt --check`、`cargo check --all-features`、`cargo test --all-features`、`cargo clippy --all-features -D warnings`。
 
 ### Q: 功能请求或 Bug 报告在哪里提交？
-A: 请在 GitHub Issues 中提交，描述清楚问题和复现步骤。
+A: GitHub Issues（附 `RUST_LOG=simple_downloader=debug` 日志与 `src/trace.rs` 相关 `span`）。
 
 ---
 
 ## 其他问题
 
 ### Q: simple_downloader 和其他下载库有什么区别？
-A: 
-- **高性能异步架构**：基于 Tokio 异步运行时，充分利用多核性能
-- **内置断点续传**：不需要额外配置即可使用
-- **多源下载支持**：可以同时从多个源下载，提升速度和可靠性
-- **智能调度**：动态调整并发数，自动重试失败的块
-- **模块化设计**：通过 Feature flags 可以按需裁剪功能，减小二进制体积
-- **简洁 API**：Builder 模式设计，上手简单，同时支持深度定制
+A: 亮点：`Tokio` 异步消息驱动、动态 `Probing→Stable` 带宽探测分裂、两级 `Retry 2s/10s` + `30` 熔断、`broadcast 4096` + `64KiB/50ms` 节流、`mpsc 128` 背压、`governor` 双桶限速、`bitcode` 哈希断点续传、`LaneScheduler` 多源/代理 lane。
 
 ### Q: 支持哪些操作系统？
-A: 支持 Windows、macOS、Linux，所有 Rust 支持的平台基本都可以使用。
+A: Windows/macOS/Linux（Rust `1.85+`、`edition 2024`）。
 
 ### Q: 商业项目可以免费使用吗？
-A: 是的，simple_downloader 使用 Apache 2.0 许可证，可以免费用于商业项目，不需要付费。具体请参考 [LICENSE](../LICENSE) 文件。
+A: `Apache-2.0`，可免费商用。
 
 ### Q: 有计划提供其他语言的绑定吗？
-A: 目前没有计划，但我们欢迎社区贡献其他语言的绑定（如 Python、Node.js、Go 等）。
+A: 暂无计划，欢迎社区贡献。
 
-如果你的问题没有在这里找到答案，可以在 GitHub Discussions 中提问，或者提交 Issue。
+如果你的问题没有在这里找到答案，可在 GitHub Discussions 提问或提交 Issue。
