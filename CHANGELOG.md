@@ -17,8 +17,17 @@
 
 ---
 
-## [0.7.0] - 2026-09-02
+## [0.7.1] - 2026-09-02
 
+### 🐛 修复（永久卡100% + 尾段0.00MB/s — 0.7.0聚合层回归）
+
+- **卡100%永久驻留** `monitor.rs:599 is_tail_zero` 零剩余但`delayed/pending/chunks`非空时`force_drain_delayed+coalesce`，避免`10s delayed`在`100% 0剩余`时不抽干导致`select! download_fut`永等（`smodeltrans`复现）；`state.rs` `completed_bytes`权威与`types.rs is_complete byte>=total`解耦已在`0.7.0`，本轮补`tail_zero`强制路径
+- **聚合层假完成** `smodeltrans/src-tauri/src/backend/model_download.rs:884` `overall min 99`直至`download_result Ok+gold close`才`100 Completed`，移除`is_complete break`提前退出，`last_speed`尾段`90%+`防抖保留`0.01MB/s→last`，`monotonic`不回退，`is_complete`仅展示
+- **测试校准** `tests/all_features_test_server.rs:79 2M→64K (≤100M档)`阈值与`resume.rs:23 adaptive`一致，`500M→256K / 1G+1→1M`
+
+---
+
+## [0.7.0] - 2026-09-02
 ### 💥 Breaking（不限 breaking 共识，6 硬门禁）
 
 - **自适应段** `resume.rs:18 adaptive_segment_size` `≤100M→64K / 100M-1G→256K / >1G→1M`，侧车段数 `1G ≤1200`，旧 `64K` 侧车 `v1` 自动迁移为新分档（`AC-1`，`METADATA_VERSION 1→2` 兼容 `v1` bitcode 回退）

@@ -69,7 +69,7 @@ simple_downloader 是一个基于 Rust 与 Tokio 的异步下载库，当前实�
 
 ## 四、推荐验证命令
 
-在仓库根目录运行（以 `Cargo.toml:3 0.7.0` 为准）：
+在仓库根目录运行（以 `Cargo.toml:3 0.7.1` 为准）：
 
 ```bash
 cargo fmt --check

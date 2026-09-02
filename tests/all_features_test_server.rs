@@ -72,16 +72,15 @@ async fn resume_adaptive_and_compat_via_test_server() {
         .unwrap();
     let url = server.url_for("resume_adaptive.bin");
 
-    // 验证自适应分档：2M 文件应按 256K 切分
+    // 验证自适应分档：≤100M→64K、100M-1G→256K、>1G→1M（2M 应为 64K）
     {
         use simple_downloader::adaptive_segment_size;
         let seg = adaptive_segment_size(2 * 1024 * 1024);
-        assert_eq!(seg, 256 * 1024, "2M should use 256K");
+        assert_eq!(seg, 64 * 1024, "2M should use 64K (≤100M档)");
         assert_eq!(adaptive_segment_size(50 * 1024 * 1024), 64 * 1024);
         assert_eq!(adaptive_segment_size(500 * 1024 * 1024), 256 * 1024);
-        assert_eq!(adaptive_segment_size(2 * 1024 * 1024 * 1024), 1024 * 1024);
+        assert_eq!(adaptive_segment_size(1024 * 1024 * 1024 + 1), 1024 * 1024);
     }
-
     let (tmp, out_path) = temp_output();
     let out_str = out_path.to_string_lossy().to_string();
     drop(tmp);

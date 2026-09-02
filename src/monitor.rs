@@ -596,6 +596,10 @@ impl DownloadMonitor {
         let remaining = self.state.total_file_size.saturating_sub(self.state.total_downloaded());
         let active = self.state.chunks.len() as u64;
         let max_workers = self.concurrency_manager.max_workers();
+        let is_tail_zero = remaining == 0
+            && !self.are_all_tasks_done()
+            && !self.state.is_download_finished()
+            && !self.retry_handler.has_permanent_failure();
         let is_starved_retry = active == 0
             && !self.state.is_download_finished()
             && !self.retry_handler.has_permanent_failure()
@@ -605,9 +609,9 @@ impl DownloadMonitor {
             && remaining >= MIN_CHUNK_SIZE * 2
             && remaining < max_workers * MIN_CHUNK_SIZE * 16
             && (!self.retry_handler.are_all_tasks_done() || self.state.chunks.values().any(|c| c.remaining_bytes() < MIN_CHUNK_SIZE * 2));
-        let should_force = is_starved_retry || is_tail_fragmented;
+        let should_force = is_starved_retry || is_tail_fragmented || is_tail_zero;
         if should_force {
-            // 合并相邻小碎片为 1MiB 级大块，减少微任务风暴
+            // 合并相邻小碎片为 1MiB 级大块，减少微任务风暴；100%零剩余但仍有delayed/pending时亦强制抽干，避免10s驻留卡死
             self.retry_handler.coalesce_small_fragments();
             if self.retry_handler.delayed_queue_len() > 0 {
                 self.retry_handler.force_drain_delayed();
@@ -620,11 +624,11 @@ impl DownloadMonitor {
             after_delayed = self.retry_handler.delayed_queue_len(),
             starved = is_starved_retry,
             tail_fragmented = is_tail_fragmented,
+            tail_zero = is_tail_zero,
             "retry process_queues"
         );
         let mut deferred_retries = Vec::new();
         let mut retried = 0usize;
-        // 饥饿/尾部碎片时绕过 RETRY_DELAY 1s，直接弹队头，避免单线程慢尾空转（类似内存碎片整理后直接分配）
         while let Some(chunk_to_retry) = if should_force {
             self.retry_handler.pop_ready_chunk_starved()
         } else {
