@@ -1,5 +1,6 @@
 //! 下载监控器，作为状态、重试和并发管理的协调中心。
 
+use crate::chunk::MIN_CHUNK_SIZE;
 use crate::chunk::chunk_run_with_reliable;
 use crate::concurrency::ConcurrencyManager;
 use crate::lane::MultiRuntime;
@@ -427,7 +428,12 @@ impl DownloadMonitor {
                 end,
                 error,
             } => {
-                ::tracing::warn!(chunk_id = id, start, end, error = %error, "ChunkFailed");
+                // 批量失败时 warn 风暴，瞬时 decoding 降为 debug
+                if error.contains("decoding") {
+                    ::tracing::debug!(chunk_id = id, start, end, error = %error, "ChunkFailed transient");
+                } else {
+                    ::tracing::warn!(chunk_id = id, start, end, error = %error, "ChunkFailed");
+                }
                 if let Some(lane_id) = self.lane_bindings.remove(&id)
                     && let Some(runtime) = multi_runtime
                 {
@@ -582,21 +588,48 @@ impl DownloadMonitor {
             url,
             multi_runtime,
         );
-
         // 委托重试处理：处理重试队列 — P0-6: delayed 10s 单独计时，不叠加 retry 2s
         let before_retry = self.retry_handler.retry_queue_len();
         let before_delayed = self.retry_handler.delayed_queue_len();
         self.retry_handler.process_queues();
+        // 主流饥饿/碎片急补：active0 或尾部多空闲(>50%空闲)且有碎片时，强制排空 delayed 并绕过 1s，并合并小碎片（IDM 碎片整理）
+        let remaining = self.state.total_file_size.saturating_sub(self.state.total_downloaded());
+        let active = self.state.chunks.len() as u64;
+        let max_workers = self.concurrency_manager.max_workers();
+        let is_starved_retry = active == 0
+            && !self.state.is_download_finished()
+            && !self.retry_handler.has_permanent_failure()
+            && remaining >= MIN_CHUNK_SIZE * 2;
+        let is_tail_fragmented = active > 0
+            && active * 2 < max_workers
+            && remaining >= MIN_CHUNK_SIZE * 2
+            && remaining < max_workers * MIN_CHUNK_SIZE * 16
+            && (!self.retry_handler.are_all_tasks_done() || self.state.chunks.values().any(|c| c.remaining_bytes() < MIN_CHUNK_SIZE * 2));
+        let should_force = is_starved_retry || is_tail_fragmented;
+        if should_force {
+            // 合并相邻小碎片为 1MiB 级大块，减少微任务风暴
+            self.retry_handler.coalesce_small_fragments();
+            if self.retry_handler.delayed_queue_len() > 0 {
+                self.retry_handler.force_drain_delayed();
+            }
+        }
         ::tracing::trace!(
             before_retry,
             before_delayed,
             after_retry = self.retry_handler.retry_queue_len(),
             after_delayed = self.retry_handler.delayed_queue_len(),
+            starved = is_starved_retry,
+            tail_fragmented = is_tail_fragmented,
             "retry process_queues"
         );
         let mut deferred_retries = Vec::new();
         let mut retried = 0usize;
-        while let Some(chunk_to_retry) = self.retry_handler.pop_ready_chunk() {
+        // 饥饿/尾部碎片时绕过 RETRY_DELAY 1s，直接弹队头，避免单线程慢尾空转（类似内存碎片整理后直接分配）
+        while let Some(chunk_to_retry) = if should_force {
+            self.retry_handler.pop_ready_chunk_starved()
+        } else {
+            self.retry_handler.pop_ready_chunk()
+        } {
             ::tracing::debug!(
                 chunk_id = chunk_to_retry.id,
                 start = chunk_to_retry.start,

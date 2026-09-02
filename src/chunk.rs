@@ -438,7 +438,12 @@ pub(crate) async fn chunk_run_with_reliable(
                 }
                 Some(Err(e)) => {
                     let error_msg = format!("{e}");
-                    ::tracing::error!(chunk_id = id, error = %error_msg, "download stream error");
+                    // 瞬时网络抖动（decoding）降为 debug，避免 16路并败时 error 风暴
+                    if error_msg.contains("decoding") {
+                        ::tracing::debug!(chunk_id = id, error = %error_msg, "download stream transient (decoding)");
+                    } else {
+                        ::tracing::warn!(chunk_id = id, error = %error_msg, "download stream error");
+                    }
                     let actual = offset.saturating_sub(start_byte);
                     if actual != last_reported {
                             let progress = DownloadInfo::ChunkProgress { id, start_byte, end_byte: end, downloaded: actual };
@@ -579,7 +584,7 @@ pub(crate) async fn chunk_run_with_reliable(
     } else if terminated {
         ::tracing::info!(chunk_id = id, "chunk terminated, no terminal event");
     } else {
-        ::tracing::warn!(chunk_id = id, "chunk exit with failure");
+        ::tracing::debug!(chunk_id = id, "chunk exit with failure (transient)");
     }
 }
 

@@ -107,7 +107,6 @@ impl ConcurrencyManager {
             consecutive_probe_no_gain: 0,
         }
     }
-
     /// 0.5.5 热更新：运行时调整最大并发（配置灵活性）
     pub fn set_max_workers(&mut self, workers: u64) {
         let w = workers.max(1);
@@ -120,6 +119,11 @@ impl ConcurrencyManager {
             self.max_workers = w;
         }
     }
+
+    pub fn max_workers(&self) -> u64 {
+        self.max_workers
+    }
+
 
     /// 按文件大小自适应的最小剩余时间阈值（大文件更激进，小文件保持保守）。
     /// 修复前 1.5/2.0/2.5/3.5/5.0 仍导致 S2/S5 零分裂（est 0.31s/1.05s <阈值），修复后更激进以允许大中文件及早探测。
@@ -150,6 +154,34 @@ impl ConcurrencyManager {
         state: &DownloadState,
         cmd_tx: &broadcast::Sender<DownloadCmd>,
     ) {
+        // 主流尾部急补（IDM/aria2 tail）：饥饿或尾部多空闲时绕过节流与有用性门限，立即补位避免“线程跑完慢补”
+        let remaining = state.total_file_size.saturating_sub(state.total_downloaded());
+        let active = state.chunks.len() as u64;
+        let is_starved = active == 0 && remaining >= MIN_CHUNK_SIZE * 2 && !state.is_download_finished();
+        // 仅 Stable 尾部多空闲才急补，Probing 仍需正向速度证据（避免 probing_phase_does_not_split_without_positive_speed_evidence 回归）
+        let is_tail_many_idle = self.phase == DownloadPhase::Stable
+            && active > 0
+            && active * 2 < self.max_workers
+            && remaining >= MIN_CHUNK_SIZE * 2
+            && remaining < self.max_workers * MIN_CHUNK_SIZE * 16;
+        if is_starved || is_tail_many_idle {
+            if let Some(largest) = self.find_largest_splittable_chunk(&state.chunks) {
+                ::tracing::info!(
+                    chunk_id = largest.id,
+                    remaining = largest.remaining_bytes(),
+                    active,
+                    max = self.max_workers,
+                    is_starved,
+                    is_tail_many_idle,
+                    "tail/starved fast split (bypass throttle/useful)"
+                );
+                self.request_split(largest.id, cmd_tx);
+            } else {
+                ::tracing::debug!("starved/tail but no splittable largest (await retry drain)");
+            }
+            // 已处理急补，本 tick 不再走常规探测/稳定逻辑（避免被 throttle 截胡）
+            return;
+        }
         // 如果距离上次分割时间太短，则不做任何操作
         if self.last_split_time.elapsed() < MIN_SPLIT_INTERVAL {
             ::tracing::trace!(
@@ -171,7 +203,6 @@ impl ConcurrencyManager {
         if self.stable_speed_samples.is_empty() {
             return;
         }
-
         // 计算平均速度和预估剩余时间
         let avg_speed =
             self.stable_speed_samples.iter().sum::<f64>() / self.stable_speed_samples.len() as f64;
@@ -514,14 +545,21 @@ impl ConcurrencyManager {
     }
 
     fn split_is_useful(&self, state: &DownloadState, avg_speed: f64, estimated_time: f64) -> bool {
-        if avg_speed <= 0.0 {
-            return false;
-        }
-        // M3-02: 极小剩余量不值得再分，避免碎片；门槛提升至 256KiB（覆盖原 40KiB），防止小文件过度分裂
         let remaining = state
             .total_file_size
             .saturating_sub(state.total_downloaded());
         if remaining < 256 * 1024 {
+            return false;
+        }
+        // 尾部多空闲放宽（IDM 尾部分片）：大量空闲时即使 est 小也值得分，避免单线程慢尾
+        let active = state.chunks.len() as u64;
+        if active * 2 < self.max_workers
+            && remaining >= MIN_CHUNK_SIZE * 4
+            && state.chunks.values().any(|c| c.is_splittable(MIN_CHUNK_SIZE))
+        {
+            return true;
+        }
+        if avg_speed <= 0.0 {
             return false;
         }
         let mut threshold = Self::adaptive_remaining_threshold(state.total_file_size);
@@ -531,8 +569,6 @@ impl ConcurrencyManager {
         }
         estimated_time > threshold
     }
-
-    /// 在所有块中找到剩余工作量最大的、且可继续分割的块。
     fn find_largest_splittable_chunk<'a>(
         &self,
         chunks: &'a HashMap<ChunkId, ChunkState>,

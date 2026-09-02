@@ -166,28 +166,42 @@ impl ResumeMetadata {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let temp_path = temporary_metadata_path(path);
         let bytes = bitcode::encode(self);
-        // 清理残留 temp，避免 create_new AlreadyExists 导致 writer 退出（77% 故障）
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        let result = async {
-            let mut file = tokio::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp_path)
-                .await?;
-            file.write_all(&bytes).await?;
-            file.sync_all().await?;
-            drop(file);
-            atomic_replace(&temp_path, path)?;
-            sync_parent_dir(path)?;
-            Ok(())
-        }
-        .await;
-        if result.is_err() {
+        // 主流 aria2 可恢复异常：控制文件落盘永不阻塞数据面，Windows 杀软 5 争用时重试+随机后缀
+        let mut last_err: Option<DownloadError> = None;
+        for attempt in 0..3 {
+            let temp_path = temporary_metadata_path(path);
             let _ = tokio::fs::remove_file(&temp_path).await;
+            let result = async {
+                let mut file = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temp_path)
+                    .await?;
+                file.write_all(&bytes).await?;
+                file.sync_all().await?;
+                drop(file);
+                atomic_replace(&temp_path, path)?;
+                sync_parent_dir(path)?;
+                Ok::<(), DownloadError>(())
+            }
+            .await;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    let is_access_denied = matches!(&e, DownloadError::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied);
+                    last_err = Some(e);
+                    if is_access_denied && attempt < 2 {
+                        tokio::time::sleep(std::time::Duration::from_millis(80 * (attempt as u64 + 1))).await;
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+            }
         }
-        result
+        Err(last_err.unwrap())
     }
 
     pub fn set_segment_hash(&mut self, segment_index: usize, hash: u64) {
@@ -531,8 +545,10 @@ impl ResumeRecorder {
 
         if newly_completed > 0 {
             self.pending_segments += newly_completed;
-            let should_flush =
-                self.pending_segments >= 16 || self.last_save.elapsed() >= Duration::from_secs(1);
+            // 主流对齐 aria2 auto-save-interval 60s：时间主导批量，避免 1MiB/1s 在 400MB/s 下 100次/s 刷盘撞 Windows 杀软 5
+            // 新策略：至少 5s 一批（pending>0），避免高频原子替换；pending 阈值仅作最小批量门限
+            let should_flush = self.pending_segments > 0
+                && self.last_save.elapsed() >= Duration::from_secs(5);
             if should_flush {
                 let cur_digest = hash_bytes(&bitcode::encode(&self.metadata));
                 if self.last_digest == Some(cur_digest) {
@@ -540,8 +556,16 @@ impl ResumeRecorder {
                     self.pending_segments = 0;
                     self.last_save = Instant::now();
                 } else {
-                    self.metadata.save_atomic_async(&self.metadata_path).await?;
-                    self.last_digest = Some(cur_digest);
+                    // 主流 best-effort：落盘失败不阻塞数据面，避免 100% 卡死（aria2 Recoverable）
+                    match self.metadata.save_atomic_async(&self.metadata_path).await {
+                        Ok(()) => {
+                            self.last_digest = Some(cur_digest);
+                        }
+                        Err(e) => {
+                            ::tracing::debug!(error = %e, pending = self.pending_segments, "resume metadata save best-effort fail (aria2 recoverable), defer");
+                            // 丢弃本次 pending，下次增量再试，避免 5 争用时 retry 风暴卡 writer
+                        }
+                    }
                     self.pending_segments = 0;
                     self.last_save = Instant::now();
                 }
@@ -549,8 +573,7 @@ impl ResumeRecorder {
         }
         Ok(())
     }
-
-    /// 强制落盘，供 writer 退出前调用以避免最后 1MiB 窗口丢失（当前 downloader 成功后会删除 sidecar，失败/中断场景下保证最多丢 16 段）
+    /// 强制落盘，供 writer 退出前调用以避免最后 5s 窗口丢失（当前 downloader 成功后会删除 sidecar，失败/中断场景下保证最多丢 5s 增量，aria2 60s 对齐）
     pub async fn flush(&mut self) -> Result<()> {
         if self.pending_segments > 0 {
             let cur_digest = hash_bytes(&bitcode::encode(&self.metadata));
@@ -561,8 +584,10 @@ impl ResumeRecorder {
                 return Ok(());
             }
             ::tracing::debug!(pending = self.pending_segments, path = %self.metadata_path.display(), "resume recorder final flush");
-            self.metadata.save_atomic_async(&self.metadata_path).await?;
-            self.last_digest = Some(cur_digest);
+            match self.metadata.save_atomic_async(&self.metadata_path).await {
+                Ok(()) => self.last_digest = Some(cur_digest),
+                Err(e) => ::tracing::debug!(error = %e, pending = self.pending_segments, "final flush best-effort fail"),
+            }
             self.pending_segments = 0;
             self.last_save = Instant::now();
         }
