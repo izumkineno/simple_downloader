@@ -784,11 +784,25 @@ impl DownloadMonitor {
             per_sum
         };
         let total_speed = chosen_raw.min(2.0 * 1024.0 * 1024.0 * 1024.0);
+        let eta_secs = if total_speed > 0.0
+            && self.state.total_file_size > 0
+            && self.state.total_downloaded() > 0
+            && self.state.total_downloaded() < self.state.total_file_size
+            && self.state.total_downloaded() > self.state.total_file_size / 20
+        {
+            let remaining = self.state.total_file_size - self.state.total_downloaded();
+            Some((remaining as f64 / total_speed) as u64)
+        } else {
+            None
+        };
+        let pieces: Vec<bool> = Vec::new();
         let _ = info_tx.send(DownloadInfo::MonitorUpdate {
             total_size: self.state.total_file_size,
             total_downloaded: self.state.total_downloaded(),
             total_speed,
             chunk_details,
+            eta_secs,
+            pieces,
         });
     }
 

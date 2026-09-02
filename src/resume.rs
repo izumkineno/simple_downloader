@@ -16,8 +16,21 @@ use std::time::{Duration, Instant};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 pub const DEFAULT_SEGMENT_SIZE: u64 = 64 * 1024;
-const METADATA_VERSION: u32 = 1;
+const METADATA_VERSION: u32 = 2;
 const RESUME_EXTENSION: &str = "download.bitcode";
+
+/// 自适应段大小：≤100M→64K, 100M-1G→256K, >1G→1M，与硬门禁 AC-1 对齐
+pub fn adaptive_segment_size(file_size: u64) -> u64 {
+    const MIB_100: u64 = 100 * 1024 * 1024;
+    const GIB_1: u64 = 1024 * 1024 * 1024;
+    if file_size <= MIB_100 {
+        64 * 1024
+    } else if file_size <= GIB_1 {
+        256 * 1024
+    } else {
+        1024 * 1024
+    }
+}
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -110,11 +123,19 @@ pub struct ResumeMetadata {
     pub file_size: u64,
     pub segment_size: u64,
     pub segments: Vec<SegmentRecord>,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub effective_url: Option<String>,
 }
 
 impl ResumeMetadata {
     pub fn new(file_size: u64, segment_size: u64) -> Self {
-        let segment_size = segment_size.max(1);
+        // 自适应：仅当调用方传入 DEFAULT 时按文件大小分档，其余保留精确值以兼容单测的小段
+        let segment_size = if segment_size == DEFAULT_SEGMENT_SIZE {
+            adaptive_segment_size(file_size)
+        } else {
+            segment_size.max(1)
+        };
         let mut segments = Vec::new();
         let mut start = 0;
         while start < file_size {
@@ -131,12 +152,37 @@ impl ResumeMetadata {
             file_size,
             segment_size,
             segments,
+            etag: None,
+            last_modified: None,
+            effective_url: None,
         }
     }
-
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = fs::read(path)?;
-        bitcode::decode(&bytes).map_err(|error| DownloadError::ResumeMetadata(error.to_string()))
+        // 先尝试 v2 解码，失败则回退 v1（旧 64K 固定侧车兼容迁移，AC-1）
+        match bitcode::decode::<Self>(&bytes) {
+            Ok(m) => Ok(m),
+            Err(_) => {
+                #[derive(Debug, Clone, Encode, Decode)]
+                struct ResumeMetadataV1 {
+                    version: u32,
+                    file_size: u64,
+                    segment_size: u64,
+                    segments: Vec<SegmentRecord>,
+                }
+                let v1: ResumeMetadataV1 = bitcode::decode(&bytes)
+                    .map_err(|e| DownloadError::ResumeMetadata(e.to_string()))?;
+                Ok(Self {
+                    version: v1.version,
+                    file_size: v1.file_size,
+                    segment_size: v1.segment_size,
+                    segments: v1.segments,
+                    etag: None,
+                    last_modified: None,
+                    effective_url: None,
+                })
+            }
+        }
     }
 
     pub fn save_atomic(&self, path: &Path) -> Result<()> {
@@ -320,6 +366,34 @@ impl ResumeMetadata {
         );
         Ok(())
     }
+    /// ETag 变更检测：若侧车存有 ETag 且与当前 ETag 不一致（忽略大小写与 W/ 前缀），则全部段失效重建（AC-1）
+    #[allow(dead_code)]
+    pub(crate) fn check_etag_mismatch(&mut self, current_etag: Option<&str>) -> bool {
+        let Some(stored) = self.etag.as_deref() else {
+            return false;
+        };
+        let Some(cur) = current_etag else {
+            return false;
+        };
+        fn norm(s: &str) -> &str {
+            let s = s.trim();
+            if s.len() >= 2 && (s[..2].eq_ignore_ascii_case("W/")) {
+                let rest = &s[2..];
+                rest.trim().trim_matches('"')
+            } else {
+                s.trim().trim_matches('"')
+            }
+        }
+        if norm(stored).eq_ignore_ascii_case(norm(cur)) {
+            return false;
+        }
+        let cleared = self.segments.iter().filter(|s| s.hash.is_some()).count();
+        for seg in &mut self.segments {
+            seg.hash = None;
+        }
+        ::tracing::warn!(stored = %stored, current = %cur, cleared, "ETag mismatch, invalidating all segments");
+        true
+    }
 }
 
 #[derive(Debug)]
@@ -376,6 +450,62 @@ impl ResumePlan {
             };
             ::tracing::debug!(path = %metadata_path.display(), segments = metadata.segments.len(), "loaded resume metadata");
             if let Err(e) = metadata.validate_shape(file_size) {
+                // 自适应迁移：旧版 64K 固定侧车 (v1) 若文件大小不变但段大小与当前自适应不一致，尝试迁移而非直接丢弃（AC-1）
+                let expected_seg = adaptive_segment_size(file_size);
+                let is_v1_mismatch = metadata.version == 1
+                    && metadata.file_size == file_size
+                    && metadata.segment_size != expected_seg;
+                if is_v1_mismatch {
+                    ::tracing::info!(
+                        path = %metadata_path.display(),
+                        old_seg = metadata.segment_size,
+                        new_seg = expected_seg,
+                        "migrating v1 sidecar to adaptive segment size"
+                    );
+                    let mut new_meta = ResumeMetadata::new(file_size, DEFAULT_SEGMENT_SIZE);
+                    // 尽量保留已校验进度：若新段完全被旧已校验段覆盖，则重算该新段 hash
+                    let old_verified = metadata.verified_ranges();
+                    for idx in 0..new_meta.segments.len() {
+                        let ns = new_meta.segments[idx].start;
+                        let ne = new_meta.segments[idx].end;
+                        let fully_covered = old_verified.iter().any(|(os, oe)| *os <= ns && *oe >= ne)
+                            || {
+                                // 64K→1M 场景：需多个旧段拼接覆盖，检查是否所有 64K 旧段在 [ns,ne] 内均已校验
+                                let mut covered = 0u64;
+                                for (os, oe) in &old_verified {
+                                    let is = (*os).max(ns);
+                                    let ie = (*oe).min(ne);
+                                    if is <= ie {
+                                        covered += ie - is + 1;
+                                    }
+                                }
+                                covered == ne - ns + 1
+                            };
+                        if fully_covered {
+                            if let Ok(mut f) = fs::File::open(output_path) {
+                                let len = ne - ns + 1;
+                                let mut buf = vec![0u8; len as usize];
+                                use std::io::{Seek, Read};
+                                if f.seek(SeekFrom::Start(ns)).is_ok() && f.read_exact(&mut buf).is_ok() {
+                                    new_meta.segments[idx].hash = Some(hash_bytes(&buf));
+                                }
+                            }
+                        }
+                    }
+                    new_meta.etag = metadata.etag.clone();
+                    new_meta.last_modified = metadata.last_modified.clone();
+                    new_meta.effective_url = metadata.effective_url.clone();
+                    let _ = new_meta.save_atomic(&metadata_path);
+                    let remaining_ranges = new_meta.remaining_ranges();
+                    let completed_bytes = new_meta.completed_bytes();
+                    return Ok(Self {
+                        metadata_path,
+                        metadata: Some(new_meta),
+                        truncate_output: false,
+                        remaining_ranges,
+                        completed_bytes,
+                    });
+                }
                 ::tracing::warn!(error=%e, path=%metadata_path.display(), "resume shape mismatch, discarding sidecar and rebuilding");
                 let _ = fs::remove_file(&metadata_path);
                 let metadata = ResumeMetadata::new(file_size, DEFAULT_SEGMENT_SIZE);

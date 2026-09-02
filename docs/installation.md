@@ -24,13 +24,13 @@ rustup update
 
 ```toml
 [dependencies]
-simple_downloader = "0.6.7"
+simple_downloader = "0.7.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
 此时可用 `Downloader::builder(url, path).download().await`，未启用 `resume/progress/multi-source/proxy`。
 
-> `simple_downloader = "0.6.7"` **不会** 默认启用任何可选功能，旧文“默认启用所有”已过时。
+> `simple_downloader = "0.7.0"` **不会** 默认启用任何可选功能，旧文“默认启用所有”已过时。
 ## 自定义 Feature 安装
 
 以 `Cargo.toml:14-19` 与 `docs/usage.md:25` 为准：
@@ -119,17 +119,9 @@ async fn main() {
 cargo run
 ```
 
-| simple_downloader | 最低 Rust | 关键依赖 |
-|-------------------|-----------|----------|
-| 0.6.x | 1.85 | `tokio 1.52` `reqwest 0.13` `thiserror 2` `bytes 1` `faststr 0.2` `futures-util 0.3` `bitcode 0.6` (resume) `tracing 0.1` `tracing-subscriber 0.3` `governor 0.7` (rate-limit) `uuid 1` (queue) `parking_lot 0.12` |
-| 0.5.x | 1.85 | `tokio 1.52` `reqwest 0.13` `thiserror 2` `bytes 1` `faststr 0.2` `futures-util 0.3` `bitcode 0.6` (resume) `tracing 0.1` `tracing-subscriber 0.3` `governor 0.7` (rate-limit) `parking_lot 0.12` |
-| 0.4.x | 1.85 | `tokio 1.52` `reqwest 0.13` `thiserror 2` `bytes 1` `faststr 0.2` `futures-util 0.3` `bitcode 0.6` (resume) `tracing 0.1` `tracing-subscriber 0.3` `parking_lot 0.12` |
-| 0.3.x | 1.85 | `tokio 1.52` `reqwest 0.13` `thiserror 2` `bytes 1` `faststr 0.2` `futures-util 0.3` `bitcode 0.6` (resume) `parking_lot 0.12` |
-| 0.2.x | 1.85 | 同 0.3.x，逻辑加固与测试补齐 |
-| 0.1.x | 1.85 | 同 0.2.x，API 兼容，仅性能与文档差异 |
-> 当前 `Cargo.toml:3` 为 `0.6.7`，上表以 `0.6.x` 行覆盖（`b4fcadf/eef24ea/全局热更` 已在 `0.6.7` 发版）。
-## Cargo 配置优化（可选）
+| 0.7.x | 1.85 | `tokio 1.52` `reqwest 0.13` `thiserror 2` `bytes 1` `faststr 0.2` `futures-util 0.3` `bitcode 0.6` (resume) `tracing 0.1` `tracing-subscriber 0.3` `governor 0.7` (rate-limit) `uuid 1` (queue) `parking_lot 0.12` |
 
+> 当前 `Cargo.toml:3` 为 `0.7.0`，上表以 `0.7.x` 行覆盖（`0.7.0 6组件: 自适应段/ETag/重试/探测/限速burst/ETA·pieces` 已发版）。
 `~/.cargo/config.toml`:
 
 ```toml

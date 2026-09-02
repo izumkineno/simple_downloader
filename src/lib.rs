@@ -26,13 +26,13 @@
 //!
 //! ```toml
 //! # 最轻量：仅基础下载
-//! simple_downloader = { version = "0.6", default-features = false }
+//! simple_downloader = { version = "0.7", default-features = false }
 //! # 常用：基础 + 断点续传 + 进度
-//! simple_downloader = { version = "0.6", default-features = false, features = ["resume", "progress"] }
+//! simple_downloader = { version = "0.7", default-features = false, features = ["resume", "progress"] }
 //! # 队列调度（可选）
-//! simple_downloader = { version = "0.6", default-features = false, features = ["queue"] }
+//! simple_downloader = { version = "0.7", default-features = false, features = ["queue"] }
 //! # 全功能（含限速与队列）
-//! simple_downloader = { version = "0.6", default-features = false, features = ["resume", "progress", "multi-source", "proxy", "rate-limit", "queue"] }
+//! simple_downloader = { version = "0.7", default-features = false, features = ["resume", "progress", "multi-source", "proxy", "rate-limit", "queue"] }
 //! ```
 //! ### 基础下载（无需任何 feature）
 //!
@@ -180,7 +180,7 @@ pub use lane::{
 #[cfg(feature = "queue")]
 pub use queue::{QueueError, TaskQueue};
 #[cfg(feature = "resume")]
-pub use resume::{DEFAULT_SEGMENT_SIZE, ResumeMetadata, hash_bytes, metadata_path_for};
+pub use resume::{adaptive_segment_size, hash_bytes, metadata_path_for, ResumeMetadata, DEFAULT_SEGMENT_SIZE};
 #[cfg(feature = "queue")]
 pub use task::{TaskId, TaskSnapshot, TaskState};
 // 导出公共类型，方便用户在类型注解和模式匹配中使用。

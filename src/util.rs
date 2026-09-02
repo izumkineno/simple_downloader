@@ -44,12 +44,23 @@ pub(crate) fn ensure_user_agent(rb: RequestBuilder) -> RequestBuilder {
 /// 一个元组 `(u64, bool)`，分别代表文件总大小和服务器是否支持范围请求。
 #[::tracing::instrument(skip(client), fields(url = %url))]
 pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
-    use reqwest::StatusCode;
-    use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE};
+    let (size, support, _etag, _lm) = get_file_info_with_headers(client, url).await?;
+    Ok((size, support))
+}
 
+/// 含 ETag/Last-Modified 的探测，复用 get_file_info 逻辑但额外透出头部供 resume 侧车存储（AC-1）
+#[::tracing::instrument(skip(client), fields(url = %url))]
+pub async fn get_file_info_with_headers(
+    client: &Client,
+    url: &str,
+) -> Result<(u64, bool, Option<String>, Option<String>)> {
+    use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, LAST_MODIFIED};
+    use reqwest::StatusCode;
     // 记录 HEAD 探测结果，但不直接作为 Range 判定依据；Accept-Ranges 缺失时仍可能支持 Range
     let mut head_size: Option<u64> = None;
     let mut head_support = false;
+    let mut head_etag: Option<String> = None;
+    let mut head_last_modified: Option<String> = None;
     if let Ok(resp) = ensure_user_agent(client.head(url))
         .send()
         .await
@@ -64,6 +75,12 @@ pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
             head_support = headers
                 .get(ACCEPT_RANGES)
                 .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"bytes"));
+        }
+        if let Some(v) = headers.get(ETAG).and_then(|v| v.to_str().ok()) {
+            head_etag = Some(v.to_string());
+        }
+        if let Some(v) = headers.get(LAST_MODIFIED).and_then(|v| v.to_str().ok()) {
+            head_last_modified = Some(v.to_string());
         }
     }
 
@@ -85,7 +102,7 @@ pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
         Err(e) => {
             ::tracing::warn!(error = %e, head_size = ?head_size, "Range GET failed, fallback to HEAD");
             if let Some(size) = head_size {
-                return Ok((size, head_support));
+                return Ok((size, head_support, head_etag, head_last_modified));
             }
             return Err(DownloadError::MissingContentLength);
         }
@@ -93,6 +110,10 @@ pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
 
     let status = range_resp.status();
     let headers = range_resp.headers();
+    let range_etag = headers.get(ETAG).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    let range_lm = headers.get(LAST_MODIFIED).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    let cur_etag = range_etag.clone().or(head_etag.clone());
+    let cur_lm = range_lm.clone().or(head_last_modified.clone());
     if !status.is_success() && status != StatusCode::PARTIAL_CONTENT {
         // 416 特殊处理：尝试从 Content-Range: bytes */<total> 解析文件大小
         if status == StatusCode::RANGE_NOT_SATISFIABLE
@@ -102,11 +123,11 @@ pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
             && total != 0
         {
             ::tracing::info!(total, "probe via 416 Content-Range");
-            return Ok((total, true));
+            return Ok((total, true, cur_etag, cur_lm));
         }
         if let Some(size) = head_size {
             ::tracing::debug!(size, "Range GET non-success, fallback to HEAD size");
-            return Ok((size, head_support));
+            return Ok((size, head_support, cur_etag, cur_lm));
         }
         // 4xx/5xx 且无 HEAD 回退时，不应把错误响应体的 Content-Length 当作文件大小（例如 400 "No userAgent" 27B）
         // 仅对 2xx 的兜底在后续分支处理，此处直接失败以触发 streaming 回退或上层错误
@@ -127,7 +148,7 @@ pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
                         support_ranges = true,
                         "probe via 206 Content-Range"
                     );
-                    return Ok((content_length, true));
+                    return Ok((content_length, true, cur_etag, cur_lm));
                 }
             }
         }
@@ -137,7 +158,7 @@ pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
                 size,
                 "206 without Content-Range, fallback to HEAD size with range support"
             );
-            return Ok((size, true));
+            return Ok((size, true, cur_etag, cur_lm));
         }
         if let Some(len_val) = headers.get(CONTENT_LENGTH)
             && let Ok(len_str) = len_val.to_str()
@@ -147,7 +168,7 @@ pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
                 content_length,
                 "206 without Content-Range, fallback via Content-Length"
             );
-            return Ok((content_length, true));
+            return Ok((content_length, true, cur_etag, cur_lm));
         }
     }
 
@@ -165,7 +186,7 @@ pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
                     support_ranges = true,
                     "probe via 200 Content-Range"
                 );
-                return Ok((content_length, true));
+                return Ok((content_length, true, cur_etag, cur_lm));
             }
         }
     }
@@ -173,7 +194,7 @@ pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
     // 3. 最终回退：优先 HEAD 的 size，否则 Range 响应的 Content-Length，保守判不支持
     if let Some(size) = head_size {
         ::tracing::info!(size, head_support, "probe fallback to HEAD");
-        return Ok((size, head_support));
+        return Ok((size, head_support, cur_etag, cur_lm));
     }
     if let Some(len_val) = headers.get(CONTENT_LENGTH)
         && let Ok(len_str) = len_val.to_str()
@@ -183,13 +204,12 @@ pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
             content_length,
             "probe fallback via GET Content-Length (no range)"
         );
-        return Ok((content_length, false));
+        return Ok((content_length, false, cur_etag, cur_lm));
     }
 
     ::tracing::error!("probe failed: MissingContentLength");
     Err(DownloadError::MissingContentLength)
 }
-
 /// 解析 `Content-Range` 头，支持 `bytes <start>-<end>/<total>` 及 `bytes */<total>` 形式。
 ///
 /// - 正常范围：`bytes 0-44/45` -> `Some((0,44,45))`

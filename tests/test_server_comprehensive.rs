@@ -87,6 +87,8 @@ async fn zero_byte_via_test_server_is_complete() {
         total_downloaded: 0,
         total_speed: 0.0,
         chunk_details: vec![],
+        eta_secs: None,
+        pieces: Vec::new(),
     };
     assert!(info.is_complete(), "0 字节 is_complete 应为 true");
     // 文件应存在且大小 0
@@ -246,6 +248,8 @@ fn retry_permanent_failure_unit() {
         total_downloaded: 100,
         total_speed: 0.0,
         chunk_details: vec![],
+        eta_secs: None,
+        pieces: Vec::new(),
     };
     assert!(info.is_complete());
     let zero = DownloadInfo::MonitorUpdate {
@@ -253,6 +257,8 @@ fn retry_permanent_failure_unit() {
         total_downloaded: 0,
         total_speed: 0.0,
         chunk_details: vec![],
+        eta_secs: None,
+        pieces: Vec::new(),
     };
     assert!(zero.is_complete(), "0 字节应完成");
 }
@@ -299,6 +305,8 @@ fn state_complete_uses_size_not_downloaded() {
         total_downloaded: 10,
         total_speed: 0.0,
         chunk_details: vec![],
+        eta_secs: None,
+        pieces: Vec::new(),
     };
     let _ = state.is_complete();
 }
@@ -329,6 +337,8 @@ async fn head_without_accept_ranges_still_supports_range() {
         total_downloaded: 0,
         total_speed: 0.0,
         chunk_details: vec![],
+        eta_secs: None,
+        pieces: Vec::new(),
     }
     .is_complete();
     // 额外为真实下载的 Range GET 做 mock

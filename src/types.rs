@@ -166,8 +166,11 @@ pub enum DownloadInfo {
         /// - 4: 已完成
         /// - 5: 失败
         chunk_details: Vec<(ChunkId, u64, u64, f64, u8)>,
+        /// 预计剩余时间（秒），`None` 表示无法估算（例如刚开始或速度为0）
+        eta_secs: Option<u64>,
+        /// 每段完成位图：`true` 表示该段已完成，长度等于 `ResumeMetadata` 段数（若无 resume 则为空）
+        pieces: Vec<bool>,
     },
-
     /// 下载块完成通知。
     ///
     /// 当某个下载块成功下载完成时发送此消息。
@@ -290,6 +293,22 @@ impl DownloadInfo {
                 }
             }
             _ => false,
+        }
+    }
+
+    /// 获取预计剩余时间（秒）— 仅 MonitorUpdate 有效
+    pub fn eta_secs(&self) -> Option<u64> {
+        match self {
+            DownloadInfo::MonitorUpdate { eta_secs, .. } => *eta_secs,
+            _ => None,
+        }
+    }
+
+    /// 获取段完成位图 — 仅 MonitorUpdate 有效
+    pub fn pieces(&self) -> Option<&[bool]> {
+        match self {
+            DownloadInfo::MonitorUpdate { pieces, .. } => Some(pieces),
+            _ => None,
         }
     }
 }

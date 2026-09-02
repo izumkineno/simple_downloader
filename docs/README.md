@@ -15,8 +15,7 @@
 - `tests/util.rs`：文件信息探测回退链路、写入任务和基础工具行为。
 - `test_server/server.py`：本地可控 Range/限速测试服务，适合集成验证与手工观察并发行为。
 
-## 二、项目概览（按 0.6.7 源码校准）
-
+## 二、项目概览（按 0.7.0 源码校准）
 simple_downloader 是一个基于 Rust 与 Tokio 的异步下载库，当前实现重点在于：
 
 - `Downloader`：`DownloadBuilder` 流式编排入口，负责 `Client`（`pool 32/90s/60s + UA`）、`get_file_info` 三级回退探测、`ResumePlan` + 写入任务和初始 `remaining_ranges` 分片。
@@ -70,7 +69,7 @@ simple_downloader 是一个基于 Rust 与 Tokio 的异步下载库，当前实�
 
 ## 四、推荐验证命令
 
-在仓库根目录运行（以 `Cargo.toml:3 0.6.7` 为准）：
+在仓库根目录运行（以 `Cargo.toml:3 0.7.0` 为准）：
 
 ```bash
 cargo fmt --check

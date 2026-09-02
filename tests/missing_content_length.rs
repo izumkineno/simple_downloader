@@ -56,6 +56,8 @@ async fn zero_byte_still_works() {
         total_downloaded: 0,
         total_speed: 0.0,
         chunk_details: vec![],
+        eta_secs: None,
+        pieces: Vec::new(),
     };
     assert!(info.is_complete(), "0 字节应完成");
     let not_yet = DownloadInfo::MonitorUpdate {
@@ -63,6 +65,8 @@ async fn zero_byte_still_works() {
         total_downloaded: 10,
         total_speed: 0.0,
         chunk_details: vec![],
+        eta_secs: None,
+        pieces: Vec::new(),
     };
     assert!(!not_yet.is_complete(), "未知大小 0/10 不应完成");
 }

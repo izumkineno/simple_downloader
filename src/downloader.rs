@@ -822,6 +822,8 @@ where
                         total_downloaded,
                         total_speed: speed,
                         chunk_details: vec![(0, 0, total_downloaded, speed, 0)],
+                        eta_secs: None,
+                        pieces: Vec::new(),
                     });
                 }
             }
@@ -842,6 +844,8 @@ where
             total_downloaded,
             total_speed: 0.0,
             chunk_details: vec![],
+            eta_secs: None,
+            pieces: Vec::new(),
         });
         let _ = self.info_tx.send(DownloadInfo::DownloadComplete(0));
         ::tracing::info!(total_downloaded, path = %writer_path, "streaming_download complete");

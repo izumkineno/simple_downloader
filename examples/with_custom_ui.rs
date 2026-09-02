@@ -52,6 +52,7 @@ async fn progress_bar_task(file_size: u64, mut info_rx: broadcast::Receiver<Down
                 total_downloaded,
                 total_speed,
                 chunk_details,
+                ..
             } => {
                 // 1. 更新总体进度条
                 total_pb.set_length(total_size);

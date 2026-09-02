@@ -42,7 +42,10 @@ mod imp {
             bytes_per_sec: NonZeroU32,
             burst: Option<NonZeroU32>,
         ) -> Arc<GovLimiter<NotKeyed, InMemoryState, QuantaClock>> {
-            let burst_val = burst.unwrap_or_else(|| NonZeroU32::new(64 * 1024).unwrap());
+            let burst_val = burst.unwrap_or_else(|| {
+                let adaptive = (bytes_per_sec.get() / 10).clamp(32 * 1024, 1024 * 1024);
+                NonZeroU32::new(adaptive).unwrap()
+            });
             let quota = Quota::per_second(bytes_per_sec).allow_burst(burst_val);
             Arc::new(GovLimiter::direct(quota))
         }

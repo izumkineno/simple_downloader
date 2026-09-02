@@ -7,11 +7,32 @@
 
 ## [Unreleased]
 
-### 待规划（与 `README TODO` 一致，已扣除 0.6.4 已发项）
+### 延期（0.7 未作，已记录；下轮实现）
 
-- [ ] 更智能的多源调度评分（`probe_speed 64KiB` 排序+黑名单 `3/30s` 已落地，`EWMA` 动态评分待 0.7）
-- [ ] 更完整的多代理端到端测试矩阵（`PerSourceProxy` 模型已落地）
-- [ ] 元数据 `version=1` 跨版本迁移策略与可观测性（`validate_shape` 自愈重建已落地，复用/失效 `segment` 事件待 0.7）
+- **EWMA 动态评分持久化** `lane.rs` `EWMA 0.3*probe +0.7*score` + 跨次 `server-stat.json` 持久（`research 07`，`R4 Contrarian` 已延期，当前仅 `3/30s` 二进制黑名单 + `64KiB probe` 排序）
+- **队列优先级与持久化** `queue.rs` `TaskQueue` 优先级抢占 + `save-session` 落盘（`research 09`，`R6 Simplifier` 已延期，当前仅 `FIFO + bench 选型`）
+- **per-chunk 2s 滑动窗** `state.rs` `ChunkState` 现仍 `EMA α=0.30`，待 `SpeedEstimator 2s` 统一（AC-5 中 ETA/位图已落地，速度窗待 0.7.1）
+- **per_source 限速热更完整** `lane.rs` `ArcSwap` 全量热更（当前 `global` 已 `reconfigure`，`per_source` 仅 `burst` 自适应，热更待补）
+- **I/O bench 数据化** `util.rs` `coalesce 128K→256K/512K` bench 选型数据待 `cargo bench` 后落 `docs/performance.md`（AC-6 当前仅阈值，数据待补）
+
+---
+
+## [0.7.0] - 2026-09-02
+
+### 💥 Breaking（不限 breaking 共识，6 硬门禁）
+
+- **自适应段** `resume.rs:18 adaptive_segment_size` `≤100M→64K / 100M-1G→256K / >1G→1M`，侧车段数 `1G ≤1200`，旧 `64K` 侧车 `v1` 自动迁移为新分档（`AC-1`，`METADATA_VERSION 1→2` 兼容 `v1` bitcode 回退）
+- **ETag 失效** `resume.rs:371 check_etag_mismatch` + `util.rs:get_file_info_with_headers` 透出 `ETag/Last-Modified`，`HEAD` 变更后全段失效重建（`AC-1`）
+- **重试指数** `retry.rs:44 retry_delay` `1s*2^min(attempt,3) cap8s +0-200ms jitter` + `classify_error` `Transient/Permanent/Retriable`（`decoding不计total，403/416直进permanent`，`AC-2`）
+- **探测** `util.rs:53 get_file_info_with_headers` `416 bytes */total` 与 `302→CDN` 重定向重探 `total`，`AC-3`
+- **限速** `limiter.rs:45 burst=clamp(limit/10,32K,1M)` 自适应，`AC-3`
+- **进度** `types.rs:151 MonitorUpdate {eta_secs, pieces}` + `monitor.rs:787 ETA` + `pieces Vec<bool>`（`AC-5`，`#[non_exhaustive]` 仍 minor 但 `0.7.0` 记 breaking）
+
+### 修复与优化
+
+- `retry.rs` `pop_ready_chunk` 改 `Instant::now() >= failure_time` 匹配指数 `failure_time = now+base+batch`，消除 `1s` 双计
+- `retry.rs` `TRANSIENT` 不计 `MAX_TOTAL_ATTEMPTS 30`，`7路 decoding` 风暴 10s 内 `WARN≤3`（`AC-2`）
+- `resume.rs` `save_atomic` 去重 `lastDigest` + `5s batch` 保持，`verify_against_file` 后 `save_atomic` 同步 `ETag`
 
 ---
 

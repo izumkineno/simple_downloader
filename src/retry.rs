@@ -15,7 +15,41 @@ const RETRY_DELAY: Duration = Duration::from_secs(1);
 const DELAYED_RETRY_DURATION: Duration = Duration::from_secs(10);
 /// 单块跨延迟周期的最大总尝试次数，超过则判永久失败避免永重试挂死。
 const MAX_TOTAL_ATTEMPTS: u32 = 30;
-/// 存储失败块的信息，用于重试。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ErrorClass {
+    Transient,
+    Permanent,
+    Retriable,
+}
+
+pub(crate) fn classify_error(msg: &str) -> ErrorClass {
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("decoding")
+        || lower.contains("early eof")
+        || lower.contains("unexpected eof")
+        || lower.contains("early_eof")
+    {
+        ErrorClass::Transient
+    } else if lower.contains("403")
+        || lower.contains("404")
+        || lower.contains("416")
+        || lower.contains("forbidden")
+        || lower.contains("not found")
+    {
+        ErrorClass::Permanent
+    } else {
+        ErrorClass::Retriable
+    }
+}
+
+/// 指数退避：1s*2^min(attempt,3) capped 8s +0-200ms jitter，与AC-2一致
+pub(crate) fn retry_delay(attempt: u32) -> Duration {
+    let exp = attempt.min(3);
+    let base_secs = 1u64 << exp; // 1,2,4,8
+    let base = Duration::from_secs(base_secs.min(8));
+    let jitter_ms = (attempt.wrapping_mul(73) % 200) as u64;
+    base + Duration::from_millis(jitter_ms)
+}
 #[derive(Debug)]
 pub struct FailedChunkInfo {
     pub id: ChunkId,
@@ -145,10 +179,34 @@ impl RetryHandler {
             self.retry_attempts.remove(&id);
             return;
         }
-        // 跨周期总计数，超过阈值判永久失败
+        let err_class = classify_error(&error);
+        if err_class == ErrorClass::Permanent {
+            ::tracing::error!(chunk_id = id, error = %error, "permanent error class, no retry");
+            let _ = info_tx.send(DownloadInfo::ChunkStatusChanged {
+                id,
+                status: 5,
+                message: Some(format!("永久失败（不可重试）: {error}")),
+            });
+            self.permanent_failures.push(FailedChunkInfo {
+                id,
+                start,
+                end,
+                failure_time: Instant::now(),
+                attempts: *self.total_attempts.get(&id).unwrap_or(&0) + 1,
+            });
+            self.retry_attempts.remove(&id);
+            return;
+        }
+        // 跨周期总计数，超过阈值判永久失败（Transient 不计 total，避免 decoding 风暴占满 30 次）
         let total = self.total_attempts.entry(id).or_insert(0);
-        *total += 1;
-        if *total > MAX_TOTAL_ATTEMPTS {
+        let is_transient = err_class == ErrorClass::Transient;
+        if !is_transient {
+            *total += 1;
+        } else {
+            // Transient 仍需记录但不计入 total，单独计数 retry_attempts
+            ::tracing::debug!(chunk_id = id, "transient not counted to total_attempts");
+        }
+        if !is_transient && *total > MAX_TOTAL_ATTEMPTS {
             ::tracing::error!(
                 chunk_id = id,
                 total = *total,
@@ -173,6 +231,7 @@ impl RetryHandler {
 
         // 增加该块的周期内重试次数
         let attempts = self.retry_attempts.entry(id).or_insert(0);
+        *attempts += 1;
         // 批量失败熔断：500ms 内多路并败时抖动退避，避免 16路并发重试惊群
         let now = Instant::now();
         let is_batch = self
@@ -201,7 +260,6 @@ impl RetryHandler {
                     "chunk will retry"
                 );
             }
-
             // 发送状态变更为“等待重试”
             let _ = info_tx.send(DownloadInfo::ChunkStatusChanged {
                 id,
@@ -212,10 +270,11 @@ impl RetryHandler {
                 )),
             });
 
+            let base_delay = retry_delay(*attempts);
             let failure_time = if is_batch {
-                now + Duration::from_millis(200 * (self.retry_queue.len() as u64 + 1))
+                now + base_delay + Duration::from_millis(200 * (self.retry_queue.len() as u64 + 1))
             } else {
-                now
+                now + base_delay
             };
             self.retry_queue.push_back(FailedChunkInfo {
                 id,
@@ -346,10 +405,7 @@ impl RetryHandler {
 
     /// 从即时重试队列中弹出一个已达到重试延迟时间的块（扫描首个就绪项，避免队头阻塞）。
     pub fn pop_ready_chunk(&mut self) -> Option<FailedChunkInfo> {
-        let pos = self
-            .retry_queue
-            .iter()
-            .position(|c| c.failure_time.elapsed() >= RETRY_DELAY)?;
+        let pos = self.retry_queue.iter().position(|c| Instant::now() >= c.failure_time)?;
         let chunk = self.retry_queue.remove(pos);
         if let Some(c) = &chunk {
             ::tracing::debug!(
