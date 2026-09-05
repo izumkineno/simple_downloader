@@ -42,14 +42,31 @@ pub(crate) fn ensure_user_agent(rb: RequestBuilder) -> RequestBuilder {
 ///
 /// # 返回
 /// 一个元组 `(u64, bool)`，分别代表文件总大小和服务器是否支持范围请求。
-#[::tracing::instrument(skip(client), fields(url = %url))]
+/// 日志用 URL 脱敏：去 userinfo/query/fragment，只留 scheme/host/path。
+/// 纯字符串处理，不做 URL 解析（零依赖），畸形输入原样截断到 `?`/`#` 之前。
+pub(crate) fn redact_url(url: &str) -> String {
+    let no_frag = url.split('#').next().unwrap_or(url);
+    let no_query = no_frag.split('?').next().unwrap_or(no_frag);
+    if let Some(scheme_end) = no_query.find("://") {
+        let rest = &no_query[scheme_end + 3..];
+        if let Some(at) = rest.find('@') {
+            let mut out = String::with_capacity(no_query.len());
+            out.push_str(&no_query[..scheme_end + 3]);
+            out.push_str(&no_query[scheme_end + 3 + at + 1..]);
+            return out;
+        }
+    }
+    no_query.to_string()
+}
+
+#[::tracing::instrument(skip(client), fields(url = %redact_url(url)))]
 pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
     let (size, support, _etag, _lm) = get_file_info_with_headers(client, url).await?;
     Ok((size, support))
 }
 
 /// 含 ETag/Last-Modified 的探测，复用 get_file_info 逻辑但额外透出头部供 resume 侧车存储（AC-1）
-#[::tracing::instrument(skip(client), fields(url = %url))]
+#[::tracing::instrument(skip(client), fields(url = %redact_url(url)))]
 pub async fn get_file_info_with_headers(
     client: &Client,
     url: &str,
@@ -61,27 +78,31 @@ pub async fn get_file_info_with_headers(
     let mut head_support = false;
     let mut head_etag: Option<String> = None;
     let mut head_last_modified: Option<String> = None;
-    if let Ok(resp) = ensure_user_agent(client.head(url))
+    match ensure_user_agent(client.head(url))
         .send()
         .await
         .and_then(|r| r.error_for_status())
     {
-        let headers = resp.headers();
-        if let Some(len_val) = headers.get(CONTENT_LENGTH)
-            && let Ok(len_str) = len_val.to_str()
-            && let Ok(content_length) = len_str.parse::<u64>()
-        {
-            head_size = Some(content_length);
-            head_support = headers
-                .get(ACCEPT_RANGES)
-                .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"bytes"));
+        Ok(resp) => {
+            let headers = resp.headers();
+            if let Some(len_val) = headers.get(CONTENT_LENGTH)
+                && let Ok(len_str) = len_val.to_str()
+                && let Ok(content_length) = len_str.parse::<u64>()
+            {
+                head_size = Some(content_length);
+                head_support = headers
+                    .get(ACCEPT_RANGES)
+                    .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"bytes"));
+            }
+            if let Some(v) = headers.get(ETAG).and_then(|v| v.to_str().ok()) {
+                head_etag = Some(v.to_string());
+            }
+            if let Some(v) = headers.get(LAST_MODIFIED).and_then(|v| v.to_str().ok()) {
+                head_last_modified = Some(v.to_string());
+            }
         }
-        if let Some(v) = headers.get(ETAG).and_then(|v| v.to_str().ok()) {
-            head_etag = Some(v.to_string());
-        }
-        if let Some(v) = headers.get(LAST_MODIFIED).and_then(|v| v.to_str().ok()) {
-            head_last_modified = Some(v.to_string());
-        }
+        // HEAD 失败只记 warn 不回错：后继 Range GET 才是金标准；`{e:#}` 保留源链，否则只剩“error sending request”
+        Err(e) => ::tracing::warn!(error = format!("{e:#}"), "HEAD probe failed"),
     }
 
     ::tracing::debug!(head_size = ?head_size, head_support, "HEAD probe result");
@@ -100,7 +121,7 @@ pub async fn get_file_info_with_headers(
             resp
         }
         Err(e) => {
-            ::tracing::warn!(error = %e, head_size = ?head_size, "Range GET failed, fallback to HEAD");
+            ::tracing::warn!(error = format!("{e:#}"), head_size = ?head_size, "Range GET failed, fallback to HEAD");
             if let Some(size) = head_size {
                 return Ok((size, head_support, head_etag, head_last_modified));
             }
@@ -365,11 +386,14 @@ async fn file_writer_task_impl(
                             break;
                         }
                         #[cfg(feature = "resume")]
-                        if let Some(recorder) = resume_recorder.as_mut() {
-                            // 主流 aria2 可恢复：侧车落盘永不阻塞数据面，失败仅降级，最多丢 5s 窗口（原 16段/1s 高频已降频）
-                            if let Err(e) = recorder.record_write(&mut file, p_off, p_buf.len() as u64).await {
-                                ::tracing::debug!(error = %e, offset = p_off, "resume metadata best-effort fail, degrade (data already flushed)");
-                            }
+                        if let Some(recorder) = resume_recorder.as_mut()
+                            && let Err(e) = recorder
+                                .record_write(&mut file, p_off, p_buf.len() as u64)
+                                .await
+                        {
+                            ::tracing::error!(error = %e, offset = p_off, "resume metadata update failed");
+                            writer_err = Some(e);
+                            break;
                         }
                         ::tracing::trace!(
                             offset = p_off,
@@ -393,10 +417,13 @@ async fn file_writer_task_impl(
                             writer_err = Some(DownloadError::Io(e));
                         } else {
                             #[cfg(feature = "resume")]
-                            if let Some(recorder) = resume_recorder.as_mut() {
-                                if let Err(e) = recorder.record_write(&mut file, p_off, p_buf.len() as u64).await {
-                                    ::tracing::debug!(error = %e, offset = p_off, "resume metadata best-effort fail on TerminateAll, degrade");
-                                }
+                            if let Some(recorder) = resume_recorder.as_mut()
+                                && let Err(e) = recorder
+                                    .record_write(&mut file, p_off, p_buf.len() as u64)
+                                    .await
+                            {
+                                ::tracing::error!(error = %e, offset = p_off, "resume metadata update failed on TerminateAll");
+                                writer_err = Some(e);
                             }
                             if writer_err.is_none() {
                                 ::tracing::trace!(
@@ -431,10 +458,13 @@ async fn file_writer_task_impl(
                     writer_err = Some(DownloadError::Io(e));
                 } else {
                     #[cfg(feature = "resume")]
-                    if let Some(recorder) = resume_recorder.as_mut() {
-                        if let Err(e) = recorder.record_write(&mut file, p_off, p_buf.len() as u64).await {
-                            ::tracing::debug!(error = %e, offset = p_off, "resume metadata best-effort fail on channel close, degrade");
-                        }
+                    if let Some(recorder) = resume_recorder.as_mut()
+                        && let Err(e) = recorder
+                            .record_write(&mut file, p_off, p_buf.len() as u64)
+                            .await
+                    {
+                        ::tracing::error!(error = %e, offset = p_off, "resume metadata update failed on channel close");
+                        writer_err = Some(e);
                     }
                 }
             }
@@ -448,7 +478,10 @@ async fn file_writer_task_impl(
         #[cfg(feature = "resume")]
         if let Some(recorder) = resume_recorder.as_mut() {
             if let Err(e) = recorder.flush().await {
-                ::tracing::debug!(error = %e, "resume recorder final flush best-effort fail, degrade");
+                ::tracing::error!(error = %e, "resume recorder final flush failed");
+                if writer_err.is_none() {
+                    writer_err = Some(e);
+                }
             } else {
                 ::tracing::debug!("resume recorder flushed on writer exit");
             }
@@ -473,6 +506,19 @@ async fn file_writer_task_impl(
 mod tests {
     use super::*;
     use bytes::Bytes;
+
+    #[test]
+    fn redact_url_strips_secrets() {
+        assert_eq!(
+            redact_url("https://host.com/file.zip?token=abc#frag"),
+            "https://host.com/file.zip"
+        );
+        assert_eq!(
+            redact_url("https://user:pass@host.com:8080/f.zip"),
+            "https://host.com:8080/f.zip"
+        );
+        assert_eq!(redact_url("https://host.com/f.zip"), "https://host.com/f.zip");
+    }
 
     #[tokio::test]
     async fn writer_truncate_true_removes_stale_tail() {

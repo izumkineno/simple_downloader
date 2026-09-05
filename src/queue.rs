@@ -278,11 +278,12 @@ impl TaskQueue {
         loop {
             {
                 let s = self.state.lock().await;
-                if s.queue.is_empty() && s.active.is_empty() {
+                if s.queue.is_empty() && s.active.is_empty() && s.pending_deletes.is_empty() {
                     return;
                 }
             }
-            self.notify.notified().await;
+            // 200ms 冲刷 tick 不 notify，用超时轮询兜底，避免 pending 删完后无通知而挂死
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(50), self.notify.notified()).await;
         }
     }
 

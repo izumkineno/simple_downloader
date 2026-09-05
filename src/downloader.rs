@@ -40,6 +40,9 @@ type ProgressHandler =
 fn default_client_builder() -> ClientBuilder {
     ClientBuilder::new()
         .user_agent(crate::DEFAULT_USER_AGENT)
+        // 无连接超时时黑洞网络下 probe/chunk .send() 可永久挂起，任务表现为“不动了”；
+        // 仅连建立超时间（不含 body 传输），不误伤慢速大分片。
+        .connect_timeout(std::time::Duration::from_secs(10))
         .pool_max_idle_per_host(32)
         .pool_idle_timeout(std::time::Duration::from_secs(90))
         .tcp_keepalive(std::time::Duration::from_secs(60))
@@ -481,18 +484,18 @@ where
         let (file_size, support_ranges, writer_path, client, download_url, workers, multi_runtime) =
             match &self.mode {
                 DownloadMode::Single(config) => {
-                    ::tracing::debug!(url = %config.url, workers = config.workers, interval = self.update_interval, "probing single source");
+                    ::tracing::debug!(url = %crate::util::redact_url(&config.url), workers = config.workers, interval = self.update_interval, "probing single source");
                     // M3-05 保留用户 pool 配置，不二次覆盖；默认值由 default_client_builder 提供
                     let client = (self.client_builder)().build()?;
                     let (file_size, support_ranges) = match get_file_info(&client, &config.url)
                         .await
                     {
                         Ok(v) => {
-                            ::tracing::info!(size = v.0, support_ranges = v.1, url = %config.url, "probe ok");
+                            ::tracing::info!(size = v.0, support_ranges = v.1, url = %crate::util::redact_url(&config.url), "probe ok");
                             v
                         }
                         Err(DownloadError::MissingContentLength) => {
-                            ::tracing::warn!(url = %config.url, "missing Content-Length -> streaming fallback");
+                            ::tracing::warn!(url = %crate::util::redact_url(&config.url), "missing Content-Length -> streaming fallback");
                             let writer_path = config.output_path.clone();
                             let download_url = config.url.clone();
                             return self
@@ -505,7 +508,7 @@ where
                                 .await;
                         }
                         Err(e) => {
-                            ::tracing::error!(error = %e, url = %config.url, "probe failed");
+                            ::tracing::error!(error = %e, url = %crate::util::redact_url(&config.url), "probe failed");
                             return Err(e);
                         }
                     };
@@ -727,7 +730,7 @@ where
         writer_path: FastStr,
         progress_handler: Option<ProgressHandler>,
     ) -> Result<()> {
-        ::tracing::info!(url = %url, path = %writer_path, "streaming_download start (unknown Content-Length, single stream)");
+        ::tracing::info!(url = %crate::util::redact_url(&url), path = %writer_path, "streaming_download start (unknown Content-Length, single stream)");
         // 未知 Content-Length 时的流式回退：单流顺序写入，不预分配，不支持 Range/多源
         let (writer_tx, writer_handle) = {
             #[cfg(feature = "resume")]
@@ -744,11 +747,14 @@ where
             spawn(handler(0, self.info_tx.subscribe()));
             ::tracing::debug!("streaming progress handler spawned");
         }
-        let resp = ensure_user_agent(client.get(url.as_str()))
-            .send()
-            .await?
-            .error_for_status()?;
-        ::tracing::debug!(status = %resp.status(), url = %url, "streaming GET response");
+        let resp = match ensure_user_agent(client.get(url.as_str())).send().await {
+            Ok(r) => r.error_for_status()?,
+            // `?` 静默传播曾让流式失败无日志、`{e}` 截断源链：此处记全链再回错
+            Err(e) => {
+                ::tracing::error!(error = format!("{e:#}"), url = %crate::util::redact_url(&url), "streaming GET request failed");
+                return Err(DownloadError::Request(e));
+            }
+        };
         let mut stream = resp.bytes_stream();
         let mut offset = 0u64;
         let mut total_downloaded = 0u64;
@@ -799,7 +805,7 @@ where
                         });
                     }
                     Some(Err(e)) => {
-                        ::tracing::error!(error = %e, url = %url, "streaming request error");
+                        ::tracing::error!(error = %e, url = %crate::util::redact_url(&url), "streaming request error");
                         return Err(DownloadError::Request(e));
                     },
                     None => {

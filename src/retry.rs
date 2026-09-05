@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 /// 每个块的最大即时重试次数。
 const MAX_RETRIES: u32 = 10;
 /// 两次即时重试之间的最小延迟。
-const RETRY_DELAY: Duration = Duration::from_secs(1);
+const RETRY_DELAY: Duration = Duration::from_secs(2);
 /// 当达到最大即时重试次数后，进入延迟重试队列的等待时间。
 const DELAYED_RETRY_DURATION: Duration = Duration::from_secs(10);
 /// 单块跨延迟周期的最大总尝试次数，超过则判永久失败避免永重试挂死。
@@ -197,16 +197,10 @@ impl RetryHandler {
             self.retry_attempts.remove(&id);
             return;
         }
-        // 跨周期总计数，超过阈值判永久失败（Transient 不计 total，避免 decoding 风暴占满 30 次）
+        // 干净分支语义：所有失败均计入跨周期总数，超过阈值判永久失败，避免Transient无限重试挂死
         let total = self.total_attempts.entry(id).or_insert(0);
-        let is_transient = err_class == ErrorClass::Transient;
-        if !is_transient {
-            *total += 1;
-        } else {
-            // Transient 仍需记录但不计入 total，单独计数 retry_attempts
-            ::tracing::debug!(chunk_id = id, "transient not counted to total_attempts");
-        }
-        if !is_transient && *total > MAX_TOTAL_ATTEMPTS {
+        *total += 1;
+        if *total > MAX_TOTAL_ATTEMPTS {
             ::tracing::error!(
                 chunk_id = id,
                 total = *total,

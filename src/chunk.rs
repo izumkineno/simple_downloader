@@ -26,6 +26,17 @@ async fn send_terminal_event(
     }
     broadcast_tx.send(info).is_ok()
 }
+/// 精确进度补发：try_send 非阻塞 + broadcast，丢了也无妨（Failed.start offset 兜底），避免可靠通道背压卡住下载循环
+fn send_progress_best_effort(
+    reliable_tx: &Option<mpsc::Sender<DownloadInfo>>,
+    broadcast_tx: &broadcast::Sender<DownloadInfo>,
+    info: DownloadInfo,
+) {
+    if let Some(reliable_tx) = reliable_tx {
+        let _ = reliable_tx.try_send(info.clone());
+    }
+    let _ = broadcast_tx.send(info);
+}
 
 fn split_range(offset: u64, end: u64) -> Option<(u64, u64)> {
     let remaining_bytes = end.saturating_sub(offset).saturating_add(1);
@@ -268,7 +279,8 @@ pub(crate) async fn chunk_run_with_reliable(
             resp
         }
         Err(e) => {
-            let error_msg = format!("{e}");
+            // `{e:#}` 保留源链（connect/timeout/reset/dns），`{e}` 仅剩“error sending request”无法定位
+            let error_msg = format!("{e:#}");
             ::tracing::error!(chunk_id = id, range = %range_header, error = %error_msg, "chunk request failed");
             // 发送块失败信息
             send_terminal_event(
@@ -389,11 +401,7 @@ pub(crate) async fn chunk_run_with_reliable(
                         ::tracing::error!(chunk_id = id, "file writer channel closed");
                         let actual = offset.saturating_sub(start_byte);
                         if actual != last_reported {
-                            let progress = DownloadInfo::ChunkProgress { id, start_byte, end_byte: end, downloaded: actual };
-                            if let Some(reliable_tx) = &reliable_tx {
-                                let _ = reliable_tx.send(progress.clone()).await;
-                            }
-                            let _ = bd_tx.send(progress);
+                            send_progress_best_effort(&reliable_tx, &bd_tx, DownloadInfo::ChunkProgress { id, start_byte, end_byte: end, downloaded: actual });
                         }
                         send_terminal_event(
                             &reliable_tx,
@@ -437,7 +445,7 @@ pub(crate) async fn chunk_run_with_reliable(
                     }
                 }
                 Some(Err(e)) => {
-                    let error_msg = format!("{e}");
+                    let error_msg = format!("{e:#}");
                     // 瞬时网络抖动（decoding）降为 debug，避免 16路并败时 error 风暴
                     if error_msg.contains("decoding") {
                         ::tracing::debug!(chunk_id = id, error = %error_msg, "download stream transient (decoding)");
@@ -446,11 +454,7 @@ pub(crate) async fn chunk_run_with_reliable(
                     }
                     let actual = offset.saturating_sub(start_byte);
                     if actual != last_reported {
-                            let progress = DownloadInfo::ChunkProgress { id, start_byte, end_byte: end, downloaded: actual };
-                            if let Some(reliable_tx) = &reliable_tx {
-                                let _ = reliable_tx.send(progress.clone()).await;
-                            }
-                            let _ = bd_tx.send(progress);
+                        send_progress_best_effort(&reliable_tx, &bd_tx, DownloadInfo::ChunkProgress { id, start_byte, end_byte: end, downloaded: actual });
                     }
                     send_terminal_event(
                         &reliable_tx,
@@ -480,11 +484,7 @@ pub(crate) async fn chunk_run_with_reliable(
                         ::tracing::error!(chunk_id = id, offset, end, error = %error_msg, "early EOF");
                         let actual = offset.saturating_sub(start_byte);
                         if actual != last_reported {
-                            let progress = DownloadInfo::ChunkProgress { id, start_byte, end_byte: end, downloaded: actual };
-                            if let Some(reliable_tx) = &reliable_tx {
-                                let _ = reliable_tx.send(progress.clone()).await;
-                            }
-                            let _ = bd_tx.send(progress);
+                            send_progress_best_effort(&reliable_tx, &bd_tx, DownloadInfo::ChunkProgress { id, start_byte, end_byte: end, downloaded: actual });
                         }
                         send_terminal_event(
                             &reliable_tx,
@@ -535,35 +535,26 @@ pub(crate) async fn chunk_run_with_reliable(
                 total = expected_size,
                 "final progress補發"
             );
-            // 補發的最终进度走可靠通道，避免 broadcast Lagged 丢事件导致 state.downloaded 滞后而卡住完成判定
-            let progress = DownloadInfo::ChunkProgress {
+            // 补发最终进度用 try_send 非阻塞（size() 完成判定不依赖它，丢了由 Complete.size 兜底）
+            send_progress_best_effort(&reliable_tx, &bd_tx, DownloadInfo::ChunkProgress {
                 id,
                 start_byte,
                 end_byte: end,
                 downloaded: final_downloaded,
-            };
-            if let Some(reliable_tx) = &reliable_tx {
-                let _ = reliable_tx.send(progress.clone()).await;
-            }
-            let _ = bd_tx.send(progress);
+            });
         }
         // 如果没有发生失败且下载量匹配，则广播下载完成消息
         ::tracing::debug!(chunk_id = id, "DownloadComplete");
         send_terminal_event(&reliable_tx, &bd_tx, DownloadInfo::DownloadComplete(id)).await;
     } else if !terminated && !failed {
-        // !failed 但 final_downloaded != size 说明异常，判为 early EOF 避免虚假完成
-        // 先补发精确进度，避免 preserve 时因节流丢失 64KiB 窗口而少算
+        // !failed 但 final_downloaded != size 说明异常，判为 early EOF 避免虚假完成，先补发精确进度（非阻塞，丢了由 Failed.start offset 兜底）
         if final_downloaded != last_reported {
-            let progress = DownloadInfo::ChunkProgress {
+            send_progress_best_effort(&reliable_tx, &bd_tx, DownloadInfo::ChunkProgress {
                 id,
                 start_byte,
                 end_byte: end,
                 downloaded: final_downloaded,
-            };
-            if let Some(reliable_tx) = &reliable_tx {
-                let _ = reliable_tx.send(progress.clone()).await;
-            }
-            let _ = bd_tx.send(progress);
+            });
         }
         let error_msg = format!(
             "early EOF on exit: expected {} bytes ({}-{}), got {}",

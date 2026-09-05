@@ -130,12 +130,8 @@ pub struct ResumeMetadata {
 
 impl ResumeMetadata {
     pub fn new(file_size: u64, segment_size: u64) -> Self {
-        // 自适应：仅当调用方传入 DEFAULT 时按文件大小分档，其余保留精确值以兼容单测的小段
-        let segment_size = if segment_size == DEFAULT_SEGMENT_SIZE {
-            adaptive_segment_size(file_size)
-        } else {
-            segment_size.max(1)
-        };
+        // 干净分支语义：固定段大小，调用方显式传值；DEFAULT 即 64K，不按文件自适应，避免旧侧车进度回退
+        let segment_size = segment_size.max(1);
         let mut segments = Vec::new();
         let mut start = 0;
         while start < file_size {
@@ -450,62 +446,6 @@ impl ResumePlan {
             };
             ::tracing::debug!(path = %metadata_path.display(), segments = metadata.segments.len(), "loaded resume metadata");
             if let Err(e) = metadata.validate_shape(file_size) {
-                // 自适应迁移：旧版 64K 固定侧车 (v1) 若文件大小不变但段大小与当前自适应不一致，尝试迁移而非直接丢弃（AC-1）
-                let expected_seg = adaptive_segment_size(file_size);
-                let is_v1_mismatch = metadata.version == 1
-                    && metadata.file_size == file_size
-                    && metadata.segment_size != expected_seg;
-                if is_v1_mismatch {
-                    ::tracing::info!(
-                        path = %metadata_path.display(),
-                        old_seg = metadata.segment_size,
-                        new_seg = expected_seg,
-                        "migrating v1 sidecar to adaptive segment size"
-                    );
-                    let mut new_meta = ResumeMetadata::new(file_size, DEFAULT_SEGMENT_SIZE);
-                    // 尽量保留已校验进度：若新段完全被旧已校验段覆盖，则重算该新段 hash
-                    let old_verified = metadata.verified_ranges();
-                    for idx in 0..new_meta.segments.len() {
-                        let ns = new_meta.segments[idx].start;
-                        let ne = new_meta.segments[idx].end;
-                        let fully_covered = old_verified.iter().any(|(os, oe)| *os <= ns && *oe >= ne)
-                            || {
-                                // 64K→1M 场景：需多个旧段拼接覆盖，检查是否所有 64K 旧段在 [ns,ne] 内均已校验
-                                let mut covered = 0u64;
-                                for (os, oe) in &old_verified {
-                                    let is = (*os).max(ns);
-                                    let ie = (*oe).min(ne);
-                                    if is <= ie {
-                                        covered += ie - is + 1;
-                                    }
-                                }
-                                covered == ne - ns + 1
-                            };
-                        if fully_covered {
-                            if let Ok(mut f) = fs::File::open(output_path) {
-                                let len = ne - ns + 1;
-                                let mut buf = vec![0u8; len as usize];
-                                use std::io::{Seek, Read};
-                                if f.seek(SeekFrom::Start(ns)).is_ok() && f.read_exact(&mut buf).is_ok() {
-                                    new_meta.segments[idx].hash = Some(hash_bytes(&buf));
-                                }
-                            }
-                        }
-                    }
-                    new_meta.etag = metadata.etag.clone();
-                    new_meta.last_modified = metadata.last_modified.clone();
-                    new_meta.effective_url = metadata.effective_url.clone();
-                    let _ = new_meta.save_atomic(&metadata_path);
-                    let remaining_ranges = new_meta.remaining_ranges();
-                    let completed_bytes = new_meta.completed_bytes();
-                    return Ok(Self {
-                        metadata_path,
-                        metadata: Some(new_meta),
-                        truncate_output: false,
-                        remaining_ranges,
-                        completed_bytes,
-                    });
-                }
                 ::tracing::warn!(error=%e, path=%metadata_path.display(), "resume shape mismatch, discarding sidecar and rebuilding");
                 let _ = fs::remove_file(&metadata_path);
                 let metadata = ResumeMetadata::new(file_size, DEFAULT_SEGMENT_SIZE);
@@ -675,49 +615,26 @@ impl ResumeRecorder {
 
         if newly_completed > 0 {
             self.pending_segments += newly_completed;
-            // 主流对齐 aria2 auto-save-interval 60s：时间主导批量，避免 1MiB/1s 在 400MB/s 下 100次/s 刷盘撞 Windows 杀软 5
-            // 新策略：至少 5s 一批（pending>0），避免高频原子替换；pending 阈值仅作最小批量门限
-            let should_flush = self.pending_segments > 0
-                && self.last_save.elapsed() >= Duration::from_secs(5);
+            // 干净分支语义：16 段或 1s 批量落盘，失败即返回避免静默丢进度
+            let should_flush =
+                self.pending_segments >= 16 || self.last_save.elapsed() >= Duration::from_secs(1);
+            ::tracing::trace!(newly_completed, pending = self.pending_segments, should_flush, "record_write segment progress");
             if should_flush {
-                let cur_digest = hash_bytes(&bitcode::encode(&self.metadata));
-                if self.last_digest == Some(cur_digest) {
-                    ::tracing::trace!(pending = self.pending_segments, "resume metadata digest unchanged, skip flush (aria2 dedup)");
-                    self.pending_segments = 0;
-                    self.last_save = Instant::now();
-                } else {
-                    // 主流 best-effort：落盘失败不阻塞数据面，避免 100% 卡死（aria2 Recoverable）
-                    match self.metadata.save_atomic_async(&self.metadata_path).await {
-                        Ok(()) => {
-                            self.last_digest = Some(cur_digest);
-                        }
-                        Err(e) => {
-                            ::tracing::debug!(error = %e, pending = self.pending_segments, "resume metadata save best-effort fail (aria2 recoverable), defer");
-                            // 丢弃本次 pending，下次增量再试，避免 5 争用时 retry 风暴卡 writer
-                        }
-                    }
-                    self.pending_segments = 0;
-                    self.last_save = Instant::now();
-                }
+                self.metadata.save_atomic_async(&self.metadata_path).await?;
+                ::tracing::trace!(pending = self.pending_segments, path = %self.metadata_path.display(), "resume metadata flushed");
+                self.last_digest = Some(hash_bytes(&bitcode::encode(&self.metadata)));
+                self.pending_segments = 0;
+                self.last_save = Instant::now();
             }
         }
         Ok(())
     }
-    /// 强制落盘，供 writer 退出前调用以避免最后 5s 窗口丢失（当前 downloader 成功后会删除 sidecar，失败/中断场景下保证最多丢 5s 增量，aria2 60s 对齐）
+    /// 强制落盘，供 writer 退出前调用以避免最后 1s/16段窗口丢失
     pub async fn flush(&mut self) -> Result<()> {
         if self.pending_segments > 0 {
-            let cur_digest = hash_bytes(&bitcode::encode(&self.metadata));
-            if self.last_digest == Some(cur_digest) {
-                ::tracing::trace!(pending = self.pending_segments, "resume metadata digest unchanged, skip final flush");
-                self.pending_segments = 0;
-                self.last_save = Instant::now();
-                return Ok(());
-            }
-            ::tracing::debug!(pending = self.pending_segments, path = %self.metadata_path.display(), "resume recorder final flush");
-            match self.metadata.save_atomic_async(&self.metadata_path).await {
-                Ok(()) => self.last_digest = Some(cur_digest),
-                Err(e) => ::tracing::debug!(error = %e, pending = self.pending_segments, "final flush best-effort fail"),
-            }
+            ::tracing::info!(pending = self.pending_segments, path = %self.metadata_path.display(), "resume recorder final flush");
+            self.metadata.save_atomic_async(&self.metadata_path).await?;
+            self.last_digest = Some(hash_bytes(&bitcode::encode(&self.metadata)));
             self.pending_segments = 0;
             self.last_save = Instant::now();
         }

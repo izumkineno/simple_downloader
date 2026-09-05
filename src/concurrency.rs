@@ -154,34 +154,7 @@ impl ConcurrencyManager {
         state: &DownloadState,
         cmd_tx: &broadcast::Sender<DownloadCmd>,
     ) {
-        // 主流尾部急补（IDM/aria2 tail）：饥饿或尾部多空闲时绕过节流与有用性门限，立即补位避免“线程跑完慢补”
-        let remaining = state.total_file_size.saturating_sub(state.total_downloaded());
-        let active = state.chunks.len() as u64;
-        let is_starved = active == 0 && remaining >= MIN_CHUNK_SIZE * 2 && !state.is_download_finished();
-        // 仅 Stable 尾部多空闲才急补，Probing 仍需正向速度证据（避免 probing_phase_does_not_split_without_positive_speed_evidence 回归）
-        let is_tail_many_idle = self.phase == DownloadPhase::Stable
-            && active > 0
-            && active * 2 < self.max_workers
-            && remaining >= MIN_CHUNK_SIZE * 2
-            && remaining < self.max_workers * MIN_CHUNK_SIZE * 16;
-        if is_starved || is_tail_many_idle {
-            if let Some(largest) = self.find_largest_splittable_chunk(&state.chunks) {
-                ::tracing::info!(
-                    chunk_id = largest.id,
-                    remaining = largest.remaining_bytes(),
-                    active,
-                    max = self.max_workers,
-                    is_starved,
-                    is_tail_many_idle,
-                    "tail/starved fast split (bypass throttle/useful)"
-                );
-                self.request_split(largest.id, cmd_tx);
-            } else {
-                ::tracing::debug!("starved/tail but no splittable largest (await retry drain)");
-            }
-            // 已处理急补，本 tick 不再走常规探测/稳定逻辑（避免被 throttle 截胡）
-            return;
-        }
+        // 干净分支语义：一律走节流+探测/稳定有用性门限，不做饥饿/尾部绕行，避免小尾碎片风暴与 429
         // 如果距离上次分割时间太短，则不做任何操作
         if self.last_split_time.elapsed() < MIN_SPLIT_INTERVAL {
             ::tracing::trace!(
@@ -545,21 +518,14 @@ impl ConcurrencyManager {
     }
 
     fn split_is_useful(&self, state: &DownloadState, avg_speed: f64, estimated_time: f64) -> bool {
+        if avg_speed <= 0.0 {
+            return false;
+        }
+        // 干净分支语义：极小剩余不分片，避免碎片；门槛 256KiB
         let remaining = state
             .total_file_size
             .saturating_sub(state.total_downloaded());
         if remaining < 256 * 1024 {
-            return false;
-        }
-        // 尾部多空闲放宽（IDM 尾部分片）：大量空闲时即使 est 小也值得分，避免单线程慢尾
-        let active = state.chunks.len() as u64;
-        if active * 2 < self.max_workers
-            && remaining >= MIN_CHUNK_SIZE * 4
-            && state.chunks.values().any(|c| c.is_splittable(MIN_CHUNK_SIZE))
-        {
-            return true;
-        }
-        if avg_speed <= 0.0 {
             return false;
         }
         let mut threshold = Self::adaptive_remaining_threshold(state.total_file_size);

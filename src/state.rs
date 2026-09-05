@@ -133,9 +133,9 @@ impl DownloadState {
     }
 
     /// 将一个块标记为已完成。
-    /// P0-02 完整性门已保证仅当 `offset == end+1` 才发送 `DownloadComplete`，此时 `downloaded == size`。
-    /// 为容忍 `broadcast Lagged` 导致最终 `ChunkProgress` 丢失，使用 `size()` 精确累加，避免 `total_downloaded` 低估而卡 100%。
-    /// 截断流已在 chunk 侧判为 `ChunkFailed` 不会走到此分支，故不会误算零填充。
+    /// 当前架构语义：P0-02 完整性门保证仅当 offset==end+1 才发 Complete，此时 downloaded==size；
+    /// 为容忍 broadcast Lagged 丢最终 Progress，用 size() 精确累加，截断流已在 chunk 侧判 Failed 不会误算，
+    /// 残余虚报由 downloader 落盘金标准 stat 兜底（mismatch 即 Err 不删 sidecar）。
     pub fn complete_chunk(&mut self, id: &ChunkId) {
         if let Some(chunk) = self.chunks.remove(id) {
             self.completed_bytes += chunk.size();
@@ -161,8 +161,7 @@ impl DownloadState {
         }
     }
 
-    /// 计算当前已下载的总字节数。
-    /// 这是已完成块的字节数和所有活跃块当前已下载字节数的总和。
+    /// 计算当前已下载的总字节数（钳 total 防 Bisect 收缩竞态超算穿透到 UI）。
     pub fn total_downloaded(&self) -> u64 {
         (self.completed_bytes
             + self
@@ -188,7 +187,7 @@ impl DownloadState {
         self.chunks.values().filter(|c| c.status == 0).count()
     }
 
-    /// 检查下载是否已完成。
+    /// 检查下载是否已完成（仅已落账 completed 计 blank，防 total 虚高假完成）。
     pub fn is_download_finished(&self) -> bool {
         self.completed_bytes >= self.total_file_size
     }
@@ -200,13 +199,10 @@ mod tests {
 
     #[test]
     fn regression_card_complete_uses_size_not_stale_downloaded() {
-        // 卡100%回归：broadcast Lagged 导致 ChunkProgress 丢失，state 中 downloaded 仍为 0，
-        // complete_chunk 必须按 size() 累加而非 stale downloaded，否则 is_finished 永假
+        // 可靠通道+金标准架构：Lagged 丢 final Progress 时按 size() 累加防卡 100%，截断由 chunk 门+落盘校验兜底
         let mut state = DownloadState::with_completed(1000, 0);
         let chunk_id = 1;
-        // 模拟已插入但未更新进度的块
         state.chunks.insert(chunk_id, ChunkState::new(chunk_id, 0, 999));
-        // 不更新 downloaded（保持 0 模拟 Lagged 丢失 final Progress）
         state.complete_chunk(&chunk_id);
         assert_eq!(state.completed_bytes, 1000, "should use size() not stale 0");
         assert!(state.is_download_finished(), "should be finished after size add");

@@ -38,7 +38,7 @@ fn speed_does_not_spike_on_tiny_elapsed() {
     assert!(chunk2.speed <= 1024.0 * 1024.0 * 1024.0 + 1.0, "speed should be capped");
 }
 
-/// progress 回调中 speed 应稳定无恶性突增
+/// progress 回调中 speed 应稳定无恶性突增；零增量时按 EMA 衰减而非冻结
 #[test]
 fn progress_speed_stable_under_high_throughput() {
     let mut chunk = ChunkState::new(1, 0, 10 * 1024 * 1024 - 1);
@@ -49,5 +49,7 @@ fn progress_speed_stable_under_high_throughput() {
     }
     let before = chunk.speed;
     chunk.update_speed(0.5, 0.30);
-    assert_eq!(chunk.speed, before);
+    let expected = before * (1.0 - 0.30);
+    assert!((chunk.speed - expected).abs() < 1e-6, "zero delta should decay via EMA");
+    assert!(chunk.speed < before, "stalled speed must decay");
 }

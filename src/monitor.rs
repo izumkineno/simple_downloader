@@ -1,18 +1,16 @@
 //! 下载监控器，作为状态、重试和并发管理的协调中心。
 
-use crate::chunk::MIN_CHUNK_SIZE;
 use crate::chunk::chunk_run_with_reliable;
 use crate::concurrency::ConcurrencyManager;
 use crate::lane::MultiRuntime;
 use crate::limiter::RateLimiter;
 use crate::retry::RetryHandler;
-use crate::speed::SpeedEstimator;
 use crate::state::{ChunkState, DownloadState};
 use crate::types::{ChunkId, DownloadCmd, DownloadInfo};
 use faststr::FastStr;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -35,15 +33,16 @@ pub struct DownloadMonitor {
     lane_bindings: HashMap<ChunkId, FastStr>,
     /// 因 lane 容量不足暂未调度的分割新区间的缓冲，避免丢范围空洞。
     pub(crate) pending_bisects: std::collections::VecDeque<(u64, u64)>,
+    /// 已终局（DownloadComplete）的块墓碑：跨 broadcast/reliable 双通道乱序到达的
+    /// 迟到 ChunkProgress 若重建条目将永久卡住退出（active_chunks 幽灵块），直接丢弃。
+    /// 重试复用同 id 但失败路径 entry 常驻，故墓碑仅记 Complete，不记 Failed。
+    retired_ids: HashSet<ChunkId>,
     /// 状态更新的间隔时间（秒）。
     update_interval: f64,
     /// Lagged 事件计数，用于 P0-03 对账
     lagged_count: u64,
     is_rate_limited: bool,
     global_limiter: Option<Arc<RateLimiter>>,
-    /// 全局速度：主流滑动窗口（aria2 10s/curl环形缓冲 5-10s）替代 EMA，避免冷启动滞后
-    global_estimator: SpeedEstimator,
-    last_global_bytes: u64,
 }
 
 impl DownloadMonitor {
@@ -73,13 +72,12 @@ impl DownloadMonitor {
                 update_interval,
             ),
             lane_bindings: HashMap::new(),
+            retired_ids: HashSet::new(),
             pending_bisects: std::collections::VecDeque::new(),
             update_interval,
             lagged_count: 0,
             is_rate_limited: false,
             global_limiter: None,
-            global_estimator: SpeedEstimator::new(std::time::Duration::from_secs(5)),
-            last_global_bytes: completed_bytes,
         }
     }
 
@@ -386,6 +384,12 @@ impl DownloadMonitor {
                 end_byte,
                 downloaded,
             } => {
+                // 墓碑：已 Complete 的块不再接受进度，已终局任务无后继事件，
+                // 迟到进度重建条目将致 active_chunks 幽灵块、退出条件永假。
+                if self.retired_ids.contains(&id) {
+                    ::tracing::trace!(chunk_id = id, downloaded, "stale progress for retired chunk, dropped");
+                    return;
+                }
                 // 更新块的进度信息
                 let chunk = self
                     .state
@@ -408,6 +412,7 @@ impl DownloadMonitor {
                 ::tracing::info!(chunk_id = id, "chunk DownloadComplete");
                 // 标记一个块为已完成
                 self.state.complete_chunk(&id);
+                self.retired_ids.insert(id);
                 if let Some(lane_id) = self.lane_bindings.remove(&id)
                     && let Some(runtime) = multi_runtime
                 {
@@ -458,10 +463,14 @@ impl DownloadMonitor {
                     pending = self.pending_bisects.len(),
                     "ChunkBisected"
                 );
-                // 立刻收缩原块 end，避免后续 DownloadComplete 按旧 size() 双计导致已下载>>总量
+                // 干净分支对齐：收缩原块 end 后钳 downloaded，避免已下超 mid 时进度倒退/永不完结
                 let bisect_mid = new_start.saturating_sub(1);
                 if let Some(chunk) = self.state.chunks.get_mut(&original_id) {
                     chunk.update_end_byte(bisect_mid);
+                    let sz = chunk.size();
+                    if chunk.downloaded_bytes > sz {
+                        chunk.update_downloaded(sz);
+                    }
                 }
                 // 尝试为新区间分配 lane；若容量不足则缓冲至 pending_bisects，避免丢范围
                 let Some((lane_id, rb)) = build_request(client, url, multi_runtime.as_mut()) else {
@@ -547,18 +556,12 @@ impl DownloadMonitor {
                 "chunk speed update"
             );
         }
-        // 全局速度：滑动窗口（aria2 10s窗口/curl环形缓冲 5-10s），替代EMA，贴近系统任务管理器
-        let total_now = self.state.total_downloaded();
-        let now = Instant::now();
-        self.global_estimator.observe(total_now, now);
-        let global_speed = self.global_estimator.speed(now);
-        self.last_global_bytes = total_now;
+        // 总速以活跃块 EMA 之和为准（send_monitor_update），窗口估算已删，仅留 chunk_sum 日志
         ::tracing::trace!(
             elapsed_secs,
-            downloaded = total_now,
+            downloaded = self.state.total_downloaded(),
             total = self.state.total_file_size,
             chunk_sum_kbs = self.state.total_speed() / 1024.0,
-            global_kbs = global_speed / 1024.0,
             active = self.state.chunks.len(),
             pending_bisects = self.pending_bisects.len(),
             retry_q = self.retry_handler.retry_queue_len(),
@@ -566,7 +569,6 @@ impl DownloadMonitor {
             tasks = tasks.len(),
             "monitor tick"
         );
-        // 发送聚合后的监控更新（global_speed(window) 为权威 total_speed，chunk_sum 仅作对比日志）
         self.send_monitor_update(info_tx);
 
 
@@ -592,48 +594,17 @@ impl DownloadMonitor {
         let before_retry = self.retry_handler.retry_queue_len();
         let before_delayed = self.retry_handler.delayed_queue_len();
         self.retry_handler.process_queues();
-        // 主流饥饿/碎片急补：active0 或尾部多空闲(>50%空闲)且有碎片时，强制排空 delayed 并绕过 1s，并合并小碎片（IDM 碎片整理）
-        let remaining = self.state.total_file_size.saturating_sub(self.state.total_downloaded());
-        let active = self.state.chunks.len() as u64;
-        let max_workers = self.concurrency_manager.max_workers();
-        let is_tail_zero = remaining == 0
-            && !self.are_all_tasks_done()
-            && !self.state.is_download_finished()
-            && !self.retry_handler.has_permanent_failure();
-        let is_starved_retry = active == 0
-            && !self.state.is_download_finished()
-            && !self.retry_handler.has_permanent_failure()
-            && remaining >= MIN_CHUNK_SIZE * 2;
-        let is_tail_fragmented = active > 0
-            && active * 2 < max_workers
-            && remaining >= MIN_CHUNK_SIZE * 2
-            && remaining < max_workers * MIN_CHUNK_SIZE * 16
-            && (!self.retry_handler.are_all_tasks_done() || self.state.chunks.values().any(|c| c.remaining_bytes() < MIN_CHUNK_SIZE * 2));
-        let should_force = is_starved_retry || is_tail_fragmented || is_tail_zero;
-        if should_force {
-            // 合并相邻小碎片为 1MiB 级大块，减少微任务风暴；100%零剩余但仍有delayed/pending时亦强制抽干，避免10s驻留卡死
-            self.retry_handler.coalesce_small_fragments();
-            if self.retry_handler.delayed_queue_len() > 0 {
-                self.retry_handler.force_drain_delayed();
-            }
-        }
+        // 干净分支语义：重试一律尊重 2s/10s 退避，不做饥饿/尾部强制抽干与碎片合并，避免重试惊群与 429
         ::tracing::trace!(
             before_retry,
             before_delayed,
             after_retry = self.retry_handler.retry_queue_len(),
             after_delayed = self.retry_handler.delayed_queue_len(),
-            starved = is_starved_retry,
-            tail_fragmented = is_tail_fragmented,
-            tail_zero = is_tail_zero,
             "retry process_queues"
         );
         let mut deferred_retries = Vec::new();
         let mut retried = 0usize;
-        while let Some(chunk_to_retry) = if should_force {
-            self.retry_handler.pop_ready_chunk_starved()
-        } else {
-            self.retry_handler.pop_ready_chunk()
-        } {
+        while let Some(chunk_to_retry) = self.retry_handler.pop_ready_chunk() {
             ::tracing::debug!(
                 chunk_id = chunk_to_retry.id,
                 start = chunk_to_retry.start,
@@ -694,7 +665,7 @@ impl DownloadMonitor {
             self.retry_handler.push_back_retry_with_backoff(chunk);
         }
 
-        // 检查下载是否已全部完成
+        // 完成三重门：tasks 空（JoinHandle 全回收，防 writer 未刷盘即返）+ 无活跃/重试/缓冲 + completed 落账；比干净多 tasks 门，只拖至多一拍不假完成
         let done =
             tasks.is_empty() && self.are_all_tasks_done() && self.state.is_download_finished();
         if done {
@@ -775,19 +746,8 @@ impl DownloadMonitor {
             .values()
             .map(|c| (c.id, c.size(), c.downloaded_bytes, c.speed, c.status))
             .collect();
-        // 主流滑动窗口（aria2 10s/curl 5-10s）为权威总速，2 GiB上界防极端堆叠
-        // 全部重试/无活跃块时窗口仍含旧窗口均值，会虚高卡大速度；此时按主流（aria2/curl 0速）直接归零
-        let now = Instant::now();
-        let window_speed = self.global_estimator.speed(now);
-        let per_sum = self.state.total_speed();
-        let chosen_raw = if self.state.normal_chunk_count() == 0 {
-            0.0
-        } else if window_speed > 0.0 {
-            window_speed
-        } else {
-            per_sum
-        };
-        let total_speed = chosen_raw.min(2.0 * 1024.0 * 1024.0 * 1024.0);
+        // 干净分支语义：总速=活跃块EMA之和；窗口估算仅作日志参考，不做权威，避免preserve跳变虚高
+        let total_speed = self.state.total_speed();
         let eta_secs = if total_speed > 0.0
             && self.state.total_file_size > 0
             && self.state.total_downloaded() > 0
@@ -925,11 +885,49 @@ mod regression_tests {
         // elapsed 0.001 应被 guard 忽略，返回 false 且不更新 speed
         let before_speed = monitor.state.chunks.get(&1).unwrap().speed;
         let done = monitor.handle_tick(0.001, &mut tasks, &info_tx, &None, &cmd_tx, &client, &writer_tx, None, &mut None, &next_id);
-        assert!(!done);
+
         assert_eq!(monitor.state.chunks.get(&1).unwrap().speed, before_speed);
         // 正常 elapsed 应更新
         let done2 = monitor.handle_tick(0.5, &mut tasks, &info_tx, &None, &cmd_tx, &client, &writer_tx, None, &mut None, &next_id);
         assert!(!done2);
         assert!(monitor.state.chunks.get(&1).unwrap().speed > 0.0);
+    }
+    #[tokio::test]
+    async fn stale_progress_after_complete_does_not_resurrect() {
+        // 复现：terminal 经 reliable 先到清块，迟到 broadcast 进度重建幽灵块致永不退出
+        let mut monitor = DownloadMonitor::new(1000, 0.5, 1);
+        let mut tasks = FuturesUnordered::new();
+        let (info_tx, _) = broadcast::channel(16);
+        let (cmd_tx, _) = broadcast::channel(16);
+        let client = reqwest::Client::new();
+        let (writer_tx, _) = mpsc::channel(16);
+        let next_id = AtomicU64::new(1);
+        let mut multi: Option<MultiRuntime> = None;
+        let mut call = |monitor: &mut DownloadMonitor,
+                    tasks: &mut FuturesUnordered<JoinHandle<()>>,
+                    info: DownloadInfo| {
+            monitor.handle_download_info(
+                info, tasks, &next_id, &client, &writer_tx, &None, &cmd_tx, &info_tx, None,
+                &mut multi,
+            );
+        };
+        // 正常进度建条目
+        call(
+            &mut monitor,
+            &mut tasks,
+            DownloadInfo::ChunkProgress { id: 0, start_byte: 0, end_byte: 999, downloaded: 1000 },
+        );
+        assert_eq!(monitor.state.chunks.len(), 1);
+        // 终局清块
+        call(&mut monitor, &mut tasks, DownloadInfo::DownloadComplete(0));
+        assert!(monitor.state.chunks.is_empty());
+        // 迟到进度必须丢弃，不得复活
+        call(
+            &mut monitor,
+            &mut tasks,
+            DownloadInfo::ChunkProgress { id: 0, start_byte: 0, end_byte: 999, downloaded: 1000 },
+        );
+        assert!(monitor.state.chunks.is_empty(), "幽灵块复活将永久卡住退出条件");
+        assert!(monitor.retry_handler.are_all_tasks_done());
     }
 }

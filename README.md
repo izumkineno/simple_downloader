@@ -65,7 +65,7 @@
 - **需要限速**：打开 `rate-limit`，见下节
 - **需要队列**：打开 `queue`，见 `examples/with_queue.rs`
 
-> 完整调用形态见 [`docs/usage.md`](docs/usage.md)，`cargo doc` 见 `src/lib.rs`  crate 文档。
+> 完整调用形态见 [`docs/调用指南.md`](docs/调用指南.md)，`cargo doc` 见 `src/lib.rs`  crate 文档。
 #### 9. **速度限制（`rate-limit` feature，0.5.x 新增，0.6.x 自适应冻结校准，0.6.2+ 热更）**
 
 - **全局限速**：`Downloader::builder(url, path).speed_limit(bps).with_burst(bytes).download().await`，`1 token = 1 byte`，`burst` 默认 64KiB 硬限，`0` 或 `>4GiB/s` 返回 `InvalidArgument`，全局为硬上限（`per_source` 之和 > 全局时按剩余分配）
@@ -80,7 +80,7 @@
 - **FIFO 调度**：`TaskQueue::with_max_concurrent(3)`（`1..64` clamp）+ `enqueue`/`enqueue_with_workers`（两层并发独立）、`pause`/`resume`/`cancel`/`query`/`wait_all`，`TaskId/TaskState/TaskSnapshot/QueueError`，`examples/with_queue.rs` 演示重命名/隔离
 - **重命名与并发安全**：`occupied` 内存集合 + `try_exists` 磁盘 + `*.download.bitcode` 三重 CAS，`a.tar.gz → a.tar(1).gz` 无限递增，`windows` 大小写折叠，`concurrent_enqueue_assigns_unique_paths` 17 并发唯一
 - **可靠终局与延迟删**：`ChunkFailed/Complete/Bisected` 经 `mpsc reliable` 兜底防 `Lagged` 丢失（`b4fcadf`），`queue` 取消后 `pending_deletes` 200ms 周期 `flush_pending_deletes`（`PermissionDenied/未知Io` 重试）
-- **稳定 UI 契约**：`DownloadInfo #[non_exhaustive]` + `MonitorUpdate` 稳定行为（见 `src/types.rs` + `docs/usage.md#6`），`progress` 需 `run(handler)` 且 `match` 含 `_`
+- **稳定 UI 契约**：`DownloadInfo #[non_exhaustive]` + `MonitorUpdate` 稳定行为（见 `src/types.rs` + `docs/调用指南.md#6`），`progress` 需 `run(handler)` 且 `match` 含 `_`
 ---
 
 ### 待实现的功能 (TODO List)
@@ -92,8 +92,8 @@
 -   [x] **单源 / 多源恢复**: 已覆盖 `Downloader::new(...)` 与 `Downloader::new_multi(...)` 的恢复路径。
 -   [x] **进程级恢复测试**: 已补充单源控制台中断恢复、多源 kill / 崩溃式终止恢复的集成测试。
 -   [x] **原子持久化与截断语义**: `save_atomic` 临时文件+`rename`+`sync_parent_dir`，`file_writer` `truncate(true/false)` 分支已验证（`src/resume.rs`/`src/util.rs` + `tests`）。
--   [ ] **元数据 schema 演进策略（0.6.2 已带 version=1 自愈重建，后续补跨版本迁移与兼容表，待 0.7）**: 当前 `validate_shape` 任一 `version/file_size/segment_size` 不一致即删侧car重建，已防旧版本脏数据。
--   [ ] **可观测性增强（待 0.7）**: 补充“复用/失效 segment”日志与 `DownloadInfo` 事件，当前 `tracing` 已全链路 `#[instrument]` 但仅信息级。
+-   [ ] **元数据 schema 演进策略（`METADATA_VERSION=2`，`v1` 形状不一致自愈重建；`adaptive_segment_size` 已导出待接入自动分档，`ETag` 变更失效待接线）**: 当前 `validate_shape` 任一 `version/file_size/segment_size` 不一致即删 sidecar 重建，已防旧版本脏数据。
+-   [ ] **可观测性增强（`pieces` 位图与复用/失效 segment 事件待接入）**: `MonitorUpdate { eta_secs }` 已落地（进度 `<5%` 或速度为 0 时 `None`），`pieces` 当前恒为空；`tracing` 已全链路 `#[instrument]`。
 #### 2. **核心功能：多源多代理下载 (Multi-Source Downloading)**
 -   [x] **支持多个 URL 下载同一个文件**: 通过 `MultiSourceConfig::with_sources(...)` 配置一组镜像 URL，并使用 `Downloader::new_multi(...)` 启动多源下载。
 -   [x] **支持源 / 代理 lane 建模**: 通过 `SourceConfig::with_proxies(...)`、`LaneModel::PerSource` / `LaneModel::PerSourceProxy` 表达多源多代理调度维度。
@@ -114,8 +114,8 @@
 -   [x] **Feature 能力裁剪（第一阶段）**: 默认模式仅保留基础多线程下载；`resume` / `multi-source` / `proxy` / `progress` 已拆为按需启用的 Cargo features。
 -   [x] **配置热更新（0.6.2+2）**: `SharedConfig` 热更底座 `RuntimeConfig`（`workers`/`update_interval`/`speed_limit,burst` 全局）支持运行时 `apply_config`，`DownloadMonitor` 动态生效（含 `global limiter` 热更）
 -   [x] **任务队列 API（0.6.0 `queue` feature，0.6.1 200ms drain + 0.6.2 未知 Io 重试，0.6.2+ reliable）**: `TaskQueue::with_max_concurrent(3)`（`1..64` clamp）+ `enqueue`/`enqueue_with_workers`（两层并发独立）、`pause`/`resume`/`cancel`/`query`/`wait_all`，`TaskId/TaskState/TaskSnapshot/QueueError`，`examples/with_queue.rs` 演示重命名/隔离，`pending_deletes` 延迟删 + `reliable` 终局兜底
--   [x] **更稳定的 UI 对接层（0.6.2 `DownloadInfo` 稳定契约，0.6.2+ 终局可靠）**: `#[non_exhaustive]` + `MonitorUpdate` 字段/状态码 + `progress_percent/speed_mbps/downloaded_bytes/total_bytes/is_complete` 稳定行为（非 `MonitorUpdate` 返回 0/false），`b4fcadf` 终局事件经 `reliable mpsc` 兜底防 `Lagged` 丢失，UI 仅依赖 `MonitorUpdate` 聚合，新增变体/字段为 minor，详见 `src/types.rs:DownloadInfo` 与 `docs/usage.md#6`
-#### 示例（权威调用形态见 `docs/usage.md`）
+-   [x] **更稳定的 UI 对接层（0.6.2 `DownloadInfo` 稳定契约，0.6.2+ 终局可靠，0.7+ `eta_secs/pieces`）**: `#[non_exhaustive]` + `MonitorUpdate` 字段/状态码 + `progress_percent/speed_mbps/downloaded_bytes/total_bytes/is_complete/eta_secs/pieces` 稳定行为（非 `MonitorUpdate` 返回 0/false/None），`b4fcadf` 终局事件经 `reliable mpsc` 兜底防 `Lagged` 丢失，UI 仅依赖 `MonitorUpdate` 聚合，新增变体/字段为 minor，终局以落盘 `stat` 为准，详见 `src/types.rs:DownloadInfo` 与 `docs/调用指南.md#6`
+#### 示例（权威调用形态见 `docs/调用指南.md`）
 
 ```rust
 use simple_downloader::Downloader;
@@ -126,7 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
-更多场景：`docs/usage.md#3 Builder 全景`；恢复/多源/限速/队列完整示例见 `examples/`：
+更多场景：`docs/调用指南.md#3 Builder 全景`；恢复/多源/限速/队列完整示例见 `examples/`：
 `cargo run --features progress --example with_custom_ui` |
 `cargo run --features multi-source,progress --example manual_multi_source_test_server`（500 MiB 双源 16m/2m） |
 `cargo run --features queue --example with_queue` |
@@ -140,13 +140,13 @@ cargo test --features queue --test queue -- --nocapture
 cargo test --features resume,multi-source --test resume -- --nocapture --test-threads=1
 cargo test --features resume,multi-source --test process_resume -- --nocapture --test-threads=1
 ```
-（`tests/resume` 覆盖元数据/损坏/缺文件；`process_resume` 覆盖单源中断与多源 kill 恢复；`rate_limit` 覆盖 `5MiB@1MiB/s 4-6.5s` 精度；`queue` 覆盖并发重命名，详见 `docs/README.md#三`）
+（`tests/resume` 覆盖元数据/损坏/缺文件；`process_resume` 覆盖单源中断与多源 kill 恢复；`rate_limit` 覆盖 `5MiB@1MiB/s 4-6.5s` 精度；`queue` 覆盖并发重命名，详见 `docs/文档导航.md#三`）
 
 #### 架构概览
 
-README 中的图只保留概念级视角；更完整、权威的运行时时序、重试与动态分片细节见 [`docs/architecture.md`](docs/architecture.md)。
+README 中的图只保留概念级视角；更完整、权威的运行时时序、重试与动态分片细节见 [`docs/架构说明.md`](docs/架构说明.md)。
 
-测试覆盖面、推荐验证命令和本地 `test_server/` 集成验证入口见 [`docs/README.md`](docs/README.md)。
+测试覆盖面、推荐验证命令和本地 `test_server/` 集成验证入口见 [`docs/文档导航.md`](docs/文档导航.md)。
 
 ```mermaid
 flowchart LR

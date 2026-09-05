@@ -576,7 +576,7 @@ impl MultiRuntime {
         while let Some((mut runtime, res)) = probe_futs.next().await {
             match res {
                 Ok((file_size, support_ranges)) => {
-                    ::tracing::debug!(lane_id = %runtime.lane_id, url = %runtime.url, file_size, support_ranges, "probe success");
+                    ::tracing::debug!(lane_id = %runtime.lane_id, url = %crate::util::redact_url(&runtime.url), file_size, support_ranges, "probe success");
                     if support_ranges {
                         if let Some(expected) = range_file_size {
                             if expected != file_size {
@@ -710,7 +710,7 @@ impl MultiRuntime {
                     }
                 }
                 Err(e) => {
-                    ::tracing::warn!(lane_id = %runtime.lane_id, url = %runtime.url, error = %e, "probe failed, lane skipped");
+                    ::tracing::warn!(lane_id = %runtime.lane_id, url = %crate::util::redact_url(&runtime.url), error = %e, "probe failed, lane skipped");
                     continue;
                 }
             }
@@ -881,7 +881,7 @@ impl MultiRuntime {
         let lane_id = self.scheduler.best_lane()?;
         self.scheduler.assign_chunk(lane_id.as_str());
         let runtime = self.next_runtime(&lane_id)?;
-        ::tracing::trace!(lane_id = %lane_id, url = %runtime.url, "claim lane");
+        ::tracing::trace!(lane_id = %lane_id, url = %crate::util::redact_url(&runtime.url), "claim lane");
         Some((lane_id, runtime.client.get(runtime.url.as_str())))
     }
 
@@ -935,7 +935,7 @@ where
                 .pool_idle_timeout(std::time::Duration::from_secs(90))
                 .tcp_keepalive(std::time::Duration::from_secs(60))
                 .build()?;
-            ::tracing::debug!(source_id = %source.id, url = %source.url, "expand lane (no proxy)");
+            ::tracing::debug!(source_id = %source.id, url = %crate::util::redact_url(&source.url), "expand lane (no proxy)");
             runtimes.push(LaneRuntime {
                 lane_id: source.id.clone(),
                 source_id: source.id.clone(),
@@ -954,7 +954,7 @@ where
                 .pool_idle_timeout(std::time::Duration::from_secs(90))
                 .tcp_keepalive(std::time::Duration::from_secs(60))
                 .build()?;
-            ::tracing::debug!(source_id = %source.id, url = %source.url, "expand lane (source has no proxies)");
+            ::tracing::debug!(source_id = %source.id, url = %crate::util::redact_url(&source.url), "expand lane (source has no proxies)");
             runtimes.push(LaneRuntime {
                 lane_id: source.id.clone(),
                 source_id: source.id.clone(),
@@ -971,7 +971,7 @@ where
             let proxy_obj = match Proxy::all(proxy.url.as_str()) {
                 Ok(p) => p,
                 Err(error) => {
-                    ::tracing::warn!(proxy_url = %proxy.url, error = %error, "proxy parse failed, skip lane");
+                    ::tracing::warn!(proxy_url = %crate::util::redact_url(&proxy.url), error = %error, "proxy parse failed, skip lane");
                     continue;
                 }
             };
@@ -984,7 +984,7 @@ where
             {
                 Ok(c) => c,
                 Err(error) => {
-                    ::tracing::warn!(proxy_url = %proxy.url, error = %error, "proxy client build failed, skip lane");
+                    ::tracing::warn!(proxy_url = %crate::util::redact_url(&proxy.url), error = %error, "proxy client build failed, skip lane");
                     continue;
                 }
             };
