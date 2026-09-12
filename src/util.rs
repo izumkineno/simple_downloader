@@ -59,6 +59,50 @@ pub(crate) fn redact_url(url: &str) -> String {
     no_query.to_string()
 }
 
+/// Range 探针验体：`bytes=0-0` 的 206 必须恰好回 1 字节，否则 Range 通道不可信。
+/// 防盗链/过期缓存会 206 配空体或错体（`Content-Range` 照写总量），按头分片只会组装坏文件；
+/// 超时/读错/字节数不对一律按不可信处理，上层回退无 Range 单流（浏览器同款）。
+async fn probe_zero_range_byte(resp: reqwest::Response) -> Option<u8> {
+    use futures_util::StreamExt;
+    use std::time::Duration;
+    let mut stream = resp.bytes_stream();
+    let mut buf = [0u8; 2];
+    let mut n = 0usize;
+    let read = async {
+        while n < 2 {
+            match stream.next().await {
+                Some(Ok(chunk)) => {
+                    let take = chunk.len().min(2 - n);
+                    buf[n..n + take].copy_from_slice(&chunk[..take]);
+                    n += take;
+                }
+                Some(Err(_)) | None => break,
+            }
+        }
+        (n == 1).then_some(buf[0])
+    };
+    tokio::time::timeout(Duration::from_secs(10), read).await.ok().flatten()
+}
+
+/// 整包首字节：无 Range 的 GET 只读首字节即关连接，与 Range 体交叉验证。
+/// 字节 0 在任何合规服务端都唯一，错位即缓存与源不一致；读不到也判不可信，
+/// 回退单流后真正的错误由下载阶段原样抛出，不在这里吞错。
+async fn plain_first_byte(client: &Client, url: &str) -> Option<u8> {
+    use std::time::Duration;
+    let get = async {
+        let mut resp = ensure_user_agent(
+            client
+                .get(url)
+                .header(reqwest::header::ACCEPT_ENCODING, "identity"),
+        )
+        .send()
+        .await
+        .ok()?;
+        resp.chunk().await.ok()??.first().copied()
+    };
+    tokio::time::timeout(Duration::from_secs(10), get).await.ok().flatten()
+}
+
 #[::tracing::instrument(skip(client), fields(url = %redact_url(url)))]
 pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
     let (size, support, _etag, _lm) = get_file_info_with_headers(client, url).await?;
@@ -130,7 +174,7 @@ pub async fn get_file_info_with_headers(
     };
 
     let status = range_resp.status();
-    let headers = range_resp.headers();
+    let headers = range_resp.headers().clone();
     let range_etag = headers.get(ETAG).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
     let range_lm = headers.get(LAST_MODIFIED).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
     let cur_etag = range_etag.clone().or(head_etag.clone());
@@ -164,12 +208,36 @@ pub async fn get_file_info_with_headers(
                 if *total != "*"
                     && let Ok(content_length) = total.parse::<u64>()
                 {
-                    ::tracing::info!(
-                        content_length,
-                        support_ranges = true,
-                        "probe via 206 Content-Range"
-                    );
-                    return Ok((content_length, true, cur_etag, cur_lm));
+                    // 空体/错体即 Range 说谎；单字节探针能过但体与源不符的 incoherent 缓存，
+                    // 必须再与整包首字节交叉验证，否则按头分片会组装坏文件。回退无 Range 单流。
+                    match probe_zero_range_byte(range_resp).await {
+                        Some(r0) => match plain_first_byte(client, url).await {
+                            Some(p0) if p0 == r0 => {
+                                ::tracing::info!(
+                                    content_length,
+                                    support_ranges = true,
+                                    "probe via 206 Content-Range"
+                                );
+                                return Ok((content_length, true, cur_etag, cur_lm));
+                            }
+                            other => {
+                                ::tracing::error!(
+                                    content_length,
+                                    range_byte = r0,
+                                    plain_byte = ?other,
+                                    "Range body incoherent with plain GET, range channel untrusted"
+                                );
+                                return Err(DownloadError::MissingContentLength);
+                            }
+                        },
+                        None => {
+                            ::tracing::error!(
+                                content_length,
+                                "206 Range body mismatch for bytes=0-0, range channel untrusted"
+                            );
+                            return Err(DownloadError::MissingContentLength);
+                        }
+                    }
                 }
             }
         }

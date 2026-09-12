@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+### 🐛 修复
+
+- **Range 探针验体** `util.rs:get_file_info_with_headers` `206 bytes=0-0` 必须恰好回 1 字节体且与整包首字节一致（各 10s 上限），否则判 Range 通道不可信 → `MissingContentLength` 走无 Range 单流（浏览器同款）；防盗链/过期缓存 `206` 配空体、错体时不再按头分片组装坏文件（`flingtrainer` 实测：`HEAD/Range` 称 796885 且 Range 体为 gzip 魔数，整包 `GET` 实为 1390080 可运行 PE）
+
 ### 延期（0.7 未作，已记录；下轮实现）
 
 - **EWMA 动态评分持久化** `lane.rs` `EWMA 0.3*probe +0.7*score` + 跨次 `server-stat.json` 持久（`research 07`，`R4 Contrarian` 已延期，当前仅 `3/30s` 二进制黑名单 + `64KiB probe` 排序）
