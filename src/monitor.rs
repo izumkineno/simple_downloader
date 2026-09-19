@@ -444,8 +444,8 @@ impl DownloadMonitor {
                 error,
             } => {
                 // 批量失败时 warn 风暴，瞬时 decoding 降为 debug
-                if error.contains("decoding") {
-                    ::tracing::debug!(chunk_id = id, start, end, error = %error, "ChunkFailed transient");
+                if error.contains("decoding") || error.contains("trickle") {
+                    ::tracing::debug!(chunk_id = id, start, end, error = %error, "ChunkFailed transient/rescue");
                 } else {
                     ::tracing::warn!(chunk_id = id, start, end, error = %error, "ChunkFailed");
                 }
@@ -675,6 +675,23 @@ impl DownloadMonitor {
             self.retry_handler.push_back_retry_with_backoff(chunk);
         }
 
+        // 终局短路：字节已齐（total 口径，含在途 chunk.downloaded）但块没发 Complete
+        // （trickle 服务器尾包后不关流，stream exhausted 永不到）时直接判 done，
+        // 不等三重门——否则 11 个零速幽灵块挨个吃 TerminateChunk，白白 18 次重握手。
+        // 安全：total 口径经单调钳 + min(total) 双保险，虚高不可能；writer 侧由 tasks/pending
+        // 的自然排空保证落盘（本 tick 内 tasks 非空则下一拍仍会走正常三重门）。
+        if self.state.total_downloaded() >= self.state.total_file_size
+            && self.retry_handler.are_all_tasks_done()
+        {
+            ::tracing::info!(
+                downloaded = self.state.total_downloaded(),
+                total = self.state.total_file_size,
+                active = self.state.chunks.len(),
+                tasks = tasks.len(),
+                "monitor tick: bytes complete, short-circuit (server never closed stream)",
+            );
+            return true;
+        }
         // 完成三重门：tasks 空（JoinHandle 全回收，防 writer 未刷盘即返）+ 无活跃/重试/缓冲 + completed 落账；比干净多 tasks 门，只拖至多一拍不假完成
         let done =
             tasks.is_empty() && self.are_all_tasks_done() && self.state.is_download_finished();
@@ -943,5 +960,23 @@ mod regression_tests {
         );
         assert!(monitor.state.chunks.is_empty(), "幽灵块复活将永久卡住退出条件");
         assert!(monitor.retry_handler.are_all_tasks_done());
+    }
+    #[tokio::test]
+    async fn bytes_complete_short_circuits_without_stream_close() {
+        // 复现 paste-4：字节已齐但服务器不关流，块无 Complete、速度归零被误判 stall 挨个枪毙。
+        // 终局短路应直接判 done，不等三重门。
+        let mut monitor = DownloadMonitor::new(1000, 0.5, 1);
+        monitor.state.chunks.insert(1, crate::state::ChunkState::new(1, 0, 499));
+        monitor.state.chunks.get_mut(&1).unwrap().update_downloaded(500);
+        monitor.state.chunks.insert(2, crate::state::ChunkState::new(2, 500, 999));
+        monitor.state.chunks.get_mut(&2).unwrap().update_downloaded(500);
+        let mut tasks = FuturesUnordered::new();
+        let (info_tx, _) = broadcast::channel(10);
+        let (cmd_tx, _) = broadcast::channel(10);
+        let client = reqwest::Client::new();
+        let (writer_tx, _) = mpsc::channel(10);
+        let next_id = AtomicU64::new(3);
+        let done = monitor.handle_tick(0.5, &mut tasks, &info_tx, &None, &cmd_tx, &client, &writer_tx, None, &mut None, &next_id);
+        assert!(done, "字节已齐必须短路判 done，不等服务器关流");
     }
 }
