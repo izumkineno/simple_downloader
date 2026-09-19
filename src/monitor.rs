@@ -43,6 +43,8 @@ pub struct DownloadMonitor {
     lagged_count: u64,
     is_rate_limited: bool,
     global_limiter: Option<Arc<RateLimiter>>,
+    // per-task 附加请求头（单源重调度/重试的 client.get 全经 build_request 生效）
+    extra_headers: Vec<(FastStr, FastStr)>,
 }
 
 impl DownloadMonitor {
@@ -78,12 +80,18 @@ impl DownloadMonitor {
             lagged_count: 0,
             is_rate_limited: false,
             global_limiter: None,
+            extra_headers: Vec::new(),
         }
     }
 
     pub fn with_rate_limit(mut self, limiter: Option<Arc<RateLimiter>>) -> Self {
         self.is_rate_limited = limiter.is_some();
         self.global_limiter = limiter;
+        self
+    }
+    /// 设置 per-task 附加请求头；单源重调度/重试经 `build_request` 统一生效，多源 lane 自带 client 不受影响。
+    pub fn with_extra_headers(mut self, headers: Vec<(FastStr, FastStr)>) -> Self {
+        self.extra_headers = headers;
         self
     }
 
@@ -261,7 +269,7 @@ impl DownloadMonitor {
                         && self.are_all_tasks_done()
                         && self.state.is_download_finished()
                     {
-                        ::tracing::info!("monitor all done fast-path exit");
+                        ::tracing::debug!("monitor all done fast-path exit");
                         break 'main_loop;
                     }
                 },
@@ -309,7 +317,7 @@ impl DownloadMonitor {
                         self.send_monitor_update(&info_tx);
                     }
                     Err(broadcast::error::RecvError::Closed) => {
-                        ::tracing::info!("broadcast closed, monitor exit");
+                        ::tracing::debug!("broadcast closed, monitor exit");
                         break 'main_loop;
                     },
                 },
@@ -348,7 +356,7 @@ impl DownloadMonitor {
                 },
             }
         }
-        ::tracing::info!("monitor all download tasks complete, shutting down");
+        ::tracing::debug!("monitor all download tasks complete, shutting down");
         Ok(())
     }
     /// 处理从下载块接收到的各种 `DownloadInfo` 消息。
@@ -396,7 +404,9 @@ impl DownloadMonitor {
                     .chunks
                     .entry(id)
                     .or_insert_with(|| ChunkState::new(id, start_byte, end_byte));
-                chunk.update_downloaded(downloaded);
+                // 单调钳：broadcast/reliable 双通道乱序、收尾可靠补发与在途节流 Progress
+                // 乱序时，小值直接赋值会把 total_downloaded 拉回退（前端进度条倒流）。
+                chunk.update_downloaded(chunk.downloaded_bytes.max(downloaded));
                 chunk.update_end_byte(end_byte);
                 // 如果块的状态不是“下载中”，则更新为“下载中”
                 if chunk.status != 0 {
@@ -409,7 +419,7 @@ impl DownloadMonitor {
                 }
             }
             DownloadInfo::DownloadComplete(id) => {
-                ::tracing::info!(chunk_id = id, "chunk DownloadComplete");
+                ::tracing::debug!(chunk_id = id, "chunk DownloadComplete");
                 // 标记一个块为已完成
                 self.state.complete_chunk(&id);
                 self.retired_ids.insert(id);
@@ -473,7 +483,7 @@ impl DownloadMonitor {
                     }
                 }
                 // 尝试为新区间分配 lane；若容量不足则缓冲至 pending_bisects，避免丢范围
-                let Some((lane_id, rb)) = build_request(client, url, multi_runtime.as_mut()) else {
+                let Some((lane_id, rb)) = build_request(client, url, multi_runtime.as_mut(), &self.extra_headers) else {
                     ::tracing::warn!(
                         new_start,
                         new_end,
@@ -483,7 +493,7 @@ impl DownloadMonitor {
                     return;
                 };
                 let new_id = next_chunk_id.fetch_add(1, Ordering::SeqCst);
-                ::tracing::info!(new_id, new_start, new_end, lane_id = ?lane_id.as_ref().map(|s| s.as_str()), "spawn bisected chunk");
+                ::tracing::debug!(new_id, new_start, new_end, lane_id = ?lane_id.as_ref().map(|s| s.as_str()), "spawn bisected chunk");
                 // 限速：解析分源与全局（需在 move 前）
                 let per_source = lane_id.as_ref().and_then(|id| {
                     multi_runtime
@@ -612,7 +622,7 @@ impl DownloadMonitor {
                 attempts = chunk_to_retry.attempts,
                 "pop ready retry chunk"
             );
-            let Some((lane_id, rb)) = build_request(client, url, multi_runtime.as_mut()) else {
+            let Some((lane_id, rb)) = build_request(client, url, multi_runtime.as_mut(), &self.extra_headers) else {
                 ::tracing::debug!(
                     chunk_id = chunk_to_retry.id,
                     "lane capacity blocked for retry, deferred"
@@ -693,7 +703,7 @@ impl DownloadMonitor {
     ) -> usize {
         let mut drained = 0usize;
         while let Some((start, end)) = self.pending_bisects.front().copied() {
-            let Some((lane_id, rb)) = build_request(client, url, multi_runtime.as_mut()) else {
+            let Some((lane_id, rb)) = build_request(client, url, multi_runtime.as_mut(), &self.extra_headers) else {
                 ::tracing::debug!(
                     start,
                     end,
@@ -704,7 +714,7 @@ impl DownloadMonitor {
             };
             self.pending_bisects.pop_front();
             let new_id = next_chunk_id.fetch_add(1, Ordering::SeqCst);
-            ::tracing::info!(new_id, start, end, lane_id = ?lane_id.as_ref().map(|s| s.as_str()), "drain pending_bisect");
+            ::tracing::debug!(new_id, start, end, lane_id = ?lane_id.as_ref().map(|s| s.as_str()), "drain pending_bisect");
             let per_source = lane_id.as_ref().and_then(|id| {
                 multi_runtime
                     .as_ref()
@@ -820,6 +830,7 @@ fn build_request(
     client: &Client,
     url: Option<&FastStr>,
     multi_runtime: Option<&mut MultiRuntime>,
+    extra_headers: &[(FastStr, FastStr)],
 ) -> Option<(Option<FastStr>, reqwest::RequestBuilder)> {
     if let Some(runtime) = multi_runtime {
         let (lane_id, rb) = runtime.claim_request_builder()?;
@@ -827,7 +838,10 @@ fn build_request(
     }
 
     let url = url?;
-    Some((None, client.get(url.as_str())))
+    Some((
+        None,
+        crate::util::apply_extra_headers(client.get(url.as_str()), extra_headers),
+    ))
 }
 
 #[cfg(all(test, feature = "rate-limit"))]

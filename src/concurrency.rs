@@ -12,6 +12,8 @@ const BANDWIDTH_PROBE_FACTOR: f64 = 1.1;
 const STABLE_SPLIT_THRESHOLD: f64 = 0.8;
 /// 最小分割间隔，防止过于频繁地分割任务。
 const MIN_SPLIT_INTERVAL: Duration = Duration::from_millis(150);
+/// 零速块阈值：chunk 速度低于此即判慢连接 stall，偏心切分 + 豁免观察期连续切。
+const STALL_SKEW_SPEED_BPS: f64 = 1024.0;
 /// 触发分割所需的最小预估剩余时间（兜底值），实际使用按文件大小自适应的阈值，避免在下载即将完成时进行不必要的分割。
 const MIN_REMAINING_TIME_FOR_SPLIT: f64 = 3.0;
 /// 块的最小尺寸，统一复用 `chunk::MIN_CHUNK_SIZE` 的 10 KiB 阈值（可安全二分的最小剩余量 ×2）。
@@ -73,6 +75,9 @@ pub struct ConcurrencyManager {
     current_observation: Option<SplitObservation>,
     /// 探测阶段连续没有获得速度增益的次数
     consecutive_probe_no_gain: usize,
+    /// 同块偏心切分计数：trickle 连接靠切分救不回来（切几次还是零速），
+    /// 达阈值后改发 TerminateChunk 杀坏连接走重试换新连接。
+    skewed_split_counts: HashMap<ChunkId, u32>,
 }
 
 impl ConcurrencyManager {
@@ -105,6 +110,7 @@ impl ConcurrencyManager {
             observation_state: ObservationState::Ready,
             current_observation: None,
             consecutive_probe_no_gain: 0,
+            skewed_split_counts: HashMap::new(),
         }
     }
     /// 0.5.5 热更新：运行时调整最大并发（配置灵活性）
@@ -306,7 +312,7 @@ impl ConcurrencyManager {
                 self.request_split(largest_chunk.id, cmd_tx);
                 self.consecutive_probe_no_gain = 0; // 重置连续无增益计数
             } else {
-                ::tracing::info!("probing: no splittable largest -> Stable");
+                ::tracing::debug!("probing: no splittable largest -> Stable");
                 self.transition_to_stable();
             }
         } else {
@@ -394,16 +400,55 @@ impl ConcurrencyManager {
             "stable::ready check"
         );
 
+        // stall 救援优先：零速块 kill 换连接不需要"切分收益"，绕过 useful/should_split 门控。
+        // 否则 3KB 尾块 useful=false + 不满足可切分尺寸，双重拦截，只能等 15s 空闲超时。
+        if let Some(stalled) = state.chunks.values().filter(|c| c.speed < STALL_SKEW_SPEED_BPS && c.remaining_bytes() > 0).min_by(|a, b| a.speed.partial_cmp(&b.speed).unwrap_or(std::cmp::Ordering::Equal)) {
+            let stalled_id = stalled.id;
+            let stalled_speed = stalled.speed;
+            let stalled_remaining = stalled.remaining_bytes();
+            ::tracing::info!(
+                chunk_id = stalled_id,
+                speed_kbs = stalled_speed / 1024.0,
+                remaining = stalled_remaining,
+                "stable::ready skewed-splitting stalled chunk"
+            );
+            self.request_skewed_split(stalled_id, stalled_remaining, cmd_tx);
+            return;
+        }
         if should_consider_split {
-            // 尝试分割最慢的块，因为它可能是瓶颈
+            // 尝试分割最慢的块，因为它可能是瓶颈；正常切分要求单块剩余 ≥512KiB，
+            // 尾部小块建连+首字节开销大于并行收益（106KB→20KB碎片越切越慢）。
+            // 但零速 stall 豁免：偏心切分只留 1/8 本地、新连接取 7/8，正是救尾手段。
             if let Some(slowest_chunk) = self.find_slowest_splittable_chunk(&state.chunks) {
-                ::tracing::info!(
-                    chunk_id = slowest_chunk.id,
-                    speed_kbs = slowest_chunk.speed / 1024.0,
-                    remaining = slowest_chunk.remaining_bytes(),
-                    "stable::ready splitting slowest"
-                );
-                self.request_split_with_observation(slowest_chunk.id, avg_speed, cmd_tx);
+                let slowest_id = slowest_chunk.id;
+                let slowest_speed = slowest_chunk.speed;
+                let slowest_remaining = slowest_chunk.remaining_bytes();
+                let is_stall = slowest_speed < STALL_SKEW_SPEED_BPS;
+                if !is_stall && slowest_remaining < 512 * 1024 {
+                    ::tracing::debug!(
+                        chunk_id = slowest_id,
+                        remaining = slowest_remaining,
+                        "stable::ready skip: slowest remaining <512KiB tail"
+                    );
+                    return;
+                }
+                if is_stall {
+                    ::tracing::info!(
+                        chunk_id = slowest_id,
+                        speed_kbs = slowest_speed / 1024.0,
+                        remaining = slowest_remaining,
+                        "stable::ready skewed-splitting stalled chunk"
+                    );
+                    self.request_skewed_split(slowest_id, slowest_remaining, cmd_tx);
+                } else {
+                    ::tracing::info!(
+                        chunk_id = slowest_id,
+                        speed_kbs = slowest_speed / 1024.0,
+                        remaining = slowest_remaining,
+                        "stable::ready splitting slowest"
+                    );
+                    self.request_split_with_observation(slowest_id, avg_speed, cmd_tx);
+                }
             } else {
                 ::tracing::debug!("stable::ready no splittable slowest chunk");
             }
@@ -494,10 +539,35 @@ impl ConcurrencyManager {
             "stable -> Observing"
         );
     }
+    /// 偏心分割请求：豁免观察期（保持 Ready 可连续切），仅受 MIN_SPLIT_INTERVAL 节流。
+    /// 同块累计 2 次后仍 stall（trickle 连接：有数据但极慢，空闲超时永不触发，
+    /// 切分只救走 7/8、坏连接留守的 1/8 永远跑不动），第 3 次改发 TerminateChunk
+    /// 杀坏连接走重试换新连接。小剩余（<128KiB）切分救回的 7/8 也不值得一次建连，
+    /// 且 12KB 尾块证明连 trickle 都停了时直接杀、不浪费一次切分。
+    fn request_skewed_split(&mut self, id: ChunkId, remaining: u64, cmd_tx: &broadcast::Sender<DownloadCmd>) {
+        if remaining < 128 * 1024 {
+            ::tracing::debug!(chunk_id = id, remaining, phase = ?self.phase, "TerminateChunk: small-tail stall kill");
+            let _ = cmd_tx.send(DownloadCmd::TerminateChunk { id });
+            self.skewed_split_counts.remove(&id);
+            self.last_split_time = Instant::now();
+            return;
+        }
+        let count = self.skewed_split_counts.entry(id).or_insert(0);
+        *count += 1;
+        if *count > 2 {
+            ::tracing::debug!(chunk_id = id, skewed_count = *count, phase = ?self.phase, "TerminateChunk: trickle connection kill");
+            let _ = cmd_tx.send(DownloadCmd::TerminateChunk { id });
+            self.skewed_split_counts.remove(&id);
+        } else {
+            ::tracing::debug!(chunk_id = id, skewed_count = *count, phase = ?self.phase, "BisectDownloadSkewed");
+            let _ = cmd_tx.send(DownloadCmd::BisectDownloadSkewed { id });
+        }
+        self.last_split_time = Instant::now();
+    }
 
     /// 发送一个分割请求。
     fn request_split(&mut self, id: ChunkId, cmd_tx: &broadcast::Sender<DownloadCmd>) {
-        ::tracing::info!(chunk_id = id, phase = ?self.phase, "BisectDownload");
+        ::tracing::debug!(chunk_id = id, phase = ?self.phase, "BisectDownload");
         let _ = cmd_tx.send(DownloadCmd::BisectDownload { id });
         self.last_split_time = Instant::now();
     }
@@ -592,6 +662,30 @@ mod tests {
     }
 
     #[test]
+    fn stalled_chunk_gets_skewed_split_without_observation() {
+        // 零速 stall 块：偏心切分且豁免观察期（保持 Ready，可连续切）
+        let mut manager = ConcurrencyManager::new(8);
+        manager.phase = DownloadPhase::Stable;
+        manager.max_speed = 10_000.0;
+        manager.recent_best_speed = 10_000.0;
+        manager.last_split_time = Instant::now() - MIN_SPLIT_INTERVAL;
+        manager.stable_speed_samples = VecDeque::from(vec![5000.0, 5000.0, 5000.0]);
+        let state = state_with_chunks(
+            5_000_000,
+            [
+                chunk(1, 0, 60_000, 55_000, 9000.0),
+                chunk(2, 60_001, 5_000_000 - 1, 1000, 6.0), // stall：6B/s
+            ],
+        );
+        let (cmd_tx, mut cmd_rx) = broadcast::channel(4);
+        manager.decide_and_act(&state, &cmd_tx);
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(DownloadCmd::BisectDownloadSkewed { id: 2 })
+        ));
+        assert_eq!(manager.observation_state, ObservationState::Ready);
+    }
+    #[test]
     fn probing_phase_does_not_split_without_positive_speed_evidence() {
         let mut manager = ConcurrencyManager::new(4);
         manager.last_split_time = Instant::now() - MIN_SPLIT_INTERVAL;
@@ -615,15 +709,15 @@ mod tests {
         let state = state_with_chunks(
             50_000,
             [
-                chunk(1, 0, 19_999, 5_000, 75.0),
-                chunk(2, 20_000, 39_999, 5_000, 75.0),
+                chunk(1, 0, 19_999, 5_000, 7500.0),
+                chunk(2, 20_000, 39_999, 5_000, 7500.0),
             ],
         );
         let (cmd_tx, mut cmd_rx) = broadcast::channel(4);
 
         manager.decide_and_act(&state, &cmd_tx);
 
-        assert_eq!(manager.max_speed, 112.5);
+        assert_eq!(manager.max_speed, 3825.0);
         assert!(matches!(cmd_rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
@@ -632,16 +726,16 @@ mod tests {
         // 验证稳定阶段不会仅仅因为并发数未满就进行分割
         let mut manager = ConcurrencyManager::new(3);
         manager.phase = DownloadPhase::Stable;
-        manager.max_speed = 1_000.0;
-        manager.recent_best_speed = 1_000.0;
+        manager.max_speed = 10_000.0;
+        manager.recent_best_speed = 10_000.0;
         manager.last_split_time = Instant::now() - MIN_SPLIT_INTERVAL;
         manager.stable_speed_samples = VecDeque::from(vec![1_000.0, 1_000.0, 1_000.0]);
 
         let state = state_with_chunks(
             200_000,
             [
-                chunk(1, 0, 60_000, 55_000, 500.0),
-                chunk(2, 60_001, 120_000, 15_000, 500.0),
+                chunk(1, 0, 60_000, 55_000, 5000.0),
+                chunk(2, 60_001, 120_000, 15_000, 5000.0),
             ],
         );
         let (cmd_tx, mut cmd_rx) = broadcast::channel(4);
@@ -657,16 +751,16 @@ mod tests {
         // 验证稳定阶段分割后会进入观察期
         let mut manager = ConcurrencyManager::new(3);
         manager.phase = DownloadPhase::Stable;
-        manager.max_speed = 1_000.0;
-        manager.recent_best_speed = 1_000.0;
+        manager.max_speed = 10_000.0;
+        manager.recent_best_speed = 10_000.0;
         manager.last_split_time = Instant::now() - MIN_SPLIT_INTERVAL;
-        manager.stable_speed_samples = VecDeque::from(vec![700.0, 700.0, 700.0]); // 速度低于阈值
+        manager.stable_speed_samples = VecDeque::from(vec![7000.0, 7000.0, 7000.0]); // 速度低于阈值
 
         let state = state_with_chunks(
             5_000_000,
             [
-                chunk(1, 0, 60_000, 55_000, 400.0),
-                chunk(2, 60_001, 120_000, 15_000, 300.0), // 慢块，总和700
+                chunk(1, 0, 1_060_000, 55_000, 4000.0),
+                chunk(2, 1_060_001, 2_120_000, 15_000, 3000.0), // 慢块
             ],
         );
         let (cmd_tx, mut cmd_rx) = broadcast::channel(4);
@@ -701,17 +795,17 @@ mod tests {
         // 验证组合增益门通过时允许继续分割
         let mut manager = ConcurrencyManager::new(4);
         manager.phase = DownloadPhase::Stable;
-        manager.max_speed = 1_000.0;
-        manager.recent_best_speed = 1_000.0;
+        manager.max_speed = 10_000.0;
+        manager.recent_best_speed = 10_000.0;
         manager.last_split_time = Instant::now() - MIN_SPLIT_INTERVAL;
 
         // 第一次调用：速度低，触发分割
-        manager.stable_speed_samples = VecDeque::from(vec![700.0, 700.0, 700.0]);
+        manager.stable_speed_samples = VecDeque::from(vec![7000.0, 7000.0, 7000.0]);
         let state1 = state_with_chunks(
             5_000_000,
             [
-                chunk(1, 0, 60_000, 55_000, 400.0),
-                chunk(2, 60_001, 120_000, 15_000, 300.0), // 总和700
+                chunk(1, 0, 1_060_000, 55_000, 4000.0),
+                chunk(2, 1_060_001, 2_120_000, 15_000, 3000.0),
             ],
         );
         let (cmd_tx, mut cmd_rx) = broadcast::channel(4);
@@ -728,12 +822,12 @@ mod tests {
         let state2 = state_with_chunks(
             5_000_000,
             [
-                chunk(1, 0, 60_000, 58_000, 450.0),
-                chunk(2, 60_001, 90_000, 10_000, 225.0),
-                chunk(3, 90_001, 120_000, 10_000, 225.0),
+                chunk(1, 0, 60_000, 58_000, 4500.0),
+                chunk(2, 60_001, 90_000, 10_000, 2250.0),
+                chunk(3, 90_001, 120_000, 10_000, 2250.0),
             ],
-        ); // 总速度900
-        manager.stable_speed_samples = VecDeque::from(vec![700.0, 700.0, 700.0]);
+        ); // 总速度9000
+        manager.stable_speed_samples = VecDeque::from(vec![7000.0, 7000.0, 7000.0]);
         manager.decide_and_act(&state2, &cmd_tx);
         assert!(matches!(cmd_rx.try_recv(), Err(TryRecvError::Empty)));
 
@@ -745,15 +839,15 @@ mod tests {
             5_000_000,
             [
                 chunk(1, 0, 60_000, 60_000, 0.0),
-                chunk(2, 60_001, 90_000, 20_000, 350.0),
-                chunk(3, 90_001, 120_000, 20_000, 350.0),
-                chunk(4, 120_001, 199_999, 10_000, 400.0),
+                chunk(2, 60_001, 90_000, 20_000, 3500.0),
+                chunk(3, 90_001, 120_000, 20_000, 3500.0),
+                chunk(4, 120_001, 199_999, 10_000, 4000.0),
             ],
-        ); // 总速度1100（包括已完成块的0速度）
-        manager.stable_speed_samples = VecDeque::from(vec![700.0, 900.0, 1100.0]);
+        ); // 总速度11000（包括已完成块的0速度）
+        manager.stable_speed_samples = VecDeque::from(vec![7000.0, 9000.0, 11000.0]);
         manager.decide_and_act(&state3, &cmd_tx);
         // 评估会立即执行，分割成功，更新最近最佳速度（说明增益门通过）
-        assert_eq!(manager.recent_best_speed, 1100.0);
+        assert_eq!(manager.recent_best_speed, 11000.0);
         // 观察状态会根据是否继续分割而变化，此处只需验证增益门逻辑正确
     }
 
@@ -762,17 +856,17 @@ mod tests {
         // 验证组合增益门失败时不允许继续分割
         let mut manager = ConcurrencyManager::new(3);
         manager.phase = DownloadPhase::Stable;
-        manager.max_speed = 1_000.0;
-        manager.recent_best_speed = 1_000.0;
+        manager.max_speed = 10_000.0;
+        manager.recent_best_speed = 10_000.0;
         manager.last_split_time = Instant::now() - MIN_SPLIT_INTERVAL;
 
         // 第一次调用：速度低，触发分割
-        manager.stable_speed_samples = VecDeque::from(vec![700.0, 700.0, 700.0]);
+        manager.stable_speed_samples = VecDeque::from(vec![7000.0, 7000.0, 7000.0]);
         let state1 = state_with_chunks(
             5_000_000,
             [
-                chunk(1, 0, 60_000, 55_000, 400.0),
-                chunk(2, 60_001, 120_000, 15_000, 300.0), // 总和700
+                chunk(1, 0, 1_060_000, 55_000, 4000.0),
+                chunk(2, 1_060_001, 2_120_000, 15_000, 3000.0),
             ],
         );
         let (cmd_tx, mut cmd_rx) = broadcast::channel(4);
@@ -789,12 +883,12 @@ mod tests {
         let state2 = state_with_chunks(
             5_000_000,
             [
-                chunk(1, 0, 60_000, 58_000, 400.0),
-                chunk(2, 60_001, 90_000, 10_000, 175.0),
-                chunk(3, 90_001, 120_000, 10_000, 175.0),
+                chunk(1, 0, 60_000, 58_000, 4000.0),
+                chunk(2, 60_001, 90_000, 10_000, 1750.0),
+                chunk(3, 90_001, 120_000, 10_000, 1750.0),
             ],
-        ); // 总速度750
-        manager.stable_speed_samples = VecDeque::from(vec![700.0, 700.0, 700.0]);
+        ); // 总速度7500
+        manager.stable_speed_samples = VecDeque::from(vec![7000.0, 7000.0, 7000.0]);
         manager.decide_and_act(&state2, &cmd_tx); // 收集第一个样本
         assert_eq!(manager.observation_state, ObservationState::Observing);
 
@@ -835,4 +929,5 @@ mod tests {
         assert_eq!(manager.phase, DownloadPhase::Stable);
         assert_eq!(manager.consecutive_probe_no_gain, 1);
     }
+
 }

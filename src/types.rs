@@ -61,15 +61,6 @@ pub enum DownloadError {
     #[error("没有可用的下载源")]
     NoAvailableSources,
 
-    /// 断点续传元数据存在，但目标文件不存在。
-    ///
-    /// 可能的原因：
-    /// - 上次下载后目标文件被手动删除
-    /// - 文件路径被移动或重命名
-    /// - 磁盘分区被卸载
-    #[error("断点续传元数据存在，但目标文件不存在: {0}")]
-    ResumeTargetMissing(PathBuf),
-
     /// 断点续传元数据无效。
     ///
     /// 可能的原因：
@@ -96,6 +87,13 @@ pub enum DownloadCmd {
     WriteFile { offset: u64, data: Bytes },
     /// 分割一个下载任务的命令（广播给所有块任务）。
     BisectDownload { id: ChunkId },
+    /// 偏心分割：慢连接块只保留前 1/8 剩余量，其余 7/8 交新块用新连接极速拉回，
+    /// 尾部收敛从对半切的 4-5 刀压到 1-2 刀。
+    BisectDownloadSkewed { id: ChunkId },
+    /// 终止单个下载块（坏连接杀死）：chunk 以 ChunkFailed 上报当前 offset..end
+    /// 走现有重试换新连接，避免 trickle 连接（有数据但极慢，空闲超时永不触发）
+    /// 被偏心切分反复保留、尾部拖 90 秒。
+    TerminateChunk { id: ChunkId },
     /// 终止所有下载任务的命令（广播给所有任务）。
     TerminateAll,
 }

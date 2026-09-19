@@ -15,6 +15,8 @@ use tokio::sync::{broadcast, mpsc};
 /// 定义一个块（chunk）的最小尺寸。
 /// 当一个块被分割时，分割后的每个块的大小不能小于此值。
 pub(crate) const MIN_CHUNK_SIZE: u64 = 1024 * 10; // 10 KB
+/// chunk 流空闲超时：15s 无数据即判失败走重试，防半开连接永久挂起。
+const CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 
 async fn send_terminal_event(
     reliable_tx: &Option<mpsc::Sender<DownloadInfo>>,
@@ -39,12 +41,22 @@ fn send_progress_best_effort(
 }
 
 fn split_range(offset: u64, end: u64) -> Option<(u64, u64)> {
+    split_range_skewed(offset, end, false)
+}
+
+/// 偏心切分：skewed 时慢块只留前 1/8（钳 MIN_CHUNK_SIZE），剩余 7/8 交新块。
+/// 留量下限钳住：剩余 < 2*MIN_CHUNK 拒绝，避免小尾碎片风暴。
+fn split_range_skewed(offset: u64, end: u64, skewed: bool) -> Option<(u64, u64)> {
     let remaining_bytes = end.saturating_sub(offset).saturating_add(1);
     if remaining_bytes < MIN_CHUNK_SIZE * 2 {
         return None;
     }
 
-    let left_chunk_size = remaining_bytes / 2;
+    let left_chunk_size = if skewed {
+        (remaining_bytes / 8).max(MIN_CHUNK_SIZE).min(remaining_bytes - MIN_CHUNK_SIZE)
+    } else {
+        remaining_bytes / 2
+    };
     let midpoint = offset + left_chunk_size - 1;
     Some((midpoint, midpoint + 1))
 }
@@ -329,7 +341,7 @@ pub(crate) async fn chunk_run_with_reliable(
                         )
                         .await
                         {
-                            ::tracing::info!(chunk_id = id, kept_range = format!("{offset}-{midpoint}"), new_range = format!("{new_chunk_start}-{end}"), "chunk bisected");
+                            ::tracing::debug!(chunk_id = id, kept_range = format!("{offset}-{midpoint}"), new_range = format!("{new_chunk_start}-{end}"), "chunk bisected");
                             ::tracing::debug!(chunk_id = id, offset, midpoint, new_start = new_chunk_start, new_end = end, "bisected detail");
                             // 更新当前块的结束位置
                             end = midpoint;
@@ -337,6 +349,50 @@ pub(crate) async fn chunk_run_with_reliable(
                             ::tracing::warn!(chunk_id = id, "bisected send failed (no monitor)");
                         }
                     }
+                    DownloadCmd::BisectDownloadSkewed { id: id_ } if id == id_ => {
+                        ::tracing::debug!(chunk_id = id, offset, end, remaining = end.saturating_sub(offset).saturating_add(1), "recv BisectDownloadSkewed");
+                        let Some((midpoint, new_chunk_start)) = split_range_skewed(offset, end, true) else {
+                            ::tracing::debug!(chunk_id = id, remaining = end.saturating_sub(offset).saturating_add(1), "skewed bisect rejected: remaining < 2*MIN_CHUNK");
+                            continue;
+                        };
+                        if send_terminal_event(
+                            &reliable_tx,
+                            &bd_tx,
+                            DownloadInfo::ChunkBisected {
+                                original_id: id,
+                                new_start: new_chunk_start,
+                                new_end: end,
+                            },
+                        )
+                        .await
+                        {
+                            ::tracing::debug!(chunk_id = id, kept_range = format!("{offset}-{midpoint}"), new_range = format!("{new_chunk_start}-{end}"), "chunk skewed-bisected");
+                            end = midpoint;
+                        } else {
+                            ::tracing::warn!(chunk_id = id, "skewed bisected send failed (no monitor)");
+                        }
+                    }
+                    // 单块终止（坏连接杀死）：以失败上报剩余区间走重试换新连接
+                    DownloadCmd::TerminateChunk { id: id_ } if id == id_ => {
+                        ::tracing::debug!(chunk_id = id, offset, end, "recv TerminateChunk, failing over to retry");
+                        let actual = offset.saturating_sub(start_byte);
+                        if actual != last_reported {
+                            send_progress_best_effort(&reliable_tx, &bd_tx, DownloadInfo::ChunkProgress { id, start_byte, end_byte: end, downloaded: actual });
+                        }
+                        send_terminal_event(
+                            &reliable_tx,
+                            &bd_tx,
+                            DownloadInfo::ChunkFailed {
+                                id,
+                                start: offset,
+                                end,
+                                error: "stalled trickle connection killed, retry with fresh connection".to_string(),
+                            },
+                        )
+                        .await;
+                        failed = true;
+                        break;
+                    },
                     // 收到终止命令，退出循环
                     DownloadCmd::TerminateAll => {
                         ::tracing::debug!(chunk_id = id, "recv TerminateAll, exiting");
@@ -355,9 +411,11 @@ pub(crate) async fn chunk_run_with_reliable(
                     break;
                 },
             },
-            // 从网络流中获取下一个数据块
-            chunk_result = stream.next() => match chunk_result {
-                Some(Ok(mut chunk)) => {
+            // 从网络流中获取下一个数据块；空闲超时兜底：半开连接不发数据不断开时
+            // chunk 会永久挂起（小文件 0%/尾部 99.x% 卡死，手动暂停继续才恢复）。
+            // 超时后按 ChunkFailed 走现有重试/二分，保证任务自行收敛。
+            chunk_result = tokio::time::timeout(CHUNK_IDLE_TIMEOUT, stream.next()) => match chunk_result {
+                Ok(Some(Ok(mut chunk))) => {
                     if offset > end { break; }
 
                     let remaining_chunk_len = chunk.len() as u64;
@@ -444,7 +502,7 @@ pub(crate) async fn chunk_run_with_reliable(
                         break;
                     }
                 }
-                Some(Err(e)) => {
+                Ok(Some(Err(e))) => {
                     let error_msg = format!("{e:#}");
                     // 瞬时网络抖动（decoding）降为 debug，避免 16路并败时 error 风暴
                     if error_msg.contains("decoding") {
@@ -470,8 +528,33 @@ pub(crate) async fn chunk_run_with_reliable(
                     failed = true;
                     break;
                 },
+                // 超时：按失败走重试，offset 锚定避免 monitor 少算
+                Err(_) => {
+                    let error_msg = format!(
+                        "chunk idle timeout (15s no data, {}-{})",
+                        offset, end
+                    );
+                    ::tracing::warn!(chunk_id = id, offset, end, "chunk stream idle timeout");
+                    let actual = offset.saturating_sub(start_byte);
+                    if actual != last_reported {
+                        send_progress_best_effort(&reliable_tx, &bd_tx, DownloadInfo::ChunkProgress { id, start_byte, end_byte: end, downloaded: actual });
+                    }
+                    send_terminal_event(
+                        &reliable_tx,
+                        &bd_tx,
+                        DownloadInfo::ChunkFailed {
+                            id,
+                            start: offset,
+                            end,
+                            error: error_msg,
+                        },
+                    )
+                    .await;
+                    failed = true;
+                    break;
+                }
                 // 流结束：P0-02 完整性门，offset 必须到达 end+1 否则判 Early-EOF
-                None => {
+                Ok(None) => {
                     ::tracing::debug!(chunk_id = id, offset, end, "stream exhausted");
                     // 仅当 offset < end+1 时判 early EOF；offset>end 视为已完成 (bisect 后 end 缩小)
                     if offset < end.saturating_add(1) {
@@ -528,20 +611,22 @@ pub(crate) async fn chunk_run_with_reliable(
     let final_downloaded = offset.saturating_sub(start_byte);
     let expected_size = end.saturating_sub(start_byte).saturating_add(1);
     if !terminated && !failed && final_downloaded == expected_size {
-        if final_downloaded != last_reported {
-            ::tracing::trace!(
+        // 无条件可靠 await 补发最终进度（即使本地 last_reported 已记：broadcast 发过≠monitor 收到，
+        // Lagged 丢光时 monitor 侧无条目，Complete 的 remove+加账落空即 769B 卡死根因）。
+        // 同一 mpsc FIFO 保证 Progress 先于 Complete 到达。
+        if let Some(tx) = &reliable_tx {
+            ::tracing::debug!(
                 chunk_id = id,
                 final_downloaded,
                 total = expected_size,
-                "final progress補發"
+                "final progress reliable補發"
             );
-            // 补发最终进度用 try_send 非阻塞（size() 完成判定不依赖它，丢了由 Complete.size 兜底）
-            send_progress_best_effort(&reliable_tx, &bd_tx, DownloadInfo::ChunkProgress {
+            let _ = tx.send(DownloadInfo::ChunkProgress {
                 id,
                 start_byte,
                 end_byte: end,
                 downloaded: final_downloaded,
-            });
+            }).await;
         }
         // 如果没有发生失败且下载量匹配，则广播下载完成消息
         ::tracing::debug!(chunk_id = id, "DownloadComplete");
@@ -573,7 +658,7 @@ pub(crate) async fn chunk_run_with_reliable(
         )
         .await;
     } else if terminated {
-        ::tracing::info!(chunk_id = id, "chunk terminated, no terminal event");
+        ::tracing::debug!(chunk_id = id, "chunk terminated, no terminal event");
     } else {
         ::tracing::debug!(chunk_id = id, "chunk exit with failure (transient)");
     }
@@ -582,6 +667,20 @@ pub(crate) async fn chunk_run_with_reliable(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skewed_split_keeps_eighth_clamped_to_min_chunk() {
+        // 80KiB 偏心切：慢块留 10KiB(1/8)，新块拿 70KiB
+        let (mid, new_start) = split_range_skewed(0, 80 * 1024 - 1, true).unwrap();
+        assert_eq!(mid, 10 * 1024 - 1);
+        assert_eq!(new_start, 10 * 1024);
+        // 小剩余钳 MIN_CHUNK：20KiB 偏心切慢块留 10KiB 下限
+        let (mid2, _) = split_range_skewed(0, 20 * 1024 - 1, true).unwrap();
+        assert_eq!(mid2, 10 * 1024 - 1);
+        // 对半切不受影响
+        let (mid3, _) = split_range_skewed(0, 80 * 1024 - 1, false).unwrap();
+        assert_eq!(mid3, 40 * 1024 - 1);
+    }
 
     #[test]
     fn split_range_allows_exactly_two_minimum_chunks() {
