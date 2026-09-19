@@ -7,6 +7,15 @@
 
 ## [Unreleased]
 
+## [0.7.2]
+
+### ✨ 新增
+
+- **尾部偏心切分** `types::BisectDownloadSkewed` + `chunk::split_range_skewed`：stall 块只留前 1/8 剩余量、7/8 交新块用新连接拉回，尾部收敛从对半切 4-5 刀压到 1-2 刀
+- **trickle 连接杀死** `types::TerminateChunk`：同块偏心切 2 次仍 stall（>1KB/s trickle，空闲超时永不触发）第 3 次改发 kill，以 `ChunkFailed` 上报剩余区间走现有重试换新连接；剩余 <128KiB 的 stall 尾块直接杀（Nexus CDN 实测 90s→3s）
+- **stall 救援绕过切分门控** `concurrency::handle_stable_ready`：零速块救援提前到 `useful/splittable` 门控之前，3KB 级尾块不再因 `useful=false` + 尺寸不足被双重拦截（23MB 文件 3568B 尾巴 10s→1s 内）
+- **per-task 请求头** `downloader::header/headers/user_agent/referer/cookie`：`extra_headers` 在探测/单流/chunk/monitor 重调度全链路经 `apply_extra_headers` 追加（GMM Referer 防盗链必需）
+
 ### 🐛 修复
 
 - **Range 探针验体** `util.rs:get_file_info_with_headers` `206 bytes=0-0` 必须恰好回 1 字节体且与整包首字节一致（各 10s 上限），否则判 Range 通道不可信 → `MissingContentLength` 走无 Range 单流（浏览器同款）；防盗链/过期缓存 `206` 配空体、错体时不再按头分片组装坏文件（`flingtrainer` 实测：`HEAD/Range` 称 796885 且 Range 体为 gzip 魔数，整包 `GET` 实为 1390080 可运行 PE）
