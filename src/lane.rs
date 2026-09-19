@@ -384,7 +384,7 @@ impl LaneScheduler {
             if entry.health == LaneHealth::Blacklisted {
                 if let Some(at) = entry.blacklisted_at {
                     if at.elapsed() >= BLACKLIST_DURATION {
-                        ::tracing::info!(lane_id = %entry.candidate.lane_id, "lane blacklist expired -> Healthy");
+                        ::tracing::debug!(lane_id = %entry.candidate.lane_id, "lane blacklist expired -> Healthy");
                         entry.health = LaneHealth::Healthy;
                         entry.consecutive_failures = 0;
                         entry.blacklisted_at = None;
@@ -610,7 +610,7 @@ impl MultiRuntime {
                                     Ok(b) => {
                                         let elapsed = start.elapsed().as_secs_f64().max(0.001);
                                         let s = b.len() as f64 / elapsed;
-                                        ::tracing::info!(lane_id = %runtime.lane_id, bytes = b.len(), elapsed, speed = s, "probe_speed measured (range)");
+                                        ::tracing::debug!(lane_id = %runtime.lane_id, bytes = b.len(), elapsed, speed = s, "probe_speed measured (range)");
                                         if s > 0.0 { s } else { 1.0 }
                                     }
                                     Err(e) => {
@@ -686,7 +686,7 @@ impl MultiRuntime {
                                     } else {
                                         let elapsed = start.elapsed().as_secs_f64().max(0.001);
                                         let s = total as f64 / elapsed;
-                                        ::tracing::info!(lane_id = %runtime.lane_id, bytes = total, elapsed, speed = s, "probe_speed measured (fallback)");
+                                        ::tracing::debug!(lane_id = %runtime.lane_id, bytes = total, elapsed, speed = s, "probe_speed measured (fallback)");
                                         if s > 0.0 { s } else { 1.0 }
                                     }
                                 }

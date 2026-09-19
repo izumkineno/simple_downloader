@@ -133,7 +133,7 @@ impl TaskQueue {
         };
         let _ = self.tx.send(QueueCmd::Pump).await;
         self.notify.notify_waiters();
-        ::tracing::info!(task_id=%id, path=%final_path.display(), "queue enqueue");
+        ::tracing::debug!(task_id=%id, path=%final_path.display(), "queue enqueue");
         id
     }
 
@@ -147,7 +147,7 @@ impl TaskQueue {
             drop(s);
             self.notify.notify_waiters();
             let _ = self.tx.send(QueueCmd::Pump).await;
-            ::tracing::info!(task_id=%id, "queue pause active -> Paused");
+            ::tracing::debug!(task_id=%id, "queue pause active -> Paused");
             return Ok(());
         }
         if let Some(pos) = s.queue.iter().position(|t| t.id == id) {
@@ -156,7 +156,7 @@ impl TaskQueue {
             s.all.insert(id.clone(), task);
             drop(s);
             self.notify.notify_waiters();
-            ::tracing::info!(task_id=%id, "queue pause queued -> Paused");
+            ::tracing::debug!(task_id=%id, "queue pause queued -> Paused");
             return Ok(());
         }
         if let Some(t) = s.all.get(&id) {
@@ -183,7 +183,7 @@ impl TaskQueue {
                 drop(s);
                 let _ = self.tx.send(QueueCmd::Pump).await;
                 self.notify.notify_waiters();
-                ::tracing::info!(task_id=%id, "queue resume Paused -> Queued (front)");
+                ::tracing::debug!(task_id=%id, "queue resume Paused -> Queued (front)");
                 Ok(())
             }
             Some(t) => Err(QueueError::InvalidState {
@@ -208,7 +208,7 @@ impl TaskQueue {
             drop(s);
             self.notify.notify_waiters();
             let _ = self.tx.send(QueueCmd::Pump).await;
-            ::tracing::info!(task_id=%id, "queue cancel active -> Removed (deferred delete)");
+            ::tracing::debug!(task_id=%id, "queue cancel active -> Removed (deferred delete)");
             return Ok(());
         }
         if let Some(pos) = s.queue.iter().position(|t| t.id == id) {
@@ -224,7 +224,7 @@ impl TaskQueue {
                 let _ = tokio::fs::remove_file(&meta).await;
             }
             self.notify.notify_waiters();
-            ::tracing::info!(task_id=%id, "queue cancel queued -> Removed");
+            ::tracing::debug!(task_id=%id, "queue cancel queued -> Removed");
             return Ok(());
         }
         if let Some(t) = s.all.get(&id).cloned() {
@@ -240,7 +240,7 @@ impl TaskQueue {
                     let _ = tokio::fs::remove_file(&meta).await;
                 }
                 self.notify.notify_waiters();
-                ::tracing::info!(task_id=%id, "queue cancel paused -> Removed");
+                ::tracing::debug!(task_id=%id, "queue cancel paused -> Removed");
                 return Ok(());
             }
             if t.state == TaskState::Removed {
@@ -258,7 +258,7 @@ impl TaskQueue {
                     let _ = tokio::fs::remove_file(&meta).await;
                 }
                 self.notify.notify_waiters();
-                ::tracing::info!(task_id=%id, "queue cancel completed/failed -> Removed");
+                ::tracing::debug!(task_id=%id, "queue cancel completed/failed -> Removed");
                 return Ok(());
             }
             return Err(QueueError::InvalidState {
@@ -415,7 +415,7 @@ async fn driver_loop(
                         flush_pending_deletes(&state).await;
                     },
                     Some(QueueCmd::Shutdown) | None => {
-                        ::tracing::info!("queue driver shutdown");
+                        ::tracing::debug!("queue driver shutdown");
                         break;
                     }
                 }
@@ -545,7 +545,7 @@ async fn on_complete(
             Ok(()) => {
                 if task.state == TaskState::Active {
                     task.state = TaskState::Completed;
-                    ::tracing::info!(task_id=%id, "queue task Completed");
+                    ::tracing::debug!(task_id=%id, "queue task Completed");
                 }
             }
             Err(e) => {

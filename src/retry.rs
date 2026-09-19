@@ -350,7 +350,7 @@ impl RetryHandler {
             drained += 1;
         }
         if drained > 0 {
-            ::tracing::info!(drained, "starved force_drain_delayed");
+            ::tracing::debug!(drained, "starved force_drain_delayed");
         }
     }
 
@@ -392,7 +392,7 @@ impl RetryHandler {
         }
         let chunk = self.retry_queue.pop_front();
         if let Some(c) = &chunk {
-            ::tracing::info!(chunk_id = c.id, "starved immediate pop retry (bypass 1s)");
+            ::tracing::debug!(chunk_id = c.id, "starved immediate pop retry (bypass 1s)");
         }
         chunk
     }
