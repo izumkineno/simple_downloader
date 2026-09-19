@@ -419,10 +419,21 @@ impl ResumePlan {
 
         if metadata_path.exists() {
             if !output_path.exists() {
-                ::tracing::error!(path = %output_path.display(), meta = %metadata_path.display(), "resume metadata exists but target file missing");
-                return Err(DownloadError::ResumeTargetMissing(
-                    output_path.to_path_buf(),
-                ));
+                // 孤儿 sidecar 自愈：目标文件被外部删除时，清掉 meta 直接全量重下，
+                // 不再抛 ResumeTargetMissing 让上层手动重试。
+                ::tracing::warn!(path = %output_path.display(), meta = %metadata_path.display(), "orphan resume sidecar (target missing), discarding and full download");
+                let _ = fs::remove_file(&metadata_path);
+                let metadata = ResumeMetadata::new(file_size, DEFAULT_SEGMENT_SIZE);
+                if let Err(save_err) = metadata.save_atomic(&metadata_path) {
+                    ::tracing::warn!(error=%save_err, path=%metadata_path.display(), "rebuild resume metadata save failed");
+                }
+                return Ok(Self {
+                    metadata_path,
+                    metadata: Some(metadata),
+                    truncate_output: true,
+                    remaining_ranges: full_ranges(file_size),
+                    completed_bytes: 0,
+                });
             }
 
             let mut metadata = match ResumeMetadata::load(&metadata_path) {
@@ -434,7 +445,7 @@ impl ResumePlan {
                     if let Err(save_err) = metadata.save_atomic(&metadata_path) {
                         ::tracing::warn!(error=%save_err, path=%metadata_path.display(), "rebuild resume metadata save failed");
                     }
-                    ::tracing::info!(path=%metadata_path.display(), file_size, "rebuilt resume plan after corrupted sidecar");
+                    ::tracing::debug!(path=%metadata_path.display(), file_size, "rebuilt resume plan after corrupted sidecar");
                     return Ok(Self {
                         metadata_path,
                         metadata: Some(metadata),
@@ -452,7 +463,7 @@ impl ResumePlan {
                 if let Err(save_err) = metadata.save_atomic(&metadata_path) {
                     ::tracing::warn!(error=%save_err, path=%metadata_path.display(), "rebuild resume metadata save failed");
                 }
-                ::tracing::info!(path=%metadata_path.display(), file_size, "rebuilt resume plan after shape mismatch (full download)");
+                ::tracing::debug!(path=%metadata_path.display(), file_size, "rebuilt resume plan after shape mismatch (full download)");
                 return Ok(Self {
                     metadata_path,
                     metadata: Some(metadata),
@@ -487,7 +498,7 @@ impl ResumePlan {
         } else {
             ::tracing::debug!(path = %metadata_path.display(), file_size, "initial resume metadata saved");
         }
-        ::tracing::info!(path = %metadata_path.display(), file_size, "new resume plan (full download)");
+        ::tracing::debug!(path = %metadata_path.display(), file_size, "new resume plan (full download)");
         Ok(Self {
             metadata_path,
             metadata: Some(metadata),
@@ -515,7 +526,7 @@ impl ResumePlan {
                 });
         match &res {
             Ok(plan) => {
-                ::tracing::info!(path = %path_clone.display(), completed = plan.completed_bytes, remaining = plan.remaining_ranges.len(), truncate = plan.truncate_output, "resume prepare_async done")
+                ::tracing::debug!(path = %path_clone.display(), completed = plan.completed_bytes, remaining = plan.remaining_ranges.len(), truncate = plan.truncate_output, "resume prepare_async done")
             }
             Err(e) => {
                 ::tracing::error!(path = %path_clone.display(), error = %e, "resume prepare_async failed")
@@ -632,7 +643,7 @@ impl ResumeRecorder {
     /// 强制落盘，供 writer 退出前调用以避免最后 1s/16段窗口丢失
     pub async fn flush(&mut self) -> Result<()> {
         if self.pending_segments > 0 {
-            ::tracing::info!(pending = self.pending_segments, path = %self.metadata_path.display(), "resume recorder final flush");
+            ::tracing::debug!(pending = self.pending_segments, path = %self.metadata_path.display(), "resume recorder final flush");
             self.metadata.save_atomic_async(&self.metadata_path).await?;
             self.last_digest = Some(hash_bytes(&bitcode::encode(&self.metadata)));
             self.pending_segments = 0;

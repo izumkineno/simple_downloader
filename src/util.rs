@@ -31,6 +31,27 @@ pub(crate) fn ensure_user_agent(rb: RequestBuilder) -> RequestBuilder {
         Err(_) => rb.header(USER_AGENT, crate::DEFAULT_USER_AGENT),
     }
 }
+/// 在 `RequestBuilder` 上追加 per-task 附加头；调用方须在 `ensure_user_agent` 之后调用，
+/// 使显式 `User-Agent` 覆盖 crate 默认 UA（reqwest 请求级头优先于 client 默认头）。
+/// 非法头名/头值仅记 warn 跳过，不中断下载。
+pub(crate) fn apply_extra_headers(
+    rb: RequestBuilder,
+    extra_headers: &[(FastStr, FastStr)],
+) -> RequestBuilder {
+    let mut rb = rb;
+    for (k, v) in extra_headers {
+        match (
+            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+            reqwest::header::HeaderValue::from_str(v.as_str()),
+        ) {
+            (Ok(name), Ok(value)) => {
+                rb = rb.header(name, value);
+            }
+            _ => ::tracing::warn!("忽略非法 per-task 请求头"),
+        }
+    }
+    rb
+}
 
 /// 从 URL 检索文件元数据（大小和是否支持范围请求）。
 ///
@@ -87,13 +108,20 @@ async fn probe_zero_range_byte(resp: reqwest::Response) -> Option<u8> {
 /// 整包首字节：无 Range 的 GET 只读首字节即关连接，与 Range 体交叉验证。
 /// 字节 0 在任何合规服务端都唯一，错位即缓存与源不一致；读不到也判不可信，
 /// 回退单流后真正的错误由下载阶段原样抛出，不在这里吞错。
-async fn plain_first_byte(client: &Client, url: &str) -> Option<u8> {
+async fn plain_first_byte(
+    client: &Client,
+    url: &str,
+    extra_headers: &[(FastStr, FastStr)],
+) -> Option<u8> {
     use std::time::Duration;
     let get = async {
         let mut resp = ensure_user_agent(
-            client
-                .get(url)
-                .header(reqwest::header::ACCEPT_ENCODING, "identity"),
+            apply_extra_headers(
+                client
+                    .get(url)
+                    .header(reqwest::header::ACCEPT_ENCODING, "identity"),
+                extra_headers,
+            ),
         )
         .send()
         .await
@@ -109,11 +137,13 @@ pub async fn get_file_info(client: &Client, url: &str) -> Result<(u64, bool)> {
     Ok((size, support))
 }
 
-/// 含 ETag/Last-Modified 的探测，复用 get_file_info 逻辑但额外透出头部供 resume 侧车存储（AC-1）
+/// 携带 per-task 附加头的探测入口（防盗链 Referer/鉴权 Cookie 等场景）。
+/// 无附加头时等价 `get_file_info_with_headers`。
 #[::tracing::instrument(skip(client), fields(url = %redact_url(url)))]
-pub async fn get_file_info_with_headers(
+pub async fn get_file_info_with_request_headers(
     client: &Client,
     url: &str,
+    extra_headers: &[(FastStr, FastStr)],
 ) -> Result<(u64, bool, Option<String>, Option<String>)> {
     use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, LAST_MODIFIED};
     use reqwest::StatusCode;
@@ -122,7 +152,7 @@ pub async fn get_file_info_with_headers(
     let mut head_support = false;
     let mut head_etag: Option<String> = None;
     let mut head_last_modified: Option<String> = None;
-    match ensure_user_agent(client.head(url))
+    match ensure_user_agent(apply_extra_headers(client.head(url), extra_headers))
         .send()
         .await
         .and_then(|r| r.error_for_status())
@@ -152,10 +182,13 @@ pub async fn get_file_info_with_headers(
     ::tracing::debug!(head_size = ?head_size, head_support, "HEAD probe result");
     // 2. 范围 GET 探测：以 206/ Content-Range 为金标准，失败则回退 HEAD 避免 501 误判
     let range_resp = match ensure_user_agent(
-        client
-            .get(url)
-            .header("Range", "bytes=0-0")
-            .header(reqwest::header::ACCEPT_ENCODING, "identity"),
+        apply_extra_headers(
+            client
+                .get(url)
+                .header("Range", "bytes=0-0")
+                .header(reqwest::header::ACCEPT_ENCODING, "identity"),
+            extra_headers,
+        ),
     )
     .send()
     .await
@@ -187,7 +220,7 @@ pub async fn get_file_info_with_headers(
             && let Some((_, _, total)) = crate::util::parse_content_range(crs)
             && total != 0
         {
-            ::tracing::info!(total, "probe via 416 Content-Range");
+            ::tracing::debug!(total, "probe via 416 Content-Range");
             return Ok((total, true, cur_etag, cur_lm));
         }
         if let Some(size) = head_size {
@@ -211,7 +244,7 @@ pub async fn get_file_info_with_headers(
                     // 空体/错体即 Range 说谎；单字节探针能过但体与源不符的 incoherent 缓存，
                     // 必须再与整包首字节交叉验证，否则按头分片会组装坏文件。回退无 Range 单流。
                     match probe_zero_range_byte(range_resp).await {
-                        Some(r0) => match plain_first_byte(client, url).await {
+                        Some(r0) => match plain_first_byte(client, url, extra_headers).await {
                             Some(p0) if p0 == r0 => {
                                 ::tracing::info!(
                                     content_length,
@@ -282,7 +315,7 @@ pub async fn get_file_info_with_headers(
 
     // 3. 最终回退：优先 HEAD 的 size，否则 Range 响应的 Content-Length，保守判不支持
     if let Some(size) = head_size {
-        ::tracing::info!(size, head_support, "probe fallback to HEAD");
+        ::tracing::debug!(size, head_support, "probe fallback to HEAD");
         return Ok((size, head_support, cur_etag, cur_lm));
     }
     if let Some(len_val) = headers.get(CONTENT_LENGTH)
@@ -298,6 +331,14 @@ pub async fn get_file_info_with_headers(
 
     ::tracing::error!("probe failed: MissingContentLength");
     Err(DownloadError::MissingContentLength)
+}
+/// 含 ETag/Last-Modified 的探测，复用 get_file_info 逻辑但额外透出头部供 resume 侧车存储（AC-1）
+#[::tracing::instrument(skip(client), fields(url = %redact_url(url)))]
+pub async fn get_file_info_with_headers(
+    client: &Client,
+    url: &str,
+) -> Result<(u64, bool, Option<String>, Option<String>)> {
+    get_file_info_with_request_headers(client, url, &[]).await
 }
 /// 解析 `Content-Range` 头，支持 `bytes <start>-<end>/<total>` 及 `bytes */<total>` 形式。
 ///
@@ -412,7 +453,7 @@ async fn file_writer_task_impl(
         .truncate(truncate)
         .open(&*filepath)
         .await?;
-    ::tracing::info!(path = %filepath, size, truncate, "output file ready (streaming, no preallocation)");
+    ::tracing::debug!(path = %filepath, size, truncate, "output file ready (streaming, no preallocation)");
 
     // 异步执行文件写入循环（带相邻段合并，128KiB 限）—— P0-1 修复：所有 seek/write/flush/record 错误回传
     let writer_handle = tokio::spawn(async move {

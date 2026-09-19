@@ -12,7 +12,7 @@ use crate::types::{DownloadCmd, DownloadInfo, Result};
 use crate::util::file_writer_task;
 #[cfg(feature = "resume")]
 use crate::util::file_writer_task_with_resume;
-use crate::util::{ensure_user_agent, get_file_info};
+use crate::util::{apply_extra_headers, ensure_user_agent, get_file_info_with_request_headers};
 use faststr::FastStr;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
@@ -101,6 +101,9 @@ where
     resume_enabled: bool,
     speed_limit: Option<u64>,
     burst: Option<u64>,
+    // per-task 附加请求头（User-Agent/Referer/Cookie 等），在各 RequestBuilder 处追加，
+    // 对探测、单流、chunk 全链路生效（含 monitor 重调度）；显式 UA 覆盖 crate 默认 UA
+    extra_headers: Vec<(FastStr, FastStr)>,
 }
 
 impl DownloadBuilder {
@@ -116,7 +119,6 @@ impl DownloadBuilder {
     /// - `workers`: 自动检测 CPU 核心数，默认值为核心数，最少为 1
     /// - `update_interval`: 0.5 秒（进度更新间隔）
     /// - `resume_enabled`: 根据 `resume` feature 是否启用自动决定
-    /// - `client_builder`: 使用默认的 reqwest 客户端配置
     pub fn new(url: impl Into<FastStr>, output_path: impl Into<FastStr>) -> Self {
         Self {
             url: url.into(),
@@ -127,6 +129,7 @@ impl DownloadBuilder {
             resume_enabled: cfg!(feature = "resume"),
             speed_limit: None,
             burst: None,
+            extra_headers: Vec::new(),
         }
     }
 }
@@ -198,6 +201,7 @@ where
             resume_enabled: self.resume_enabled,
             speed_limit: self.speed_limit,
             burst: self.burst,
+            extra_headers: self.extra_headers,
         }
     }
 
@@ -230,6 +234,42 @@ where
         self.burst = Some(burst_bytes);
         self
     }
+    /// 追加单个 per-task 请求头，可多次调用；同名后者覆盖前者（client default_headers 语义）。
+    /// 典型用途：`Referer` 防盗链、`Cookie` 鉴权、`Authorization` 令牌。
+    pub fn header(mut self, name: impl Into<FastStr>, value: impl Into<FastStr>) -> Self {
+        let name = name.into();
+        self.extra_headers.retain(|(k, _)| k != &name);
+        self.extra_headers.push((name, value.into()));
+        self
+    }
+
+    /// 批量追加 per-task 请求头。
+    pub fn headers<I, K, V>(mut self, headers: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<FastStr>,
+        V: Into<FastStr>,
+    {
+        for (k, v) in headers {
+            self = self.header(k, v);
+        }
+        self
+    }
+
+    /// 设置 per-task `User-Agent`，覆盖 crate 默认 UA（`ensure_user_agent` 会保留已设值）。
+    pub fn user_agent(self, ua: impl Into<FastStr>) -> Self {
+        self.header("User-Agent", ua)
+    }
+
+    /// 设置 per-task `Referer`（防盗链场景，GMM gloss/第三方队列必需）。
+    pub fn referer(self, referer: impl Into<FastStr>) -> Self {
+        self.header("Referer", referer)
+    }
+
+    /// 设置 per-task `Cookie` 请求头。
+    pub fn cookie(self, cookie: impl Into<FastStr>) -> Self {
+        self.header("Cookie", cookie)
+    }
 
     /// 构建 Downloader 实例。
     /// 构建 Downloader 实例。
@@ -246,6 +286,7 @@ where
             downloader.speed_limit = self.speed_limit;
             downloader.burst = self.burst;
             downloader.global_limiter = None;
+            downloader.extra_headers = self.extra_headers;
         }
         downloader
     }
@@ -306,6 +347,7 @@ where
     speed_limit: Option<u64>,
     burst: Option<u64>,
     global_limiter: Option<Arc<RateLimiter>>,
+    extra_headers: Vec<(FastStr, FastStr)>,
 }
 
 impl<F> Downloader<F>
@@ -346,6 +388,7 @@ where
             speed_limit: None,
             burst: None,
             global_limiter: None,
+            extra_headers: Vec::new(),
         }
     }
 
@@ -371,10 +414,15 @@ where
             speed_limit: None,
             burst: None,
             global_limiter: None,
+            extra_headers: Vec::new(),
         }
     }
-
-    /// 显式启用或关闭自动断点续传。
+    /// 由 `client_builder` 构建 `Client`。per-task 附加头不在此注入——`ensure_user_agent`
+    /// 会在请求级覆盖 client 默认 UA，故附加头统一在各 `RequestBuilder` 处
+    /// 经 `apply_extra_headers` 追加（探测/单流/chunk/monitor 重调度）。
+    fn build_client(&self) -> reqwest::Result<Client> {
+        (self.client_builder)().build()
+    }
     ///
     /// 仅在 `resume` feature 开启时可用。
     ///
@@ -439,7 +487,7 @@ where
 
     #[::tracing::instrument(skip(self, progress_handler), fields(mode = ?match &self.mode { DownloadMode::Single(c) => format!("single:{}", c.url), DownloadMode::Multi(c) => format!("multi:{}", c.output_path) }))]
     async fn run_internal(mut self, progress_handler: Option<ProgressHandler>) -> Result<()> {
-        ::tracing::info!("download run_internal start");
+        ::tracing::debug!("download run_internal start");
         if let Some(limit) = self.speed_limit {
             if limit == 0 {
                 return Err(DownloadError::InvalidArgument(
@@ -461,7 +509,7 @@ where
                 }
                 if b > u32::MAX as u64 {
                     return Err(DownloadError::InvalidArgument(format!(
-                        "burst {} 超过 {}",
+                        "burst {} 超过 {} 需 ≤4GiB/s",
                         b,
                         u32::MAX
                     )));
@@ -486,12 +534,17 @@ where
                 DownloadMode::Single(config) => {
                     ::tracing::debug!(url = %crate::util::redact_url(&config.url), workers = config.workers, interval = self.update_interval, "probing single source");
                     // M3-05 保留用户 pool 配置，不二次覆盖；默认值由 default_client_builder 提供
-                    let client = (self.client_builder)().build()?;
-                    let (file_size, support_ranges) = match get_file_info(&client, &config.url)
+                    let client = self.build_client()?;
+                    let (file_size, support_ranges, _etag, _last_modified) =
+                        match get_file_info_with_request_headers(
+                        &client,
+                        &config.url,
+                        &self.extra_headers,
+                    )
                         .await
                     {
                         Ok(v) => {
-                            ::tracing::info!(size = v.0, support_ranges = v.1, url = %crate::util::redact_url(&config.url), "probe ok");
+                            ::tracing::debug!(size = v.0, support_ranges = v.1, url = %crate::util::redact_url(&config.url), "probe ok");
                             v
                         }
                         Err(DownloadError::MissingContentLength) => {
@@ -535,7 +588,7 @@ where
                             );
                             if let Some(first) = config.sources.first() {
                                 // M3-05 保留用户 pool 配置
-                                let client = (self.client_builder)().build()?;
+                                let client = self.build_client()?;
                                 let writer_path = config.output_path.clone();
                                 let download_url = first.url.clone();
                                 return self
@@ -557,7 +610,7 @@ where
                         }
                     };
                     let support_ranges = runtime.supports_ranges;
-                    ::tracing::info!(file_size, support_ranges, "multi-source probe ok");
+                    ::tracing::debug!(file_size, support_ranges, "multi-source probe ok");
                     let (client, download_url) = runtime
                         .best_lane_runtime()
                         .map(|lane| (lane.client.clone(), lane.url.clone()))
@@ -664,7 +717,7 @@ where
         } else if let Err(ref e) = writer_result {
             ::tracing::error!(error = %e, "writer task failed");
         } else {
-            ::tracing::info!(writer_path = %writer_path, file_size, "orchestrate_downloads done");
+            ::tracing::debug!(writer_path = %writer_path, file_size, "orchestrate_downloads done");
         }
         orchestrate_result?;
         writer_result?;
@@ -698,7 +751,7 @@ where
             loop {
                 match tokio::fs::remove_file(&meta_path).await {
                     Ok(_) => {
-                        ::tracing::info!(path = %meta_path.display(), "resume sidecar cleaned after success");
+                        ::tracing::debug!(path = %meta_path.display(), "resume sidecar cleaned after success");
                         break;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
@@ -718,7 +771,7 @@ where
                 }
             }
         }
-        ::tracing::info!(writer_path = %writer_path, "download complete");
+        ::tracing::debug!(writer_path = %writer_path, "download complete");
         Ok(())
     }
     #[::tracing::instrument(skip(self, client, writer_path, progress_handler), fields(url = %url, path = %writer_path))]
@@ -747,7 +800,11 @@ where
             spawn(handler(0, self.info_tx.subscribe()));
             ::tracing::debug!("streaming progress handler spawned");
         }
-        let resp = match ensure_user_agent(client.get(url.as_str())).send().await {
+        let resp = match ensure_user_agent(
+            apply_extra_headers(client.get(url.as_str()), &self.extra_headers),
+        )
+        .send()
+        .await {
             Ok(r) => r.error_for_status()?,
             // `?` 静默传播曾让流式失败无日志、`{e}` 截断源链：此处记全链再回错
             Err(e) => {
@@ -809,7 +866,7 @@ where
                         return Err(DownloadError::Request(e));
                     },
                     None => {
-                        ::tracing::info!(total_downloaded, "streaming completed (EOF)");
+                        ::tracing::debug!(total_downloaded, "streaming completed (EOF)");
                         break;
                     },
                 },
@@ -854,7 +911,7 @@ where
             pieces: Vec::new(),
         });
         let _ = self.info_tx.send(DownloadInfo::DownloadComplete(0));
-        ::tracing::info!(total_downloaded, path = %writer_path, "streaming_download complete");
+        ::tracing::debug!(total_downloaded, path = %writer_path, "streaming_download complete");
         Ok(())
     }
 
@@ -898,8 +955,8 @@ where
             },
             "effective workers"
         );
-
-        let initial_ranges = split_resume_ranges(resume_ranges, workers, multi_runtime.is_some());
+        let initial_ranges =
+            split_resume_ranges(resume_ranges, workers, multi_runtime.is_some());
         ::tracing::debug!(initial_ranges = ?initial_ranges, "initial ranges after split");
         let mut pending_initial = Vec::new();
         let mut initial_lanes = Vec::new();
@@ -909,7 +966,8 @@ where
             completed_bytes,
             self.update_interval,
             workers,
-        );
+        )
+        .with_extra_headers(self.extra_headers.clone());
         {
             // 限速冻结：任一限速器存在即冻结自适应；全局优先多源，否则 Builder
             let global_for_monitor = multi_runtime
@@ -950,7 +1008,10 @@ where
                 } else {
                     (
                         None,
-                        client.get(download_url.as_str()),
+                        apply_extra_headers(
+                            client.get(download_url.as_str()),
+                            &self.extra_headers,
+                        ),
                         None,
                         self.global_limiter.clone(),
                     )
