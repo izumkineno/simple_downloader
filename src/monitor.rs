@@ -692,6 +692,19 @@ impl DownloadMonitor {
             );
             return true;
         }
+        // 周期快照：每 tick 一行 total/completed/active/retry/tasks，debug 铺路——
+        // 卡住时直接看 completed 是否停涨、active 是否全零速，不用逐块翻日志。
+        ::tracing::debug!(
+            downloaded = self.state.total_downloaded(),
+            completed = self.state.completed_bytes_for_debug(),
+            total = self.state.total_file_size,
+            active = self.state.chunks.len(),
+            normal = self.state.normal_chunk_count(),
+            retry_q = self.retry_handler.retry_queue_len(),
+            delayed = self.retry_handler.delayed_queue_len(),
+            tasks = tasks.len(),
+            "tick snapshot",
+        );
         // 完成三重门：tasks 空（JoinHandle 全回收，防 writer 未刷盘即返）+ 无活跃/重试/缓冲 + completed 落账；比干净多 tasks 门，只拖至多一拍不假完成
         let done =
             tasks.is_empty() && self.are_all_tasks_done() && self.state.is_download_finished();

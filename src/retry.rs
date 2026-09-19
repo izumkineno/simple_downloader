@@ -120,7 +120,7 @@ impl RetryHandler {
         state: &mut DownloadState,
         info_tx: &broadcast::Sender<DownloadInfo>,
     ) {
-        if error.contains("decoding") {
+        if error.contains("decoding") || error.contains("trickle") {
             ::tracing::debug!(
                 chunk_id = id,
                 start,

@@ -138,7 +138,12 @@ impl DownloadState {
     /// 残余虚报由 downloader 落盘金标准 stat 兜底（mismatch 即 Err 不删 sidecar）。
     pub fn complete_chunk(&mut self, id: &ChunkId) {
         if let Some(chunk) = self.chunks.remove(id) {
-            self.completed_bytes += chunk.size();
+            let size = chunk.size();
+            let downloaded = chunk.downloaded_bytes;
+            self.completed_bytes += size;
+            ::tracing::debug!(chunk_id = id, size, downloaded, completed = self.completed_bytes, total = self.total_file_size, "ledger complete");
+        } else {
+            ::tracing::debug!(chunk_id = id, "ledger complete on missing chunk (double-complete?)");
         }
     }
 
@@ -148,6 +153,9 @@ impl DownloadState {
     pub(crate) fn preserve_partial(&mut self, id: &ChunkId) {
         if let Some(chunk) = self.chunks.get(id) {
             self.completed_bytes += chunk.downloaded_bytes;
+            ::tracing::debug!(chunk_id = id, kept = chunk.downloaded_bytes, completed = self.completed_bytes, "ledger preserve");
+        } else {
+            ::tracing::debug!(chunk_id = id, "ledger preserve on missing chunk");
         }
     }
 
@@ -156,9 +164,16 @@ impl DownloadState {
         if let Some(chunk) = self.chunks.get(id) {
             let best = chunk.downloaded_bytes.max(exact_downloaded.min(chunk.size()));
             self.completed_bytes += best;
+            ::tracing::debug!(chunk_id = id, state_dl = chunk.downloaded_bytes, exact = exact_downloaded, kept = best, completed = self.completed_bytes, "ledger preserve_exact");
         } else {
             self.completed_bytes = self.completed_bytes.saturating_add(exact_downloaded);
+            ::tracing::debug!(chunk_id = id, exact = exact_downloaded, completed = self.completed_bytes, "ledger preserve_exact on missing chunk");
         }
+    }
+
+    /// 调试用：已落账 completed（total 口径含在途，仅日志快照用）。
+    pub fn completed_bytes_for_debug(&self) -> u64 {
+        self.completed_bytes
     }
 
     /// 计算当前已下载的总字节数（钳 total 防 Bisect 收缩竞态超算穿透到 UI）。
