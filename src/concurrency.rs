@@ -540,9 +540,12 @@ impl ConcurrencyManager {
         );
     }
     /// 偏心分割请求：豁免观察期（保持 Ready 可连续切），仅受 MIN_SPLIT_INTERVAL 节流。
-    /// 同块累计 2 次后仍 stall（trickle 连接：有数据但极慢，空闲超时永不触发，
-    /// 切分只救走 7/8、坏连接留守的 1/8 永远跑不动），第 3 次改发 TerminateChunk
-    /// 杀坏连接走重试换新连接。小剩余（<128KiB）切分救回的 7/8 也不值得一次建连，
+    /// 同块累计 4 次后仍 stall（trickle 连接：有数据但极慢，空闲超时永不触发，
+    /// 切分只救走 7/8、坏连接留守的 1/8 永远跑不动），第 5 次改发 TerminateChunk
+    /// 杀坏连接走重试换新连接（IDM 式 reassign 优先，kill 只作最后手段——aria2
+    /// #686/#897/#2111 证明杀后不补会 hang，我方 kill 走重试补新连接故无此坑，
+    /// 但建连 0.1~0.5s + CDN 可能限流，能 reassign 抢完就不杀）。
+    /// 小剩余（<128KiB）切分救回的 7/8 也不值得一次建连，
     /// 且 12KB 尾块证明连 trickle 都停了时直接杀、不浪费一次切分。
     fn request_skewed_split(&mut self, id: ChunkId, remaining: u64, cmd_tx: &broadcast::Sender<DownloadCmd>) {
         if remaining < 128 * 1024 {
@@ -554,7 +557,7 @@ impl ConcurrencyManager {
         }
         let count = self.skewed_split_counts.entry(id).or_insert(0);
         *count += 1;
-        if *count > 2 {
+        if *count > 4 {
             ::tracing::debug!(chunk_id = id, skewed_count = *count, phase = ?self.phase, "TerminateChunk: trickle connection kill");
             let _ = cmd_tx.send(DownloadCmd::TerminateChunk { id });
             self.skewed_split_counts.remove(&id);
