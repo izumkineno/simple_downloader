@@ -680,14 +680,20 @@ impl DownloadMonitor {
         // 不等三重门——否则 11 个零速幽灵块挨个吃 TerminateChunk，白白 18 次重握手。
         // 安全：total 口径经单调钳 + min(total) 双保险，虚高不可能；writer 侧由 tasks/pending
         // 的自然排空保证落盘（本 tick 内 tasks 非空则下一拍仍会走正常三重门）。
-        if self.state.total_downloaded() >= self.state.total_file_size
-            && self.retry_handler.are_all_tasks_done()
-        {
+        // 字节齐即 done：重试队列里躺的是已覆盖区间的重复下载（preserve 已落账），
+        // 等 8s 退避再重下毫无意义——paste-5 就是 tasks=0、retry_q=2 干等退避卡住。
+        // 直接判 done 丢弃重试队列；writer 由 writer_tx drop 走 channel-closed 刷新路径。
+        // tasks.is_empty() 必须保留：total 含“已发进度但 writer 未落盘 + chunk 未退出”的在途字节，
+        // 不等 JoinHandle 回收就 TerminateAll 会丢尾部（expected N got N-26KB 类报错）。
+        if tasks.is_empty() && self.state.total_downloaded() >= self.state.total_file_size {
+            let drop_q =
+                self.retry_handler.retry_queue_len() + self.retry_handler.delayed_queue_len();
             ::tracing::info!(
                 downloaded = self.state.total_downloaded(),
                 total = self.state.total_file_size,
                 active = self.state.chunks.len(),
                 tasks = tasks.len(),
+                dropped_retries = drop_q,
                 "monitor tick: bytes complete, short-circuit (server never closed stream)",
             );
             return true;

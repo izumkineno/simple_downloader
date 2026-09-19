@@ -111,6 +111,10 @@ pub struct DownloadState {
     pub chunks: HashMap<ChunkId, ChunkState>,
     /// 已完成并从 `chunks` 映射中移除的块所贡献的总字节数。
     completed_bytes: u64,
+    /// 已保留待抵扣字节：块失败时已下前缀先计入 completed，重试块成功后 Complete 按
+    /// size() 累加会把同一字节记两次（trickle kill 越多虚高越多 → is_download_finished
+    /// 误判 done → 落盘 stat 报错 → 前端卡 100%）。Complete 时按块抵扣。
+    preserved_credits: HashMap<ChunkId, u64>,
 }
 
 impl DownloadState {
@@ -120,6 +124,7 @@ impl DownloadState {
             total_file_size,
             chunks: HashMap::new(),
             completed_bytes: 0,
+            preserved_credits: HashMap::new(),
         }
     }
 
@@ -129,6 +134,7 @@ impl DownloadState {
             total_file_size,
             chunks: HashMap::new(),
             completed_bytes: completed_bytes.min(total_file_size),
+            preserved_credits: HashMap::new(),
         }
     }
 
@@ -140,8 +146,10 @@ impl DownloadState {
         if let Some(chunk) = self.chunks.remove(id) {
             let size = chunk.size();
             let downloaded = chunk.downloaded_bytes;
-            self.completed_bytes += size;
-            ::tracing::debug!(chunk_id = id, size, downloaded, completed = self.completed_bytes, total = self.total_file_size, "ledger complete");
+            // 抵扣该块失败时已保留的前缀：重试块下载的是同一区间，size() 全加即双计。
+            let credit = self.preserved_credits.remove(id).unwrap_or(0).min(size);
+            self.completed_bytes += size.saturating_sub(credit);
+            ::tracing::debug!(chunk_id = id, size, downloaded, credit, completed = self.completed_bytes, total = self.total_file_size, "ledger complete");
         } else {
             ::tracing::debug!(chunk_id = id, "ledger complete on missing chunk (double-complete?)");
         }
@@ -152,8 +160,10 @@ impl DownloadState {
     /// 若存在 Lagged 丢失，调用方可传入 `exact_downloaded` 兜底。
     pub(crate) fn preserve_partial(&mut self, id: &ChunkId) {
         if let Some(chunk) = self.chunks.get(id) {
-            self.completed_bytes += chunk.downloaded_bytes;
-            ::tracing::debug!(chunk_id = id, kept = chunk.downloaded_bytes, completed = self.completed_bytes, "ledger preserve");
+            let kept = chunk.downloaded_bytes;
+            self.completed_bytes += kept;
+            *self.preserved_credits.entry(*id).or_insert(0) += kept;
+            ::tracing::debug!(chunk_id = id, kept, completed = self.completed_bytes, "ledger preserve");
         } else {
             ::tracing::debug!(chunk_id = id, "ledger preserve on missing chunk");
         }
@@ -164,10 +174,14 @@ impl DownloadState {
         if let Some(chunk) = self.chunks.get(id) {
             let best = chunk.downloaded_bytes.max(exact_downloaded.min(chunk.size()));
             self.completed_bytes += best;
+            *self.preserved_credits.entry(*id).or_insert(0) += best;
             ::tracing::debug!(chunk_id = id, state_dl = chunk.downloaded_bytes, exact = exact_downloaded, kept = best, completed = self.completed_bytes, "ledger preserve_exact");
         } else {
             self.completed_bytes = self.completed_bytes.saturating_add(exact_downloaded);
-            ::tracing::debug!(chunk_id = id, exact = exact_downloaded, completed = self.completed_bytes, "ledger preserve_exact on missing chunk");
+            // 无条目也记 credit：同 id 重试块 Complete 时按 size() 加账，不记就会双计
+            // （paste-5 里 completed 13.5MB > total 10.58MB 即此虚高）。
+            *self.preserved_credits.entry(*id).or_insert(0) += exact_downloaded;
+            ::tracing::debug!(chunk_id = id, exact = exact_downloaded, completed = self.completed_bytes, "ledger preserve_exact on missing chunk (+credit)");
         }
     }
 
@@ -238,6 +252,23 @@ mod tests {
         // 模拟 retry handler 移除 chunk 后，total 应为精确值
         state.chunks.remove(&chunk_id);
         assert_eq!(state.total_downloaded(), 600);
+    }
+    #[test]
+    fn regression_preserve_complete_no_double_count() {
+        // trickle kill：失败保留 600 + 重试块完整下载 1000，同一字节只能记一次。
+        let mut state = DownloadState::with_completed(1000, 0);
+        let chunk_id = 3;
+        let mut chunk = ChunkState::new(chunk_id, 0, 999);
+        chunk.update_downloaded(600);
+        state.chunks.insert(chunk_id, chunk);
+        state.preserve_partial_exact(&chunk_id, 600);
+        assert_eq!(state.completed_bytes, 600);
+        // 重试块（同 id，同一区间）完整下载成功：抵扣 600，只加 400。
+        state.chunks.remove(&chunk_id);
+        state.chunks.insert(chunk_id, ChunkState::new(chunk_id, 0, 999));
+        state.complete_chunk(&chunk_id);
+        assert_eq!(state.completed_bytes, 1000, "preserve+complete must not double count");
+        assert!(state.is_download_finished());
     }
     #[test]
     fn regression_speed_guard_tiny_elapsed() {
