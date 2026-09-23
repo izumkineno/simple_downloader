@@ -764,21 +764,15 @@ mod tests {
         let handle = tokio::spawn(async move {
             chunk_run_with_reliable(1, cmd_tx, cmd_bd_rx, info_bd_tx, rb, 0, 1023, None, None, Some(reliable_tx)).await;
         });
-        // 收集可靠通道的 Failed 与 Progress
-        let mut got_progress = false;
+        // 收集可靠通道的 Failed（Progress 不强断：注释见末尾 assert 处）
         let mut got_failed = false;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while std::time::Instant::now() < deadline {
             tokio::select! {
                 msg = reliable_rx.recv() => {
-                    if let Some(info) = msg {
-                        match info {
-                            DownloadInfo::ChunkProgress { downloaded, .. } => {
-                                if downloaded == 512 { got_progress = true; }
-                            }
-                            DownloadInfo::ChunkFailed { .. } => { got_failed = true; break; }
-                            _ => {}
-                        }
+                    if let Some(DownloadInfo::ChunkFailed { .. }) = msg {
+                        got_failed = true;
+                        break;
                     }
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
@@ -786,8 +780,6 @@ mod tests {
             if got_failed { break; }
         }
         assert!(got_failed, "should receive ChunkFailed via reliable");
-        // 即使 broadcast Lagged，reliable 也应有精确 Progress
-        // 此处不强断 got_progress，因补发已走 reliable，至少 Failed 前的 Progress 应为 512
         let _ = cmd_rx.try_recv(); // drain writer
         handle.await.unwrap();
         mock.assert_async().await;

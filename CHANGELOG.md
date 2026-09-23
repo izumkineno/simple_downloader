@@ -5,7 +5,18 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/) 规范。
 
-## [Unreleased]
+## [0.7.3]
+
+### 🐛 修复
+
+- **monitor 永不关流短路** `monitor.rs`：字节已收齐但服务端迟迟不关流时直接完成，不再空等（此前 `select! download_fut` 永久挂起，`with_custom_ui` 复现）
+- **重试队列过期清理** `retry.rs/state.rs`：字节完成后丢弃过期重试队列，缺块重试保留已确认进度（此前 `bytes-complete` 后 `stale retry` 仍重跑 + `missing-chunk preserve` 丢已收字节）
+- **tail 误杀放松** `concurrency.rs`：trickle-kill 改为同块 4 次偏心切后才杀（此前 2 次就杀，正常抖动也被杀连接）；stall 救援只抢零速 + 空闲 ≥10s 的块（此前刚切出的零速新块也被秒杀）
+- **重试台账可观测** `retry.rs`：`ledger` 记录每次重试原因 + `WARN` 降级为 `DEBUG` + per-tick 快照（`smodeltrans` 长尾排查用）
+
+### 🧪 测试
+
+- `tests/concurrency.rs split_target`：补 Probing→Stable 预热（此前从未进过 Stable，切分逻辑零覆盖）；`tests/queue.rs ac2_pause_resume`：50MB + 限速保证 pause 落在飞行中（此前 2MB 本地瞬间 Completed 必 `InvalidState`）
 
 ## [0.7.2]
 

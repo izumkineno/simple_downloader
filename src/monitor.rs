@@ -971,7 +971,7 @@ mod regression_tests {
         let next_id = AtomicU64::new(2);
         // elapsed 0.001 应被 guard 忽略，返回 false 且不更新 speed
         let before_speed = monitor.state.chunks.get(&1).unwrap().speed;
-        let done = monitor.handle_tick(0.001, &mut tasks, &info_tx, &None, &cmd_tx, &client, &writer_tx, None, &mut None, &next_id);
+        let _done = monitor.handle_tick(0.001, &mut tasks, &info_tx, &None, &cmd_tx, &client, &writer_tx, None, &mut None, &next_id);
 
         assert_eq!(monitor.state.chunks.get(&1).unwrap().speed, before_speed);
         // 正常 elapsed 应更新

@@ -2,7 +2,6 @@
 
 use bytes::Bytes;
 use std::io;
-use std::path::PathBuf;
 use thiserror::Error;
 
 /// 下载块（线程）ID 的类型别名。

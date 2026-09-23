@@ -405,9 +405,12 @@ impl ConcurrencyManager {
             "stable::ready check"
         );
 
-        // stall 救援优先：零速块 kill 换连接不需要"切分收益"，绕过 useful/should_split 门控。
-        // 否则 3KB 尾块 useful=false + 不满足可切分尺寸，双重拦截，只能等 15s 空闲超时。
-        if let Some(stalled) = state.chunks.values().filter(|c| c.speed < STALL_SKEW_SPEED_BPS && c.remaining_bytes() > 0).min_by(|a, b| a.speed.partial_cmp(&b.speed).unwrap_or(std::cmp::Ordering::Equal)) {
+        // stall 救援优先：零速 + 空闲超阈的块才抢（aria2 SegmentMan 只抢 idle 段——
+        // 刚切出的块速度恒为 0，必须给它滴数据的时间，否则每个新块都被秒杀）。
+        // 绕过 useful/should_split 门控：3KB 尾块 useful=false + 不满足可切分尺寸，
+        // 双重拦截下只能等 15s 空闲超时。
+        const STALL_RESCUE_IDLE_SECS: u64 = 10;
+        if let Some(stalled) = state.chunks.values().filter(|c| c.speed < STALL_SKEW_SPEED_BPS && c.remaining_bytes() > 0 && chunk_idle_secs(state, c.id) >= STALL_RESCUE_IDLE_SECS).min_by(|a, b| a.speed.partial_cmp(&b.speed).unwrap_or(std::cmp::Ordering::Equal)) {
             let stalled_id = stalled.id;
             let stalled_speed = stalled.speed;
             let stalled_remaining = stalled.remaining_bytes();
@@ -444,7 +447,7 @@ impl ConcurrencyManager {
                         remaining = slowest_remaining,
                         "stable::ready skewed-splitting stalled chunk"
                     );
-                    self.request_skewed_split(&state, slowest_id, slowest_remaining, cmd_tx);
+                    self.request_skewed_split(state, slowest_id, slowest_remaining, cmd_tx);
                 } else {
                     ::tracing::info!(
                         chunk_id = slowest_id,

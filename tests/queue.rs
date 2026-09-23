@@ -122,9 +122,10 @@ async fn ac1_workers_isolation() {
 
 #[tokio::test]
 async fn ac2_pause_resume() {
+    // 50MB + 限速 4m/1m：保证 pause 时任务仍 Active（2MB 不限速本地瞬间 Completed，pause 必 InvalidState）。
     let server_file =
-        TestServerFile::new("pause.bin", deterministic_bytes(2 * 1024 * 1024, 7)).unwrap();
-    let server = RunningTestServer::spawn(server_file.directory(), "64m", "64m")
+        TestServerFile::new("pause.bin", deterministic_bytes(50 * 1024 * 1024, 7)).unwrap();
+    let server = RunningTestServer::spawn(server_file.directory(), "4m", "1m")
         .await
         .unwrap();
     let temp = TempDir::new().unwrap();
@@ -171,7 +172,7 @@ async fn ac2_pause_resume() {
     );
     assert!(out.exists());
     let data = std::fs::read(&out).unwrap();
-    let expected = deterministic_bytes(2 * 1024 * 1024, 7);
+    let expected = deterministic_bytes(50 * 1024 * 1024, 7);
     assert_eq!(data, expected, "resumed file mismatch");
     drop(server);
 }

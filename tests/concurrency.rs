@@ -41,13 +41,6 @@ fn assert_no_split(rx: &mut broadcast::Receiver<DownloadCmd>) {
     );
 }
 
-fn assert_split_for(rx: &mut broadcast::Receiver<DownloadCmd>, expected_id: ChunkId) {
-    match rx.try_recv() {
-        Ok(DownloadCmd::BisectDownload { id }) => assert_eq!(id, expected_id),
-        Ok(other) => panic!("unexpected command emitted: {other:?}"),
-        Err(err) => panic!("expected split command for chunk {expected_id}, got {err:?}"),
-    }
-}
 
 #[test]
 fn probing_does_not_split_without_throughput_evidence() {
@@ -144,33 +137,44 @@ fn steady_stable_speed_does_not_reprobe_against_stale_baseline() {
 
 #[test]
 fn split_target_prefers_remaining_splittable_work_over_original_size() {
+    use simple_downloader::internal::DownloadCmd;
     let mut manager = ConcurrencyManager::new(3);
     let saturated_state = state_with(
-        1_600_000,
+        1_700_000,
         [
-            active_chunk(1, 0, 999_999, 900_000, 25_000.0),
-            active_chunk(2, 1_000_000, 1_499_999, 0, 25_000.0),
-            active_chunk(3, 1_500_000, 1_599_999, 0, 25_000.0),
+            active_chunk(1, 0, 999_999, 900_000, 10_000.0),
+            active_chunk(2, 1_000_000, 1_599_999, 0, 10_000.0),
+            active_chunk(3, 1_600_000, 1_699_999, 0, 10_000.0),
         ],
     );
     let (cmd_tx, mut cmd_rx) = command_channel();
 
-    wait_for_policy_cooldown();
-    manager.decide_and_act(&saturated_state, &cmd_tx);
-    assert_no_split(&mut cmd_rx);
+    // 预热：饱和态把 manager 从 Probing 推入 Stable；预热期探测切分直接排空。
+    for _ in 0..6 {
+        wait_for_policy_cooldown();
+        manager.decide_and_act(&saturated_state, &cmd_tx);
+        while cmd_rx.try_recv().is_ok() {}
+    }
 
     let refill_state = state_with(
-        1_600_000,
+        1_700_000,
         [
-            // Largest original range, but only 10 KiB remains.
-            active_chunk(1, 0, 999_999, 989_760, 25_000.0),
-            // Smaller original range, but much more remaining splittable work.
-            active_chunk(2, 1_000_000, 1_499_999, 0, 25_000.0),
+            // Largest original range, but only 10 KiB remains (not splittable: <20KiB).
+            active_chunk(1, 0, 999_999, 989_760, 10_000.0),
+            // Smaller original range, but 600 KiB remaining splittable work.
+            active_chunk(2, 1_000_000, 1_599_999, 0, 10_000.0),
         ],
     );
 
-    wait_for_policy_cooldown();
-    manager.decide_and_act(&refill_state, &cmd_tx);
-
-    assert_split_for(&mut cmd_rx, 2);
+    // 样本窗需数个 tick 排空预热期高速样本，轮询等切分（观察期/节流各 tick 仍推进）。
+    for _ in 0..10 {
+        wait_for_policy_cooldown();
+        manager.decide_and_act(&refill_state, &cmd_tx);
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if matches!(cmd, DownloadCmd::BisectDownload { id: 2 }) {
+                return;
+            }
+        }
+    }
+    panic!("expected split command for chunk 2");
 }
