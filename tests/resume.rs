@@ -120,7 +120,8 @@ async fn single_source_resumes_verified_prefix_without_restarting_from_zero() {
 }
 
 #[tokio::test]
-async fn metadata_without_target_file_is_fail_stop() {
+async fn orphan_metadata_without_target_file_is_discarded_and_fully_redownloaded() {
+    // resume 层契约：sidecar 在、目标文件不在 → 丢弃孤儿 sidecar 走全量下载（不再抛错让上层重试）。
     let mut server = Server::new_async().await;
     let root = TempDir::new().expect("temp dir");
     let output = workspace_file(&root, "missing.bin");
@@ -130,20 +131,32 @@ async fn metadata_without_target_file_is_fail_stop() {
         .save_atomic(&metadata_path_for(&output))
         .expect("save metadata");
 
-    let _head = server
+    let head = server
         .mock("HEAD", "/file")
         .with_status(200)
         .with_header("Content-Length", body.len().to_string().as_str())
         .with_header("Accept-Ranges", "bytes")
         .create_async()
         .await;
+    let full = server
+        .mock("GET", "/file")
+        .match_header("Range", format!("bytes=0-{}", body.len() - 1).as_str())
+        .with_status(206)
+        .with_header(
+            "Content-Range",
+            format!("bytes 0-{}/{}", body.len() - 1, body.len()).as_str(),
+        )
+        .with_body(body.clone())
+        .create_async()
+        .await;
 
-    let error = run_single_source_download(format!("{}/file", server.url()), &output)
+    run_single_source_download(format!("{}/file", server.url()), &output)
         .await
-        .expect_err("missing file must fail-stop");
+        .expect("orphan sidecar must not block a full download");
 
-    assert!(matches!(error, DownloadError::ResumeTargetMissing(_)));
-    assert!(!output.exists());
+    assert_file_eq(&output, &body);
+    head.assert_async().await;
+    full.assert_async().await;
 }
 
 #[tokio::test]

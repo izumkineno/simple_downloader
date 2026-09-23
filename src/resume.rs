@@ -535,6 +535,32 @@ impl ResumePlan {
         res
     }
 
+    /// 本会话不需要重写、但已在 resume 层通过哈希校验的落盘区间：
+    /// [0, file_size) 减去 `remaining_ranges`。文件写者据此放行覆盖门，避免把已验证前缀
+    /// 当成空洞而拒收一个完整文件。`truncate_output` 为真（全量下载）时必为空。
+    pub fn verified_ranges(&self, file_size: u64) -> Vec<(u64, u64)> {
+        let mut covered: Vec<(u64, u64)> = Vec::new();
+        let mut cursor = 0u64;
+        for (start, end) in &self.remaining_ranges {
+            if file_size == 0 {
+                break;
+            }
+            let start = (*start).min(file_size - 1);
+            let end = (*end).min(file_size - 1);
+            if start > cursor {
+                covered.push((cursor, start - 1));
+            }
+            cursor = cursor.max(end.saturating_add(1));
+            if cursor >= file_size {
+                break;
+            }
+        }
+        if file_size > 0 && cursor < file_size {
+            covered.push((cursor, file_size - 1));
+        }
+        covered
+    }
+
     pub fn into_recorder(self) -> Option<ResumeRecorder> {
         let has_metadata = self.metadata.is_some();
         ::tracing::debug!(

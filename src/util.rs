@@ -408,21 +408,54 @@ pub async fn file_writer_task(
         true,
         #[cfg(feature = "resume")]
         None,
+        Vec::new(),
     )
     .await
 }
 
+/// `trusted_ranges`：断点续传场景下本会话不重写、但已由 resume 层校验过哈希的落盘区间。
+/// 覆盖门必须把它们算作已覆盖，否则「已验证前缀 + 本次续传尾部」会被误判为空洞，
+/// 全量完整文件也会被拒收（实测：truncate=false、extents=0、gap 0-252390 的假炸包）。
 #[cfg(feature = "resume")]
 pub async fn file_writer_task_with_resume(
     filepath: FastStr,
     size: u64,
     truncate: bool,
     resume_recorder: Option<ResumeRecorder>,
+    trusted_ranges: Vec<(u64, u64)>,
 ) -> Result<(
     mpsc::Sender<DownloadCmd>,
     JoinHandle<std::result::Result<(), DownloadError>>,
 )> {
-    file_writer_task_impl(filepath, size, truncate, resume_recorder).await
+    file_writer_task_impl(filepath, size, truncate, resume_recorder, trusted_ranges).await
+}
+
+/// 覆盖门判定：`written`（本会话已落盘）与 `trusted`（resume 已验证）并集未铺满 [0,size)
+/// 时返回首个空洞，铺满返回 None。
+fn coverage_gap(
+    written: &[(u64, u64)],
+    trusted: &[(u64, u64)],
+    size: u64,
+) -> Option<(u64, u64)> {
+    let mut extents: Vec<(u64, u64)> = written
+        .iter()
+        .chain(trusted.iter())
+        .copied()
+        .filter(|(s, e)| s <= e && *s < size)
+        .map(|(s, e)| (s, e.min(size.saturating_sub(1))))
+        .collect();
+    extents.sort_by_key(|(s, _)| *s);
+    let mut cursor = 0u64;
+    for (s, e) in extents {
+        if s > cursor {
+            return Some((cursor, s.saturating_sub(1)));
+        }
+        cursor = cursor.max(e.saturating_add(1));
+        if cursor >= size {
+            return None;
+        }
+    }
+    (cursor < size).then(|| (cursor, size.saturating_sub(1)))
 }
 
 async fn file_writer_task_impl(
@@ -430,6 +463,7 @@ async fn file_writer_task_impl(
     size: u64,
     truncate: bool,
     #[cfg(feature = "resume")] resume_recorder: Option<ResumeRecorder>,
+    trusted_ranges: Vec<(u64, u64)>,
 ) -> Result<(
     mpsc::Sender<DownloadCmd>,
     JoinHandle<std::result::Result<(), DownloadError>>,
@@ -460,6 +494,28 @@ async fn file_writer_task_impl(
         let mut pending: Option<(u64, Vec<u8>)> = None;
         const COALESCE_LIMIT: usize = 128 * 1024;
         let mut writer_err: Option<DownloadError> = None;
+        // 已落盘区间账本：每次 seek/write 成功后并入；退出时校验 [0,size) 全覆盖，
+        // 缺口即炸包（稀疏空洞 stat 查不出），直接报错不交付坏文件。
+        let mut written: Vec<(u64, u64)> = Vec::new();
+        macro_rules! mark_written {
+            ($off:expr, $len:expr) => {{
+                let s = $off;
+                let e = $off.saturating_add($len as u64).saturating_sub(1);
+                written.push((s, e));
+                written.sort_by_key(|(s, _)| *s);
+                let mut merged: Vec<(u64, u64)> = Vec::with_capacity(written.len());
+                for (s, e) in written.drain(..) {
+                    if let Some((_, last_e)) = merged.last_mut() {
+                        if s <= last_e.saturating_add(1) {
+                            *last_e = (*last_e).max(e);
+                            continue;
+                        }
+                    }
+                    merged.push((s, e));
+                }
+                written = merged;
+            }};
+        }
 
         while let Some(command) = rx.recv().await {
             match command {
@@ -494,6 +550,7 @@ async fn file_writer_task_impl(
                             writer_err = Some(DownloadError::Io(e));
                             break;
                         }
+                        mark_written!(p_off, p_buf.len());
                         #[cfg(feature = "resume")]
                         if let Some(recorder) = resume_recorder.as_mut()
                             && let Err(e) = recorder
@@ -520,11 +577,11 @@ async fn file_writer_task_impl(
                             writer_err = Some(DownloadError::Io(e));
                         } else if let Err(e) = file.write_all(&p_buf).await {
                             ::tracing::error!(offset = p_off, len = p_buf.len(), error = %e, "file writer final write failed");
-                            writer_err = Some(DownloadError::Io(e));
                         } else if let Err(e) = file.flush().await {
                             ::tracing::error!(offset = p_off, error = %e, "file writer final flush failed");
                             writer_err = Some(DownloadError::Io(e));
                         } else {
+                            mark_written!(p_off, p_buf.len());
                             #[cfg(feature = "resume")]
                             if let Some(recorder) = resume_recorder.as_mut()
                                 && let Err(e) = recorder
@@ -566,6 +623,7 @@ async fn file_writer_task_impl(
                     ::tracing::error!(offset = p_off, error = %e, "flush remaining pending flush failed");
                     writer_err = Some(DownloadError::Io(e));
                 } else {
+                    mark_written!(p_off, p_buf.len());
                     #[cfg(feature = "resume")]
                     if let Some(recorder) = resume_recorder.as_mut()
                         && let Err(e) = recorder
@@ -599,6 +657,18 @@ async fn file_writer_task_impl(
             if let Err(e) = file.flush().await {
                 ::tracing::error!(error = %e, "final file flush failed");
                 writer_err = Some(DownloadError::Io(e));
+            }
+        }
+        // 覆盖门：[0,size) 任一字节没写过（也未被 resume 验证过）即空洞，size 对也炸包；报错不交付。
+        if writer_err.is_none() && size > 0 {
+            let extents = written.len();
+            let trusted = trusted_ranges.len();
+            if let Some((gs, ge)) = coverage_gap(&written, &trusted_ranges, size) {
+                ::tracing::error!(gap_start = gs, gap_end = ge, size, extents, trusted, "writer coverage gap: hole never written, refusing corrupt file");
+                writer_err = Some(DownloadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("unwritten hole {gs}-{ge} of {size}, refusing corrupt file"),
+                )));
             }
         }
         ::tracing::info!("file writer task exited");
@@ -661,6 +731,7 @@ mod tests {
             3,
             false,
             None,
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -674,5 +745,27 @@ mod tests {
         handle.await.unwrap().unwrap();
 
         assert_eq!(tokio::fs::read(&path).await.unwrap(), b"new tail");
+    }
+
+    #[test]
+    fn coverage_gap_uses_trusted_resume_prefix() {
+        // 续传：已验证前缀 [0,599) + 本会话续传尾部 [600,999) → 无空洞。
+        assert_eq!(
+            coverage_gap(&[(600, 999)], &[(0, 599)], 1000),
+            None,
+            "verified prefix must satisfy the coverage gate"
+        );
+        // 全量已验证（本会话零写入）也不该被拒收。
+        assert_eq!(coverage_gap(&[], &[(0, 999)], 1000), None);
+        // 真空洞：[0,599) 既没写也没验证过 → 报首个缺口。
+        assert_eq!(coverage_gap(&[(600, 999)], &[], 1000), Some((0, 599)));
+    }
+
+    #[test]
+    fn coverage_gap_clamps_and_bridges_extents() {
+        // 相邻段自动合并，跨 size 的 extent 截断，不越界报假空洞。
+        assert_eq!(coverage_gap(&[(0, 99), (100, 999)], &[], 1000), None);
+        assert_eq!(coverage_gap(&[(0, 5000)], &[], 1000), None);
+        assert_eq!(coverage_gap(&[(0, 9)], &[(10, 19)], 20), None);
     }
 }

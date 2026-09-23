@@ -36,21 +36,28 @@ async fn file_writer_task_with_resume_does_not_truncate_existing_file() {
     temp_file.write_all(b"existing-data").unwrap();
     let path = temp_file.path().to_str().unwrap();
 
-    let (tx, handle) = file_writer_task_with_resume(FastStr::new(path), 32, false, None)
-        .await
-        .unwrap();
+    // 续传语义：已落盘的 [0,12] 由调用方声明为已校验，本会话只补 [13,20)。
+    let (tx, handle) = file_writer_task_with_resume(
+        FastStr::new(path),
+        20,
+        false,
+        None,
+        vec![(0, 12)],
+    )
+    .await
+    .unwrap();
     tx.send(DownloadCmd::WriteFile {
-        offset: 16,
-        data: Bytes::from_static(b"tail"),
+        offset: 13,
+        data: Bytes::from_static(b"seven!!"),
     })
     .await
     .unwrap();
     tx.send(DownloadCmd::TerminateAll).await.unwrap();
-    handle.await.unwrap();
+    handle.await.unwrap().unwrap();
 
     let content = std::fs::read(path).unwrap();
     assert_eq!(&content[..13], b"existing-data");
-    assert_eq!(&content[16..20], b"tail");
+    assert_eq!(&content[13..20], b"seven!!");
 }
 
 #[tokio::test]
@@ -71,6 +78,14 @@ async fn test_get_file_info_range_get_success() {
         .with_body("a")
         .create_async()
         .await;
+    // 206 通道须与无 Range 整包首字节交叉验证，否则按 Range 头分片可能组装坏文件
+    let mock_plain = server
+        .mock("GET", "/testfile")
+        .with_status(200)
+        .with_header("Content-Length", "1")
+        .with_body("a")
+        .create_async()
+        .await;
 
     let client = Client::new();
     let url = format!("{}/testfile", server.url());
@@ -80,6 +95,7 @@ async fn test_get_file_info_range_get_success() {
     assert!(accept_ranges);
     mock_head.assert_async().await;
     mock_get.assert_async().await;
+    mock_plain.assert_async().await;
 }
 
 #[tokio::test]
@@ -123,7 +139,7 @@ async fn test_file_writer_task() {
         .await
         .unwrap();
 
-    // 写入多个分片数据
+    // 分片写入并铺满 [0,100)：覆盖门要求交付前无未写区间
     tx.send(DownloadCmd::WriteFile {
         offset: 0,
         data: Bytes::from_static(b"Hello"),
@@ -131,8 +147,14 @@ async fn test_file_writer_task() {
     .await
     .unwrap();
     tx.send(DownloadCmd::WriteFile {
-        offset: 10,
+        offset: 5,
         data: Bytes::from_static(b"World"),
+    })
+    .await
+    .unwrap();
+    tx.send(DownloadCmd::WriteFile {
+        offset: 10,
+        data: Bytes::from(vec![7u8; 90]),
     })
     .await
     .unwrap();
@@ -141,10 +163,9 @@ async fn test_file_writer_task() {
     // 等待写入完成
     handle.await.unwrap().unwrap();
 
-    // 读取文件内容验证 — streaming: file length is max written offset + len (15), not preallocated 100
+    // 读取文件内容验证 — streaming: file length is max written offset + len (100)
     let mut file = fs::File::open(path).await.unwrap();
     let metadata = file.metadata().await.unwrap();
-    // streaming: file should be at least 15 bytes (highest write), not preallocated to 100
     assert!(
         metadata.len() >= 15,
         "streaming file should be at least 15 bytes, got {}",
@@ -159,9 +180,29 @@ async fn test_file_writer_task() {
     file.read_to_end(&mut content).await.unwrap();
 
     assert_eq!(&content[0..5], b"Hello");
-    assert_eq!(&content[10..15], b"World");
-    // 中间未写入部分应该是0填充 (sparse hole)
-    for i in 5..10 {
-        assert_eq!(content[i], 0);
-    }
+    assert_eq!(&content[5..10], b"World");
+    assert!(content[10..].iter().all(|b| *b == 7));
+}
+
+#[tokio::test]
+async fn test_file_writer_rejects_unwritten_hole() {
+    // 覆盖门：声明 size 大于实际写入区间时必须报错，不交付稀疏空洞文件（stat 长度查不出空洞）。
+    let temp_file = NamedTempFile::new().unwrap();
+    let path = temp_file.path().to_str().unwrap();
+    let (tx, handle) = file_writer_task(FastStr::new(path), 100).await.unwrap();
+
+    tx.send(DownloadCmd::WriteFile {
+        offset: 0,
+        data: Bytes::from_static(b"Hello"),
+    })
+    .await
+    .unwrap();
+    tx.send(DownloadCmd::TerminateAll).await.unwrap();
+
+    let result = handle.await.unwrap();
+    let error = result.expect_err("hole must be rejected");
+    assert!(
+        error.to_string().contains("unwritten hole 5-99"),
+        "unexpected error: {error}"
+    );
 }

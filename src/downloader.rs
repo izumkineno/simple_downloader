@@ -671,11 +671,14 @@ where
         );
 
         #[cfg(feature = "resume")]
+        let trusted_ranges = resume_plan.verified_ranges(file_size);
+        #[cfg(feature = "resume")]
         let (writer_tx, writer_handle) = file_writer_task_with_resume(
             writer_path.clone(),
             file_size,
             truncate_output,
             resume_plan.into_recorder(),
+            trusted_ranges,
         )
         .await?;
         #[cfg(not(feature = "resume"))]
@@ -694,7 +697,7 @@ where
                 file_size,
                 support_ranges,
                 writer_tx,
-                client,
+                client.clone(),
                 &download_url,
                 workers,
                 multi_runtime,
@@ -725,12 +728,40 @@ where
         // monitor 的 completed_bytes 与 clamp 的 total_downloaded 可能在 Lagged/双计等边界下虚报 100%，
         // 必须以落盘文件长度为金标准，否则不删 sidecar 并报错以便 resume 重试，而非假完成卡死。
         if file_size > 0 {
+            // 尾块补拉：多 worker 并发下尾块常被 CDN 提前掐连接（日志 20 例 mismatch 差几KB~几十KB），
+            // 直接报错走整任务 resume 重试太重；落盘已到 actual，单流 Range 补 [actual, file_size) 即可，最多 3 轮。
+            // 不支持 Range 的源跳过，维持原报错路径。
+            if support_ranges {
+                for round in 1..=3u32 {
+                    let actual = tokio::fs::metadata(std::path::Path::new(writer_path.as_str()))
+                        .await
+                        .map(|meta| meta.len())
+                        .unwrap_or(0);
+                    if actual >= file_size {
+                        break;
+                    }
+                    ::tracing::warn!(expected = file_size, actual, round, path = %writer_path, "tail gap detected, single-stream Range refill");
+                    if let Err(error) = Self::refill_tail_gap(
+                        &client,
+                        &self.extra_headers,
+                        download_url.as_str(),
+                        writer_path.as_str(),
+                        actual,
+                        file_size,
+                    )
+                    .await
+                    {
+                        ::tracing::warn!(error = %error, round, "tail refill failed, keeping sidecar for resume retry");
+                        break;
+                    }
+                }
+            }
             match tokio::fs::metadata(std::path::Path::new(writer_path.as_str())).await {
                 Ok(meta) => {
                     let actual = meta.len();
                     if actual != file_size {
                         ::tracing::error!(expected = file_size, actual, path = %writer_path, "final file size mismatch, download incomplete (aria2 allDownloadFinished fail)");
-                        // 保留 sidecar 供断点续传
+                        // 补拉 3 轮仍对不上才报错，保留 sidecar 供断点续传
                         return Err(DownloadError::Io(std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,
                             format!("incomplete download: expected {file_size} got {actual}"),
@@ -774,7 +805,89 @@ where
         ::tracing::debug!(writer_path = %writer_path, "download complete");
         Ok(())
     }
-    #[::tracing::instrument(skip(self, client, writer_path, progress_handler), fields(url = %url, path = %writer_path))]
+
+    /// 尾块单流补拉：Range GET [start, end)，定点写回落盘文件。只补终检差值，不走多 worker 编排。
+    /// 完整性保证：开写前复核落盘长度 == start（防盲追加写坏文件）；校验 Content-Range 回显；
+    /// 截断源多发字节；落盘后 sync_all。
+    async fn refill_tail_gap(
+        client: &Client,
+        extra_headers: &[(FastStr, FastStr)],
+        url: &str,
+        writer_path: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<()> {
+        use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+        let landed = tokio::fs::metadata(writer_path)
+            .await
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        if landed != start {
+            return Err(DownloadError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("tail refill aborted: file moved under us (at {landed}, want {start})"),
+            )));
+        }
+        let range_header = format!("bytes={}-{}", start, end - 1);
+        let response = apply_extra_headers(
+            ensure_user_agent(
+                client
+                    .get(url)
+                    .header("Range", range_header.clone())
+                    .header(reqwest::header::ACCEPT_ENCODING, "identity"),
+            ),
+            extra_headers,
+        )
+        .send()
+        .await?;
+        if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+            return Err(DownloadError::PermanentFailure(format!(
+                "tail refill unexpected status {} for range {range_header}",
+                response.status()
+            )));
+        }
+        if let Some(content_range) = response.headers().get(reqwest::header::CONTENT_RANGE) {
+            let echoed = content_range.to_str().unwrap_or("");
+            let want_echo = format!("bytes {start}-{}", end - 1);
+            if !echoed.starts_with(&want_echo) {
+                return Err(DownloadError::PermanentFailure(format!(
+                    "tail refill range mismatch: asked {range_header}, got {echoed}"
+                )));
+            }
+        }
+        let mut stream = response.bytes_stream();
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(writer_path)
+            .await
+            .map_err(DownloadError::Io)?;
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(DownloadError::Io)?;
+        let mut received: u64 = 0;
+        let want = end - start;
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk?;
+            if received + bytes.len() as u64 > want {
+                return Err(DownloadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("tail refill overflow: want {want} got at least {}", received + bytes.len() as u64),
+                )));
+            }
+            file.write_all(&bytes).await.map_err(DownloadError::Io)?;
+            received += bytes.len() as u64;
+        }
+        file.flush().await.map_err(DownloadError::Io)?;
+        file.sync_all().await.map_err(DownloadError::Io)?;
+        if received != want {
+            return Err(DownloadError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("tail refill short: want {want} got {received}"),
+            )));
+        }
+        ::tracing::info!(start, end, received, "tail refill ok");
+        Ok(())
+    }
     /// 未知 Content-Length 时的单流流式回退：`total_size=0` 仅表“未知”，`MonitorUpdate(total_size=0)` 不代表 0 字节文件，`progress_percent` 对 0 恒 0%。
     async fn streaming_download(
         self,

@@ -41,6 +41,8 @@ pub struct DownloadMonitor {
     update_interval: f64,
     /// Lagged 事件计数，用于 P0-03 对账
     lagged_count: u64,
+    /// 死胡同连续拍数：无任务/块/重试/缓冲但进度未齐时累加，否则清零
+    stall_ticks: u32,
     is_rate_limited: bool,
     global_limiter: Option<Arc<RateLimiter>>,
     // per-task 附加请求头（单源重调度/重试的 client.get 全经 build_request 生效）
@@ -78,6 +80,7 @@ impl DownloadMonitor {
             pending_bisects: std::collections::VecDeque::new(),
             update_interval,
             lagged_count: 0,
+            stall_ticks: 0,
             is_rate_limited: false,
             global_limiter: None,
             extra_headers: Vec::new(),
@@ -685,22 +688,56 @@ impl DownloadMonitor {
         // 直接判 done 丢弃重试队列；writer 由 writer_tx drop 走 channel-closed 刷新路径。
         // tasks.is_empty() 必须保留：total 含“已发进度但 writer 未落盘 + chunk 未退出”的在途字节，
         // 不等 JoinHandle 回收就 TerminateAll 会丢尾部（expected N got N-26KB 类报错）。
-        if tasks.is_empty() && self.state.total_downloaded() >= self.state.total_file_size {
-            let drop_q =
-                self.retry_handler.retry_queue_len() + self.retry_handler.delayed_queue_len();
+        // 短路门加重试队列为空：total 口径含 preserve 落账的重复计数，重试队列里可能躺着
+        // 空洞区间的补下任务（如 dropped_retries=1 + writer coverage gap）。队列非空时放行，
+        // 让补洞跑完再判 done；否则计数齐、落盘缺，直接炸 corrupt file。
+        if tasks.is_empty()
+            && self.retry_handler.retry_queue_len() == 0
+            && self.retry_handler.delayed_queue_len() == 0
+            && self.state.total_downloaded() >= self.state.total_file_size
+        {
             ::tracing::info!(
                 downloaded = self.state.total_downloaded(),
                 total = self.state.total_file_size,
                 active = self.state.chunks.len(),
                 tasks = tasks.len(),
-                dropped_retries = drop_q,
                 "monitor tick: bytes complete, short-circuit (server never closed stream)",
             );
             return true;
         }
-        // 周期快照：每 tick 一行 total/completed/active/retry/tasks，debug 铺路——
-        // 卡住时直接看 completed 是否停涨、active 是否全零速，不用逐块翻日志。
-        ::tracing::debug!(
+        // 死胡同逃生：短路未命中（进度未齐）且无任务/无活跃块/无重试在队/无缓冲——
+        // 幽灵块/事件丢失致永空转（前端卡 100% 有进度无终局）。
+        // 连续 6 拍（~3s）即注入永久失败，走现有退出路径，上层 resume 重试接管。
+        if tasks.is_empty()
+            && self.state.chunks.is_empty()
+            && self.retry_handler.retry_queue_len() == 0
+            && self.retry_handler.delayed_queue_len() == 0
+            && self.pending_bisects.is_empty()
+        {
+            self.stall_ticks = self.stall_ticks.saturating_add(1);
+            if self.stall_ticks == 1 || self.stall_ticks >= 6 {
+                ::tracing::warn!(
+                    downloaded = self.state.total_downloaded(),
+                    completed = self.state.completed_bytes_for_debug(),
+                    total = self.state.total_file_size,
+                    missing = self.state.total_file_size.saturating_sub(self.state.total_downloaded()),
+                    ticks = self.stall_ticks,
+                    retry_q = self.retry_handler.retry_queue_len(),
+                    delayed = self.retry_handler.delayed_queue_len(),
+                    "monitor stall: no live chunks but bytes incomplete (waiting for resume retry)",
+                );
+            }
+            if self.stall_ticks >= 6 {
+                self.retry_handler.fail_stalled(
+                    self.state.total_downloaded(),
+                    self.state.total_file_size,
+                );
+            }
+        } else {
+            self.stall_ticks = 0;
+        }
+        // 周期快照只在 trace：debug 每 500ms 一行刷屏，卡住时看 warn stall 行即可。
+        ::tracing::trace!(
             downloaded = self.state.total_downloaded(),
             completed = self.state.completed_bytes_for_debug(),
             total = self.state.total_file_size,
@@ -997,5 +1034,25 @@ mod regression_tests {
         let next_id = AtomicU64::new(3);
         let done = monitor.handle_tick(0.5, &mut tasks, &info_tx, &None, &cmd_tx, &client, &writer_tx, None, &mut None, &next_id);
         assert!(done, "字节已齐必须短路判 done，不等服务器关流");
+    }
+    #[tokio::test]
+    async fn stall_with_no_work_fails_instead_of_hanging() {
+        // 复现：无任务/块/重试/缓冲但进度未齐（幽灵块/事件丢失），旧逻辑永空转致前端卡 100%。
+        // 连续 6 拍即注入永久失败，走现有退出路径，上层 resume 重试接管。
+        let mut monitor = DownloadMonitor::new(1000, 0.5, 1);
+        let mut tasks = FuturesUnordered::new();
+        let (info_tx, _) = broadcast::channel(10);
+        let (cmd_tx, _) = broadcast::channel(10);
+        let client = reqwest::Client::new();
+        let (writer_tx, _) = mpsc::channel(10);
+        let next_id = AtomicU64::new(3);
+        for _ in 0..5 {
+            let done = monitor.handle_tick(0.5, &mut tasks, &info_tx, &None, &cmd_tx, &client, &writer_tx, None, &mut None, &next_id);
+            assert!(!done);
+            assert!(!monitor.retry_handler.has_permanent_failure());
+        }
+        let done = monitor.handle_tick(0.5, &mut tasks, &info_tx, &None, &cmd_tx, &client, &writer_tx, None, &mut None, &next_id);
+        assert!(!done);
+        assert!(monitor.retry_handler.has_permanent_failure(), "死胡同 6 拍必须注入永久失败，不永空转");
     }
 }

@@ -53,6 +53,10 @@ struct SplitObservation {
     best_speed_seen: f64,
 }
 
+/// 某块距上次有进展的秒数；找不到块按 0 处理（不抢未知块）。
+fn chunk_idle_secs(state: &DownloadState, id: ChunkId) -> u64 {
+    state.chunks.get(&id).map(|c| c.last_progress_at.elapsed().as_secs()).unwrap_or(0)
+}
 /// 管理动态并发控制逻辑的结构体。
 pub struct ConcurrencyManager {
     /// 用户设置的最大并发工作线程数。
@@ -78,6 +82,8 @@ pub struct ConcurrencyManager {
     /// 同块偏心切分计数：trickle 连接靠切分救不回来（切几次还是零速），
     /// 达阈值后改发 TerminateChunk 杀坏连接走重试换新连接。
     skewed_split_counts: HashMap<ChunkId, u32>,
+    /// 同块抢段时间隔节流：aria2 式只抢零进展 + 空闲超阈的段，有进展的继续滴完。
+    last_steal_time: HashMap<ChunkId, Instant>,
 }
 
 impl ConcurrencyManager {
@@ -111,6 +117,7 @@ impl ConcurrencyManager {
             current_observation: None,
             consecutive_probe_no_gain: 0,
             skewed_split_counts: HashMap::new(),
+            last_steal_time: HashMap::new(),
         }
     }
     /// 0.5.5 热更新：运行时调整最大并发（配置灵活性）
@@ -383,15 +390,13 @@ impl ConcurrencyManager {
         let should_consider_split =
             avg_speed < threshold && active_chunks < self.max_workers && useful;
 
-        ::tracing::debug!(
+        ::tracing::trace!(
             avg_kbs = avg_speed / 1024.0,
             recent_best_kbs = self.recent_best_speed / 1024.0,
             threshold_kbs = threshold / 1024.0,
-            threshold_factor = STABLE_SPLIT_THRESHOLD,
             active = active_chunks,
             max = self.max_workers,
             est_s = estimated_time,
-            adaptive_threshold = Self::adaptive_remaining_threshold(state.total_file_size),
             remaining = state
                 .total_file_size
                 .saturating_sub(state.total_downloaded()),
@@ -412,7 +417,7 @@ impl ConcurrencyManager {
                 remaining = stalled_remaining,
                 "stable::ready skewed-splitting stalled chunk"
             );
-            self.request_skewed_split(stalled_id, stalled_remaining, cmd_tx);
+            self.request_skewed_split(state, stalled_id, stalled_remaining, cmd_tx);
             return;
         }
         if should_consider_split {
@@ -439,7 +444,7 @@ impl ConcurrencyManager {
                         remaining = slowest_remaining,
                         "stable::ready skewed-splitting stalled chunk"
                     );
-                    self.request_skewed_split(slowest_id, slowest_remaining, cmd_tx);
+                    self.request_skewed_split(&state, slowest_id, slowest_remaining, cmd_tx);
                 } else {
                     ::tracing::info!(
                         chunk_id = slowest_id,
@@ -547,12 +552,23 @@ impl ConcurrencyManager {
     /// 但建连 0.1~0.5s + CDN 可能限流，能 reassign 抢完就不杀）。
     /// 小剩余（<128KiB）切分救回的 7/8 也不值得一次建连，
     /// 且 12KB 尾块证明连 trickle 都停了时直接杀、不浪费一次切分。
-    fn request_skewed_split(&mut self, id: ChunkId, remaining: u64, cmd_tx: &broadcast::Sender<DownloadCmd>) {
-        if remaining < 128 * 1024 {
-            ::tracing::debug!(chunk_id = id, remaining, phase = ?self.phase, "TerminateChunk: small-tail stall kill");
-            let _ = cmd_tx.send(DownloadCmd::TerminateChunk { id });
-            self.skewed_split_counts.remove(&id);
-            self.last_split_time = Instant::now();
+    fn request_skewed_split(&mut self, state: &DownloadState, id: ChunkId, remaining: u64, cmd_tx: &broadcast::Sender<DownloadCmd>) {
+        // aria2 式抢段（SegmentMan::getCleanSegmentIfOwnerIsIdle）：小尾巴（<128KiB）不切分，
+        // 但零进展 + 空闲超阈则直接 TerminateChunk 走重试换新连接——重试带 offset 续传
+        // （chunk.rs TerminateChunk 分支上报 actual + ChunkFailed 剩余区间），取消不丢进度。
+        const IDLE_STEAL_SECS: u64 = 10;
+        const SMALL_TAIL_BYTES: u64 = 128 * 1024;
+        if remaining < SMALL_TAIL_BYTES {
+            let idle = chunk_idle_secs(state, id);
+            let throttled = self.last_steal_time.get(&id).is_some_and(|t| t.elapsed().as_secs() < IDLE_STEAL_SECS);
+            if idle >= IDLE_STEAL_SECS && !throttled {
+                ::tracing::info!(chunk_id = id, remaining, idle_secs = idle, "small-tail idle steal: TerminateChunk, retry resumes from offset");
+                let _ = cmd_tx.send(DownloadCmd::TerminateChunk { id });
+                self.last_steal_time.insert(id, Instant::now());
+                self.last_split_time = Instant::now();
+            } else {
+                ::tracing::trace!(chunk_id = id, remaining, idle_secs = idle, "small-tail stall: let it drain, no split no kill");
+            }
             return;
         }
         let count = self.skewed_split_counts.entry(id).or_insert(0);

@@ -449,13 +449,36 @@ impl RetryHandler {
     pub fn has_permanent_failure(&self) -> bool {
         !self.permanent_failures.is_empty()
     }
+    /// 死胡同逃生注入：无任务/块/重试/缓冲但进度未齐时由 monitor tick 调用，
+    /// 复用永久失败退出路径，上层走 resume 重试而非永空转（前端卡 100%）。
+    pub fn fail_stalled(&mut self, downloaded: u64, total: u64) {
+        if self.has_permanent_failure() {
+            return;
+        }
+        self.permanent_failures.push(FailedChunkInfo {
+            id: u64::MAX,
+            start: downloaded,
+            end: total,
+            failure_time: Instant::now(),
+            attempts: 0,
+        });
+    }
 
     pub fn permanent_failure_message(&self) -> Option<String> {
         self.permanent_failures.first().map(|f| {
-            format!(
-                "块 {} 区间 {}-{} 永久失败，已重试 {} 次",
-                f.id, f.start, f.end, f.attempts
-            )
+            if f.id == u64::MAX {
+                format!(
+                    "尾部 {} 字节无活跃块（已下载 {}/{}），走 resume 重试补尾",
+                    f.end.saturating_sub(f.start),
+                    f.start,
+                    f.end
+                )
+            } else {
+                format!(
+                    "块 {} 区间 {}-{} 永久失败，已重试 {} 次",
+                    f.id, f.start, f.end, f.attempts
+                )
+            }
         })
     }
 
